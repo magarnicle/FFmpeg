@@ -93,8 +93,8 @@ typedef struct DecklinkPacketQueue {
 struct decklink_ctx {
     /* DeckLink SDK interfaces */
     IDeckLink *dl;
-    IDeckLinkOutput *dlo;
-    IDeckLinkInput *dli;
+    IDeckLinkOutput_v14_2_1 *dlo;
+    IDeckLinkInput_v14_2_1 *dli;
     IDeckLinkConfiguration *cfg;
     IDeckLinkProfileAttributes *attr;
     decklink_output_callback *output_callback;
