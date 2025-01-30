@@ -249,3 +249,4 @@ int ff_decklink_packet_queue_get(DecklinkPacketQueue *q, AVPacket *pkt, int bloc
 int64_t ff_decklink_packet_queue_peekpts(DecklinkPacketQueue *q);
 
 #endif /* AVDEVICE_DECKLINK_COMMON_H */
+

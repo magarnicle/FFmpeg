@@ -28,7 +28,7 @@ extern "C" {
 #include "libavformat/internal.h"
 }
 
-#include <DeckLinkAPI.h>
+#include <DeckLinkAPI_v14_2_1.h>
 
 extern "C" {
 #include "libavformat/avformat.h"
@@ -47,6 +47,24 @@ extern "C" {
 #include "libklvanc/pixels.h"
 #endif
 
+extern bool operator==(const REFIID& me, const REFIID& other){
+    return me.byte0 == other.byte0 &&
+	   me.byte1 == other.byte1 &&
+	   me.byte2 == other.byte2 &&
+	   me.byte3 == other.byte3 &&
+	   me.byte4 == other.byte4 &&
+	   me.byte5 == other.byte5 &&
+	   me.byte6 == other.byte6 &&
+	   me.byte7 == other.byte7 &&
+	   me.byte8 == other.byte8 &&
+	   me.byte9 == other.byte9 &&
+	   me.byte10 == other.byte10 &&
+	   me.byte11 == other.byte11 &&
+	   me.byte12 == other.byte12 &&
+	   me.byte13 == other.byte13 &&
+	   me.byte14 == other.byte14 &&
+	   me.byte15 == other.byte15;
+}
 /* DeckLink callback class declaration */
 class decklink_frame : public IDeckLinkVideoFrame_v14_2_1
 {

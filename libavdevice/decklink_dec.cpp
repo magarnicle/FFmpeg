@@ -31,7 +31,7 @@ extern "C" {
 #include "libavformat/internal.h"
 }
 
-#include <DeckLinkAPI.h>
+#include <DeckLinkAPI_v14_2_1.h>
 
 extern "C" {
 #include "config.h"
@@ -56,6 +56,7 @@ extern "C" {
 #include "decklink_common.h"
 #include "decklink_dec.h"
 
+extern bool operator==(const REFIID& me, const REFIID& other);
 #define MAX_WIDTH_VANC 1920
 const BMDDisplayMode AUTODETECT_DEFAULT_MODE = bmdModeNTSC;
 
