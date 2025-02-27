@@ -134,7 +134,6 @@ struct decklink_ctx {
     AVStream *klv_st;
     AVStream *teletext_st;
     uint16_t cdp_sequence_num;
-
     /* Options */
     int list_devices;
     int list_formats;
@@ -149,6 +148,7 @@ struct decklink_ctx {
     BMDPixelFormat raw_format;
     DecklinkSignalLossAction signal_loss_action;
 
+
     int frames_preroll;
     int frames_buffer;
 
@@ -156,6 +156,7 @@ struct decklink_ctx {
     pthread_cond_t cond;
     int frames_buffer_available_spots;
     int autodetect;
+    int block_until_available;
 
 #if CONFIG_LIBKLVANC
     struct klvanc_context_s *vanc_ctx;

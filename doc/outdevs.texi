@@ -240,6 +240,10 @@ Sets maximum output buffer size in bytes for VANC data. If the buffering reaches
 outgoing VANC data will be dropped.
 Defaults to @samp{1048576}.
 
+@item block_until_available
+Retries output if device appears unavailable. Retry rate is 60 times a second.
+Defaults to @option{0}.
+
 @end table
 
 @subsection Examples
