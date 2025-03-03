@@ -22,6 +22,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "cmdutils.h"
 #include "ffmpeg_sched.h"

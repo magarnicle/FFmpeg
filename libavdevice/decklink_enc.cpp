@@ -20,6 +20,8 @@
  */
 
 #include <atomic>
+#include <unistd.h>
+
 using std::atomic;
 
 /* Include internal.h first to avoid conflict between winsock.h (used by
@@ -182,7 +184,9 @@ public:
         ctx->frames_buffer_available_spots++;
         pthread_cond_broadcast(&ctx->cond);
         pthread_mutex_unlock(&ctx->mutex);
-
+        pthread_mutex_lock(&ctx->mutex);
+        ctx->outstanding_frames--;
+        pthread_mutex_unlock(&ctx->mutex);
         return S_OK;
     }
     virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
@@ -240,9 +244,14 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
         av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
         ctx->supports_vanc = 0;
     }
-    if (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
-        return -1;
+    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
+        if (!ctx->block_until_available) {
+            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
+            return -1;
+        };
+        av_log(avctx, AV_LOG_WARNING, "Could not enable video output, waiting for device...\n");
+        usleep(1000000 / 60);
+        continue;
     }
 
     /* Set callback. */
@@ -406,6 +415,10 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
+    av_log(avctx, AV_LOG_DEBUG, "Wating for %d outstanding frames to return their results\n", ctx->outstanding_frames);
+    while (ctx->outstanding_frames > 0){
+        usleep(1);
+    }
     if (ctx->playback_started) {
         BMDTimeValue actual;
         ctx->dlo->StopScheduledPlayback(ctx->last_pts * ctx->bmd_tb_num,
@@ -786,6 +799,9 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         return AVERROR(EIO);
     }
 
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->outstanding_frames++;
+    pthread_mutex_unlock(&ctx->mutex);
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
     av_log(avctx, AV_LOG_DEBUG, "Buffered video frames: %d.\n", (int) buffered);
     if (pkt->pts > 2 && buffered <= 2)
@@ -886,6 +902,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->list_devices = cctx->list_devices;
     ctx->list_formats = cctx->list_formats;
     ctx->preroll      = cctx->preroll;
+    ctx->block_until_available      = cctx->block_until_available;
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->first_pts    = AV_NOPTS_VALUE;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
