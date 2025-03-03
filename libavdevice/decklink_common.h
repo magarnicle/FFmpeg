@@ -155,6 +155,7 @@ struct decklink_ctx {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     int frames_buffer_available_spots;
+    int outstanding_frames;
     int autodetect;
     int block_until_available;
 

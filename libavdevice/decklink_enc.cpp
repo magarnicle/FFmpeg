@@ -184,7 +184,9 @@ public:
         ctx->frames_buffer_available_spots++;
         pthread_cond_broadcast(&ctx->cond);
         pthread_mutex_unlock(&ctx->mutex);
-
+        pthread_mutex_lock(&ctx->mutex);
+        ctx->outstanding_frames--;
+        pthread_mutex_unlock(&ctx->mutex);
         return S_OK;
     }
     virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
@@ -413,6 +415,10 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
+    av_log(avctx, AV_LOG_DEBUG, "Wating for %d outstanding frames to return their results\n", ctx->outstanding_frames);
+    while (ctx->outstanding_frames > 0){
+        usleep(1);
+    }
     if (ctx->playback_started) {
         BMDTimeValue actual;
         ctx->dlo->StopScheduledPlayback(ctx->last_pts * ctx->bmd_tb_num,
@@ -793,6 +799,9 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         return AVERROR(EIO);
     }
 
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->outstanding_frames++;
+    pthread_mutex_unlock(&ctx->mutex);
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
     av_log(avctx, AV_LOG_DEBUG, "Buffered video frames: %d.\n", (int) buffered);
     if (pkt->pts > 2 && buffered <= 2)
