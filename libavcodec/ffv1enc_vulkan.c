@@ -1468,7 +1468,7 @@ static av_cold int vulkan_encode_ffv1_init(AVCodecContext *avctx)
     FFV1Context *f = &fv->ctx;
     FFVkSPIRVCompiler *spv;
 
-    if ((err = ff_ffv1_common_init(avctx)) < 0)
+    if ((err = ff_ffv1_common_init(avctx, f)) < 0)
         return err;
 
     if (f->ac == 1)
@@ -1581,7 +1581,7 @@ static av_cold int vulkan_encode_ffv1_init(AVCodecContext *avctx)
         if (f->version < 4) {
             av_log(avctx, AV_LOG_ERROR, "PCM coding only supported by version 4 (-level 4)\n");
             return AVERROR_INVALIDDATA;
-        } else if (f->ac != AC_RANGE_CUSTOM_TAB) {
+        } else if (f->ac == AC_GOLOMB_RICE) {
             av_log(avctx, AV_LOG_ERROR, "PCM coding requires range coding\n");
             return AVERROR_INVALIDDATA;
         }
@@ -1629,11 +1629,6 @@ static av_cold int vulkan_encode_ffv1_init(AVCodecContext *avctx)
     } else {
         /* Keep 1/8th of VRAM as headroom */
         max_heap_size = max_heap_size - (max_heap_size >> 3);
-    }
-
-    if (!fv->async_depth) {
-        fv->async_depth = FFMIN(fv->qf->num, FFMAX(max_heap_size / maxsize, 1));
-        fv->async_depth = FFMAX(fv->async_depth, 1);
     }
 
     av_log(avctx, AV_LOG_INFO, "Async buffers: %zuMiB per context, %zuMiB total, depth: %i\n",
@@ -1798,6 +1793,8 @@ static const AVOption vulkan_encode_ffv1_options[] = {
             { .i64 = AC_RANGE_CUSTOM_TAB }, -2, 2, VE, .unit = "coder" },
         { "rice", "Golomb rice", 0, AV_OPT_TYPE_CONST,
             { .i64 = AC_GOLOMB_RICE }, INT_MIN, INT_MAX, VE, .unit = "coder" },
+        { "range_def", "Range with default table", 0, AV_OPT_TYPE_CONST,
+            { .i64 = AC_RANGE_DEFAULT_TAB_FORCE }, INT_MIN, INT_MAX, VE, .unit = "coder" },
         { "range_tab", "Range with custom table", 0, AV_OPT_TYPE_CONST,
             { .i64 = AC_RANGE_CUSTOM_TAB }, INT_MIN, INT_MAX, VE, .unit = "coder" },
     { "qtable", "Quantization table", OFFSET(ctx.qtable), AV_OPT_TYPE_INT,
@@ -1818,7 +1815,7 @@ static const AVOption vulkan_encode_ffv1_options[] = {
             { .i64 = 0 }, 0, 1, VE },
 
     { "async_depth", "Internal parallelization depth", OFFSET(async_depth), AV_OPT_TYPE_INT,
-            { .i64 = 0 }, 0, INT_MAX, VE },
+            { .i64 = 1 }, 1, INT_MAX, VE },
 
     { NULL }
 };

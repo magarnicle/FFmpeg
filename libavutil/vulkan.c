@@ -189,7 +189,7 @@ int ff_vk_load_props(FFVulkanContext *s)
         };
         s->qf_props[i] = (VkQueueFamilyProperties2) {
             .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
-            .pNext = &s->video_props[i],
+            .pNext = s->extensions & FF_VK_EXT_VIDEO_QUEUE ? &s->video_props[i] : NULL,
         };
     }
 
@@ -1430,6 +1430,7 @@ const char *ff_vk_shader_rep_fmt(enum AVPixelFormat pix_fmt,
         };
         return rep_tab[rep_fmt];
     };
+    case AV_PIX_FMT_GRAY32:
     case AV_PIX_FMT_GRAYF32:
     case AV_PIX_FMT_GBRPF32:
     case AV_PIX_FMT_GBRAPF32: {
@@ -1539,10 +1540,10 @@ static VkFormat map_fmt_to_rep(VkFormat fmt, enum FFVkShaderRepFormat rep_fmt)
         { REPS_FMT(VK_FORMAT_R16G16B16) },
         { REPS_FMT(VK_FORMAT_R16G16B16A16) },
         {
+            VK_FORMAT_R32_UINT,
             VK_FORMAT_R32_SFLOAT,
-            VK_FORMAT_R32_SFLOAT,
-            VK_FORMAT_UNDEFINED,
-            VK_FORMAT_UNDEFINED,
+            VK_FORMAT_R32_SINT,
+            VK_FORMAT_R32_UINT,
         },
         {
             VK_FORMAT_R32G32B32_SFLOAT,
@@ -2190,9 +2191,9 @@ print:
 
         if (prop->buf_content) {
             GLSLA(" {\n    ");
-            if (desc[i].elems) {
+            if (desc[i].buf_elems) {
                 GLSLA("%s", desc[i].buf_content);
-                GLSLA("[%i];", desc[i].elems);
+                GLSLA("[%i];", desc[i].buf_elems);
             } else {
                 GLSLA("%s", desc[i].buf_content);
             }
@@ -2381,10 +2382,10 @@ static inline void update_set_pool_write(FFVulkanContext *s, FFVkExecContext *e,
     }
 }
 
-static int vk_set_descriptor_image(FFVulkanContext *s, FFVulkanShader *shd,
-                                   FFVkExecContext *e, int set, int bind, int offs,
-                                   VkImageView view, VkImageLayout layout,
-                                   VkSampler sampler)
+int ff_vk_set_descriptor_image(FFVulkanContext *s, FFVulkanShader *shd,
+                               FFVkExecContext *e, int set, int bind, int offs,
+                               VkImageView view, VkImageLayout layout,
+                               VkSampler sampler)
 {
     FFVulkanDescriptorSet *desc_set = &shd->desc_set[set];
 
@@ -2521,8 +2522,8 @@ void ff_vk_shader_update_img_array(FFVulkanContext *s, FFVkExecContext *e,
     const int nb_planes = av_pix_fmt_count_planes(hwfc->sw_format);
 
     for (int i = 0; i < nb_planes; i++)
-        vk_set_descriptor_image(s, shd, e, set, binding, i,
-                                views[i], layout, sampler);
+        ff_vk_set_descriptor_image(s, shd, e, set, binding, i,
+                                   views[i], layout, sampler);
 }
 
 void ff_vk_shader_update_push_const(FFVulkanContext *s, FFVkExecContext *e,
@@ -2595,10 +2596,12 @@ void ff_vk_shader_free(FFVulkanContext *s, FFVulkanShader *shd)
         av_free(set->binding_offset);
     }
 
-    for (int i = 0; i < shd->nb_descriptor_sets; i++)
-        if (shd->desc_layout[i])
-            vk->DestroyDescriptorSetLayout(s->hwctx->act_dev, shd->desc_layout[i],
-                                           s->hwctx->alloc);
+    if (shd->desc_layout) {
+        for (int i = 0; i < shd->nb_descriptor_sets; i++)
+            if (shd->desc_layout[i])
+                vk->DestroyDescriptorSetLayout(s->hwctx->act_dev, shd->desc_layout[i],
+                                               s->hwctx->alloc);
+    }
 
     av_freep(&shd->desc_pool_size);
     av_freep(&shd->desc_layout);

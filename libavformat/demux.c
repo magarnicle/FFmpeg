@@ -111,6 +111,7 @@ static int set_codec_from_probe_data(AVFormatContext *s, AVStream *st,
         { "aac",        AV_CODEC_ID_AAC,          AVMEDIA_TYPE_AUDIO    },
         { "ac3",        AV_CODEC_ID_AC3,          AVMEDIA_TYPE_AUDIO    },
         { "aptx",       AV_CODEC_ID_APTX,         AVMEDIA_TYPE_AUDIO    },
+        { "av1",        AV_CODEC_ID_AV1,          AVMEDIA_TYPE_VIDEO    },
         { "dts",        AV_CODEC_ID_DTS,          AVMEDIA_TYPE_AUDIO    },
         { "dvbsub",     AV_CODEC_ID_DVB_SUBTITLE, AVMEDIA_TYPE_SUBTITLE },
         { "dvbtxt",     AV_CODEC_ID_DVB_TELETEXT, AVMEDIA_TYPE_SUBTITLE },
@@ -1173,7 +1174,15 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt,
 
     if (!size && !flush && sti->parser->flags & PARSER_FLAG_COMPLETE_FRAMES) {
         // preserve 0-size sync packets
-        compute_pkt_fields(s, st, sti->parser, pkt, AV_NOPTS_VALUE, AV_NOPTS_VALUE);
+        compute_pkt_fields(s, st, sti->parser, pkt, pkt->dts, pkt->pts);
+
+        // Theora has valid 0-sized packets that need to be output
+        if (st->codecpar->codec_id == AV_CODEC_ID_THEORA) {
+            ret = avpriv_packet_list_put(&fci->parse_queue,
+                                         pkt, NULL, 0);
+            if (ret < 0)
+                goto fail;
+        }
     }
 
     while (size > 0 || (flush && got_output)) {

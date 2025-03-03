@@ -754,11 +754,17 @@ static int test_segment(AVFormatContext *s, const AVInputFormat *in_fmt, struct 
         if (in_fmt->extensions) {
             matchF =      av_match_ext(    seg->url, in_fmt->extensions)
                      + 2*(ff_match_url_ext(seg->url, in_fmt->extensions) > 0);
-        } else if (!strcmp(in_fmt->name, "mpegts"))
-            matchF = 3;
+            if(av_match_name("mp4", in_fmt->name)) {
+                matchF |=      av_match_ext(    seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts")
+                          + 2*(ff_match_url_ext(seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts") > 0);
+            }
+        } else if (!strcmp(in_fmt->name, "mpegts")) {
+            matchF =      av_match_ext(    seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts")
+                     + 2*(ff_match_url_ext(seg->url, "ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts") > 0);
+        }
 
         if (!(matchA & matchF)) {
-            av_log(s, AV_LOG_ERROR, "detected format extension %s mismatches allowed extensions in url %s\n", in_fmt->extensions ? in_fmt->extensions : "none", seg->url);
+            av_log(s, AV_LOG_ERROR, "detected format %s extension %s mismatches allowed extensions in url %s\n", in_fmt->name, in_fmt->extensions ? in_fmt->extensions : "none", seg->url);
             return AVERROR_INVALIDDATA;
         }
     }
@@ -2627,7 +2633,7 @@ static const AVOption hls_options[] = {
     {"extension_picky", "Be picky with all extensions matching",
         OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
-        OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 3}, 0, INT_MAX, FLAGS},
+        OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 100}, 0, INT_MAX, FLAGS},
     {"m3u8_hold_counters", "The maximum number of times to load m3u8 when it refreshes without new segments",
         OFFSET(m3u8_hold_counters), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, FLAGS},
     {"http_persistent", "Use persistent HTTP connections",

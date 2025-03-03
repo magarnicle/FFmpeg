@@ -1,7 +1,4 @@
 /*
- * AAC encoder long term prediction extension
- * Copyright (C) 2015 Rostislav Pehlivanov
- *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -19,23 +16,30 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+
+#ifndef AVUTIL_HWCONTEXT_AMF_H
+#define AVUTIL_HWCONTEXT_AMF_H
+
+#include "pixfmt.h"
+#include "hwcontext.h"
+#include <AMF/core/Factory.h>
+#include <AMF/core/Context.h>
+#include <AMF/core/Trace.h>
+#include <AMF/core/Debug.h>
+
 /**
- * @file
- * AAC encoder long term prediction extension
- * @author Rostislav Pehlivanov ( atomnuker gmail com )
+ * This struct is allocated as AVHWDeviceContext.hwctx
  */
+typedef struct AVAMFDeviceContext {
+    void *              library;
+    AMFFactory         *factory;
+    void               *trace_writer;
 
-#ifndef AVCODEC_AACENC_LTP_H
-#define AVCODEC_AACENC_LTP_H
+    int64_t            version; ///< version of AMF runtime
+    AMFContext         *context;
+} AVAMFDeviceContext;
 
-#include "aacenc.h"
+enum AMF_SURFACE_FORMAT av_av_to_amf_format(enum AVPixelFormat fmt);
+enum AVPixelFormat av_amf_to_av_format(enum AMF_SURFACE_FORMAT fmt);
 
-void ff_aac_encode_ltp_info(AACEncContext *s, SingleChannelElement *sce,
-                            int common_window);
-void ff_aac_update_ltp(AACEncContext *s, SingleChannelElement *sce);
-void ff_aac_adjust_common_ltp(AACEncContext *s, ChannelElement *cpe);
-void ff_aac_ltp_insert_new_frame(AACEncContext *s);
-void ff_aac_search_for_ltp(AACEncContext *s, SingleChannelElement *sce,
-                           int common_window);
-
-#endif /* AVCODEC_AACENC_LTP_H */
+#endif /* AVUTIL_HWCONTEXT_AMF_H */
