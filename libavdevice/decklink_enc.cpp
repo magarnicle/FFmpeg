@@ -175,8 +175,12 @@ public:
         decklink_frame *frame = static_cast<decklink_frame *>(_frame);
         struct decklink_ctx *ctx = frame->_ctx;
 
-        if (frame->_avframe)
+        if (frame->_avframe){
+            if (result > 0){
+                printf("Frame %ld not displayed correctly, result is: %d\n", frame->_avframe->pts, result);
+            }
             av_frame_unref(frame->_avframe);
+        }
         if (frame->_avpacket)
             av_packet_unref(frame->_avpacket);
 
@@ -420,7 +424,7 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
     av_log(avctx, AV_LOG_DEBUG, "Waiting for %d outstanding frames to return their results\n", ctx->outstanding_frames);
-    while (ctx->outstanding_frames > 0){
+    while (0 && ctx->outstanding_frames > 0){
         usleep(1);
     }
     av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
