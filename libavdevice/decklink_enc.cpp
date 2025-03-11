@@ -176,9 +176,6 @@ public:
         struct decklink_ctx *ctx = frame->_ctx;
 
         if (frame->_avframe){
-            if (result > 0){
-                printf("Frame %ld not displayed correctly, result is: %d\n", frame->_avframe->pts, result);
-            }
             av_frame_unref(frame->_avframe);
         }
         if (frame->_avpacket)
@@ -187,9 +184,6 @@ public:
         pthread_mutex_lock(&ctx->mutex);
         ctx->frames_buffer_available_spots++;
         pthread_cond_broadcast(&ctx->cond);
-        pthread_mutex_unlock(&ctx->mutex);
-        pthread_mutex_lock(&ctx->mutex);
-        ctx->outstanding_frames--;
         pthread_mutex_unlock(&ctx->mutex);
         return S_OK;
     }
@@ -422,16 +416,21 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    uint32_t buffered;
 
-    av_log(avctx, AV_LOG_DEBUG, "Waiting for %d outstanding frames to return their results\n", ctx->outstanding_frames);
-    while (ctx->outstanding_frames > 0){
-        usleep(1);
-    }
-    av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
     if (ctx->playback_started) {
         BMDTimeValue actual;
         ctx->dlo->StopScheduledPlayback(ctx->last_pts * ctx->bmd_tb_num,
                                         &actual, ctx->bmd_tb_den);
+        while (1){
+            ctx->dlo->GetBufferedVideoFrameCount(&buffered);
+            if (buffered == 0){
+                break;
+            }
+            av_log(avctx, AV_LOG_DEBUG, "Waiting for %d buffered frames to finish\n", buffered);
+            usleep(1);
+        }
+        av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
         ctx->dlo->DisableVideoOutput();
         if (ctx->audio)
             ctx->dlo->DisableAudioOutput();
@@ -808,9 +807,6 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         return AVERROR(EIO);
     }
 
-    pthread_mutex_lock(&ctx->mutex);
-    ctx->outstanding_frames++;
-    pthread_mutex_unlock(&ctx->mutex);
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
     av_log(avctx, AV_LOG_DEBUG, "Buffered video frames: %d.\n", (int) buffered);
     if (pkt->pts > 2 && buffered <= 2)
