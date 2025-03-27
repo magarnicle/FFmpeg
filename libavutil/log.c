@@ -341,8 +341,9 @@ static void format_line(void *avcl, int level, const char *fmt, va_list vl,
         if(type) type[1] = get_category(avcl);
     }
 
-    if (*print_prefix && (level > AV_LOG_QUIET) && (flags & (AV_LOG_PRINT_TIME | AV_LOG_PRINT_DATETIME)))
+    if (*print_prefix && (level > AV_LOG_QUIET) && (flags & (AV_LOG_PRINT_TIME | AV_LOG_PRINT_DATETIME))){
         format_date_now(&part[4], flags & AV_LOG_PRINT_DATETIME);
+    }
 
     if (*print_prefix && (level > AV_LOG_QUIET) && (flags & AV_LOG_PRINT_LEVEL))
         av_bprintf(part+2, "[%s] ", get_level_str(level));
@@ -368,7 +369,7 @@ int av_log_format_line2(void *ptr, int level, const char *fmt, va_list vl,
     int ret;
 
     format_line(ptr, level, fmt, vl, part, print_prefix, NULL);
-    ret = snprintf(line, line_size, "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
+    ret = snprintf(line, line_size, "%s%s%s%s%s", part[4].str, part[0].str, part[1].str, part[2].str, part[3].str);
     av_bprint_finalize(part+3, NULL);
     return ret;
 }

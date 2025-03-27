@@ -177,9 +177,21 @@ public:
 
         if (frame->_avframe){
             av_frame_unref(frame->_avframe);
-        }
-        if (frame->_avpacket)
+            if (result > 0) {
+                printf("AV Frame was not displayed, result code: %d\n", result);
+            }
+        } else if (result > 0) {
+                printf("Non-AV Frame was not displayed, result code: %d\n", result);
+            }
+        if (frame->_avpacket) {
             av_packet_unref(frame->_avpacket);
+            if (result > 0) {
+                printf("AV Packet was not displayed, result code: %d\n", result);
+            }
+        }
+        if (result > 0) {
+            printf("!!result code: %d\n", result);
+        }
 
         pthread_mutex_lock(&ctx->mutex);
         ctx->frames_buffer_available_spots++;
@@ -428,9 +440,14 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
                 break;
             }
             av_log(avctx, AV_LOG_DEBUG, "Waiting for %d buffered frames to finish\n", buffered);
-            usleep(1);
+            if (buffered < 5) {
+                usleep(1);
+            } else {
+                usleep(300);
+            }
         }
         av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
+        av_log(avctx, AV_LOG_DEBUG, "Stopped at %ld, requested %ld\n", actual, ctx->last_pts * ctx->bmd_tb_num);
         ctx->dlo->DisableVideoOutput();
         if (ctx->audio)
             ctx->dlo->DisableAudioOutput();
