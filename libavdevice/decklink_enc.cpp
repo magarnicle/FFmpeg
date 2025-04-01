@@ -447,7 +447,7 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
             }
         }
         av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
-        av_log(avctx, AV_LOG_DEBUG, "Stopped at %ld, requested %ld\n", actual, ctx->last_pts * ctx->bmd_tb_num);
+        av_log(avctx, AV_LOG_INFO, "Stopped at %ld, requested %ld\n", actual, ctx->last_pts * ctx->bmd_tb_num);
         ctx->dlo->DisableVideoOutput();
         if (ctx->audio)
             ctx->dlo->DisableAudioOutput();
