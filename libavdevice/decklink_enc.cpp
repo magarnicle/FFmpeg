@@ -178,19 +178,21 @@ public:
         if (frame->_avframe){
             av_frame_unref(frame->_avframe);
             if (result > 0) {
-                printf("AV Frame was not displayed, result code: %d\n", result);
+                av_log(NULL, AV_LOG_WARNING, "AV Frame was not displayed, result code: %d\n", result);
             }
         } else if (result > 0) {
-                printf("Non-AV Frame was not displayed, result code: %d\n", result);
+                av_log(NULL, AV_LOG_WARNING, "Non-AV Frame was not displayed, result code: %d\n", result);
             }
         if (frame->_avpacket) {
             av_packet_unref(frame->_avpacket);
             if (result > 0) {
-                printf("AV Packet was not displayed, result code: %d\n", result);
+                av_log(NULL, AV_LOG_WARNING, "AV Packet was not displayed, result code: %d\n", result);
             }
         }
         if (result > 0) {
-            printf("!!result code: %d\n", result);
+            av_log(NULL, AV_LOG_INFO, "decklink output result code: %d\n", result);
+        } else {
+            av_log(NULL, AV_LOG_DEBUG, "decklink output result is normal\n");
         }
 
         pthread_mutex_lock(&ctx->mutex);
@@ -221,13 +223,13 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     AVCodecParameters *c = st->codecpar;
 
     if (ctx->video) {
-        av_log(avctx, AV_LOG_ERROR, "Only one video stream is supported!\n");
-        return -1;
-    }
+    av_log(avctx, AV_LOG_ERROR, "Only one video stream is supported!\n");
+    return -1;
+}
 
-    if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
-        if (c->format != AV_PIX_FMT_UYVY422) {
-            av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format!"
+if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+    if (c->format != AV_PIX_FMT_UYVY422) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format!"
                    " Only AV_PIX_FMT_UYVY422 is supported.\n");
             return -1;
         }
@@ -264,7 +266,7 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
             av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
             already_logged = 1;
         }
-        usleep(1000000 / 60);
+        usleep(1000);
         continue;
     }
 
