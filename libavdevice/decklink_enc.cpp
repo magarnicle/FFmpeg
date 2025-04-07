@@ -223,20 +223,21 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     AVCodecParameters *c = st->codecpar;
 
     if (ctx->video) {
-    av_log(avctx, AV_LOG_ERROR, "Only one video stream is supported!\n");
-    return -1;
-}
+        av_log(avctx, AV_LOG_ERROR, "Only one video stream is supported!\n");
+        return -1;
+    }
+    av_log(NULL, AV_LOG_ERROR, "!SETUP VIDEO\n");
 
-if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
-    if (c->format != AV_PIX_FMT_UYVY422) {
-        av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format!"
-                   " Only AV_PIX_FMT_UYVY422 is supported.\n");
+    if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+        if (c->format != AV_PIX_FMT_UYVY422) {
+            av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format!"
+                    " Only AV_PIX_FMT_UYVY422 is supported.\n");
             return -1;
         }
         ctx->raw_format = bmdFormat8BitYUV;
     } else if (c->codec_id != AV_CODEC_ID_V210) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported codec type!"
-               " Only V210 and wrapped frame with AV_PIX_FMT_UYVY422 are supported.\n");
+                " Only V210 and wrapped frame with AV_PIX_FMT_UYVY422 are supported.\n");
         return -1;
     } else {
         ctx->raw_format = bmdFormat10BitYUV;
@@ -247,28 +248,16 @@ if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
         return -1;
     }
     if (ff_decklink_set_format(avctx, c->width, c->height,
-                            st->time_base.num, st->time_base.den, c->field_order)) {
+                st->time_base.num, st->time_base.den, c->field_order)) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported video size, framerate or field order!"
-               " Check available formats with -list_formats 1.\n");
+                " Check available formats with -list_formats 1.\n");
         return -1;
     }
     if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
         av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
         ctx->supports_vanc = 0;
     }
-    int already_logged = 0;
-    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
-        if (!ctx->block_until_available) {
-            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
-            return -1;
-        };
-        if (!already_logged){
-            av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
-            already_logged = 1;
-        }
-        usleep(1000);
-        continue;
-    }
+
 
     /* Set callback. */
     ctx->output_callback = new decklink_output_callback();
@@ -286,12 +275,14 @@ if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
 
     av_log(avctx, AV_LOG_DEBUG, "output: %s, preroll: %d, frames buffer size: %d\n",
-           avctx->url, ctx->frames_preroll, ctx->frames_buffer);
+            avctx->url, ctx->frames_preroll, ctx->frames_buffer);
 
     /* The device expects the framerate to be fixed. */
     avpriv_set_pts_info(st, 64, st->time_base.num, st->time_base.den);
 
     ctx->video = 1;
+
+
 
     return 0;
 }
@@ -302,6 +293,7 @@ static int decklink_setup_audio(AVFormatContext *avctx, AVStream *st)
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     AVCodecParameters *c = st->codecpar;
 
+    av_log(NULL, AV_LOG_ERROR, "!SETUP AUDIO\n");
     if (ctx->audio) {
         av_log(avctx, AV_LOG_ERROR, "Only one audio stream is supported!\n");
         return -1;
@@ -431,6 +423,7 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     uint32_t buffered;
+    av_log(NULL, AV_LOG_ERROR, "!WRITE TRAILER\n");
 
     if (ctx->playback_started) {
         BMDTimeValue actual;
@@ -764,6 +757,8 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint32_t buffered;
     HRESULT hr;
 
+    av_log(NULL, AV_LOG_ERROR, "!WRITE VIDEO PACKET\n");
+
     ctx->last_pts = FFMAX(ctx->last_pts, pkt->pts);
 
     if (st->codecpar->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
@@ -814,6 +809,20 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     if (ctx->first_pts == AV_NOPTS_VALUE)
         ctx->first_pts = pkt->pts;
 
+    /* Preroll video frames. */
+    if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
+        av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
+        if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
+            return AVERROR(EIO);
+        }
+        av_log(avctx, AV_LOG_INFO, "Starting scheduled playback.\n");
+        if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
+            return AVERROR(EIO);
+        }
+        ctx->playback_started = 1;
+    }
     /* Schedule frame for playback. */
     hr = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame_v14_2_1 *) frame,
                                       pkt->pts * ctx->bmd_tb_num,
@@ -832,20 +841,6 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
                " Video may misbehave!\n");
 
-    /* Preroll video frames. */
-    if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
-        av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
-        if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
-            return AVERROR(EIO);
-        }
-        av_log(avctx, AV_LOG_INFO, "Starting scheduled playback.\n");
-        if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
-            return AVERROR(EIO);
-        }
-        ctx->playback_started = 1;
-    }
 
     return 0;
 }
@@ -919,6 +914,8 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     struct decklink_ctx *ctx;
     unsigned int n;
     int ret;
+    int already_logged;
+    av_log(NULL, AV_LOG_ERROR, "!WRITE HEADER\n");
 
     ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
     if (!ctx)
@@ -1005,6 +1002,19 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
         goto error;
     }
 
+    already_logged = 0;
+    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
+        if (!ctx->block_until_available) {
+            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
+            return -1;
+        };
+        if (!already_logged){
+            av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
+            already_logged = 1;
+        }
+        usleep(1000);
+        continue;
+    }
     return 0;
 
 error:
@@ -1014,6 +1024,8 @@ error:
 
 int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
+    av_log(NULL, AV_LOG_ERROR, "!WRITE PACKET\n");
+
     AVStream *st = avctx->streams[pkt->stream_index];
 
     if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
