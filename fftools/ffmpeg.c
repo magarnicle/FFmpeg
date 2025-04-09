@@ -883,13 +883,11 @@ static int transcode(Scheduler *sch)
 
         /* dump report by using the output first video and audio streams */
         print_report(0, timer_start, cur_time, transcode_ts);
-        av_log(NULL, AV_LOG_DEBUG, "transcode_ts: %ld \n", transcode_ts);
         speed   = transcode_ts != AV_NOPTS_VALUE && t != 0.0 ? (double)transcode_ts / AV_TIME_BASE / t : -1;
-        if (transcode_ts > 5000000 && speed > 0 && speed < 0.01) {
+        if (transcode_ts > 0 && speed > 0 && speed < 0.01) {
             av_log(NULL, AV_LOG_ERROR, "speed: %8.0f \n", speed);
             av_log(NULL, AV_LOG_ERROR, "Transcode speed slow, likely stuck, killing\n");
-            ret = -1;
-            break;
+            return -1;
         }
     }
 

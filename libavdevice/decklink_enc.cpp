@@ -191,8 +191,6 @@ public:
         }
         if (result > 0) {
             av_log(NULL, AV_LOG_INFO, "decklink output result code: %d\n", result);
-        } else {
-            av_log(NULL, AV_LOG_DEBUG, "decklink output result is normal\n");
         }
 
         pthread_mutex_lock(&ctx->mutex);
@@ -226,7 +224,6 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
         av_log(avctx, AV_LOG_ERROR, "Only one video stream is supported!\n");
         return -1;
     }
-    av_log(NULL, AV_LOG_ERROR, "!SETUP VIDEO\n");
 
     if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
         if (c->format != AV_PIX_FMT_UYVY422) {
@@ -293,7 +290,6 @@ static int decklink_setup_audio(AVFormatContext *avctx, AVStream *st)
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     AVCodecParameters *c = st->codecpar;
 
-    av_log(NULL, AV_LOG_ERROR, "!SETUP AUDIO\n");
     if (ctx->audio) {
         av_log(avctx, AV_LOG_ERROR, "Only one audio stream is supported!\n");
         return -1;
@@ -423,7 +419,6 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     uint32_t buffered;
-    av_log(NULL, AV_LOG_ERROR, "!WRITE TRAILER\n");
 
     if (ctx->playback_started) {
         BMDTimeValue actual;
@@ -757,7 +752,6 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint32_t buffered;
     HRESULT hr;
 
-    av_log(NULL, AV_LOG_ERROR, "!WRITE VIDEO PACKET\n");
 
     ctx->last_pts = FFMAX(ctx->last_pts, pkt->pts);
 
@@ -915,7 +909,6 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     unsigned int n;
     int ret;
     int already_logged;
-    av_log(NULL, AV_LOG_ERROR, "!WRITE HEADER\n");
 
     ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
     if (!ctx)
@@ -1013,7 +1006,6 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
             already_logged = 1;
         }
         usleep(1000);
-        continue;
     }
     return 0;
 
@@ -1024,7 +1016,6 @@ error:
 
 int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-    av_log(NULL, AV_LOG_ERROR, "!WRITE PACKET\n");
 
     AVStream *st = avctx->streams[pkt->stream_index];
 
