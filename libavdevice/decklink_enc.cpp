@@ -218,6 +218,7 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    int already_logged;
     AVCodecParameters *c = st->codecpar;
 
     if (ctx->video) {
@@ -253,6 +254,18 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
         av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
         ctx->supports_vanc = 0;
+    }
+    already_logged = 0;
+    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
+        if (!ctx->block_until_available) {
+            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
+            return -1;
+        };
+        if (!already_logged){
+            av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
+            already_logged = 1;
+        }
+        usleep(1000);
     }
 
 
@@ -803,20 +816,6 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     if (ctx->first_pts == AV_NOPTS_VALUE)
         ctx->first_pts = pkt->pts;
 
-    /* Preroll video frames. */
-    if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
-        av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
-        if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
-            return AVERROR(EIO);
-        }
-        av_log(avctx, AV_LOG_INFO, "Starting scheduled playback.\n");
-        if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
-            return AVERROR(EIO);
-        }
-        ctx->playback_started = 1;
-    }
     /* Schedule frame for playback. */
     hr = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame_v14_2_1 *) frame,
                                       pkt->pts * ctx->bmd_tb_num,
@@ -835,6 +834,20 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
                " Video may misbehave!\n");
 
+    /* Preroll video frames. */
+    if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
+        av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
+        if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
+            return AVERROR(EIO);
+        }
+        av_log(avctx, AV_LOG_INFO, "Starting scheduled playback.\n");
+        if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
+            return AVERROR(EIO);
+        }
+        ctx->playback_started = 1;
+    }
 
     return 0;
 }
@@ -908,7 +921,6 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     struct decklink_ctx *ctx;
     unsigned int n;
     int ret;
-    int already_logged;
 
     ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
     if (!ctx)
@@ -995,18 +1007,6 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
         goto error;
     }
 
-    already_logged = 0;
-    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
-        if (!ctx->block_until_available) {
-            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
-            return -1;
-        };
-        if (!already_logged){
-            av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
-            already_logged = 1;
-        }
-        usleep(1000);
-    }
     return 0;
 
 error:
