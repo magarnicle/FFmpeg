@@ -93,8 +93,8 @@ typedef struct DecklinkPacketQueue {
 struct decklink_ctx {
     /* DeckLink SDK interfaces */
     IDeckLink *dl;
-    IDeckLinkOutput *dlo;
-    IDeckLinkInput *dli;
+    IDeckLinkOutput_v14_2_1 *dlo;
+    IDeckLinkInput_v14_2_1 *dli;
     IDeckLinkConfiguration *cfg;
     IDeckLinkProfileAttributes *attr;
     decklink_output_callback *output_callback;
@@ -134,7 +134,6 @@ struct decklink_ctx {
     AVStream *klv_st;
     AVStream *teletext_st;
     uint16_t cdp_sequence_num;
-
     /* Options */
     int list_devices;
     int list_formats;
@@ -149,6 +148,7 @@ struct decklink_ctx {
     BMDPixelFormat raw_format;
     DecklinkSignalLossAction signal_loss_action;
 
+
     int frames_preroll;
     int frames_buffer;
 
@@ -156,6 +156,7 @@ struct decklink_ctx {
     pthread_cond_t cond;
     int frames_buffer_available_spots;
     int autodetect;
+    int block_until_available;
 
 #if CONFIG_LIBKLVANC
     struct klvanc_context_s *vanc_ctx;
@@ -249,3 +250,4 @@ int ff_decklink_packet_queue_get(DecklinkPacketQueue *q, AVPacket *pkt, int bloc
 int64_t ff_decklink_packet_queue_peekpts(DecklinkPacketQueue *q);
 
 #endif /* AVDEVICE_DECKLINK_COMMON_H */
+

@@ -856,6 +856,8 @@ static int transcode(Scheduler *sch)
 {
     int ret = 0;
     int64_t timer_start, transcode_ts = 0;
+    float t;
+    double speed;
 
     print_stream_maps();
 
@@ -881,6 +883,12 @@ static int transcode(Scheduler *sch)
 
         /* dump report by using the output first video and audio streams */
         print_report(0, timer_start, cur_time, transcode_ts);
+        speed   = transcode_ts != AV_NOPTS_VALUE && t != 0.0 ? (double)transcode_ts / AV_TIME_BASE / t : -1;
+        if (transcode_ts > 0 && speed > 0 && speed < 0.01) {
+            av_log(NULL, AV_LOG_ERROR, "speed: %8.0f \n", speed);
+            av_log(NULL, AV_LOG_ERROR, "Transcode speed slow, likely stuck, killing\n");
+            return -1;
+        }
     }
 
     ret = sch_stop(sch, &transcode_ts);
