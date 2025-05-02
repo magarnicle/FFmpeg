@@ -845,6 +845,8 @@ finish:
 
 static av_cold int decode_close(AVCodecContext *avctx)
 {
+    av_log(avctx, AV_LOG_DEBUG, "Closing decoder\n");
+
     ProresContext *ctx = avctx->priv_data;
 
     av_freep(&ctx->slices);

@@ -155,6 +155,7 @@ static int activate(AVFilterContext *ctx)
                "%d buffers queued in %s, something may be wrong.\n",
                buf->warning_limit,
                (char *)av_x_if_null(ctx->name, ctx->filter->name));
+	return - buf->warning_limit;
         buf->warning_limit *= 10;
     }
 

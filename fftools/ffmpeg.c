@@ -895,10 +895,12 @@ static int transcode(Scheduler *sch)
 
     /* write the trailer if needed */
     for (int i = 0; i < nb_output_files; i++) {
+	av_log(NULL, AV_LOG_VERBOSE, "Writing trailer for input %d\n", i);
         int err = of_write_trailer(output_files[i]);
         ret = err_merge(ret, err);
     }
 
+    av_log(NULL, AV_LOG_VERBOSE, "Terminating\n");
     term_exit();
 
     /* dump report by using the first video and audio streams */

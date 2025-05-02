@@ -133,6 +133,7 @@ static int activate(AVFilterContext *ctx)
         } else if (!s->cache_start) {
             FF_FILTER_FORWARD_WANTED(outlink, inlink);
         }
+	av_log(ctx, AV_LOG_VERBOSE, "Cloning frame %ld\n", s->pts);
         frame = av_frame_clone(s->cache_start);
         if (!frame)
             return AVERROR(ENOMEM);
@@ -153,6 +154,7 @@ static int activate(AVFilterContext *ctx)
         if (ret > 0) {
             if (s->stop_mode == MODE_CLONE && s->pad_stop != 0) {
                 av_frame_free(&s->cache_stop);
+		av_log(ctx, AV_LOG_VERBOSE, "Cloning frame %ld\n", s->pts);
                 s->cache_stop = av_frame_clone(frame);
             }
             frame->pts += s->pts;
@@ -178,6 +180,7 @@ static int activate(AVFilterContext *ctx)
                 ff_outlink_set_status(outlink, AVERROR_EOF, s->pts);
                 return 0;
             }
+	    av_log(ctx, AV_LOG_VERBOSE, "Cloning frame %ld\n", s->pts);
             frame = av_frame_clone(s->cache_stop);
             if (!frame)
                 return AVERROR(ENOMEM);

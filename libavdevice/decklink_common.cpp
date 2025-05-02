@@ -648,19 +648,18 @@ int ff_decklink_list_formats(AVFormatContext *avctx, decklink_direction_t direct
 
 void ff_decklink_cleanup(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
-
-    if (ctx->dli)
-        ctx->dli->Release();
-    if (ctx->dlo)
-        ctx->dlo->Release();
-    if (ctx->attr)
-        ctx->attr->Release();
-    if (ctx->cfg)
-        ctx->cfg->Release();
-    if (ctx->dl)
-        ctx->dl->Release();
+	struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+	struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+	if (ctx->dli)
+		ctx->dli->Release();
+	if (ctx->dlo)
+		ctx->dlo->Release();
+	if (ctx->attr)
+		ctx->attr->Release();
+	if (ctx->cfg)
+		ctx->cfg->Release();
+	if (ctx->dl)
+		ctx->dl->Release();
 }
 
 int ff_decklink_init_device(AVFormatContext *avctx, const char* name)

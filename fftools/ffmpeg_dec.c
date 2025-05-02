@@ -925,6 +925,7 @@ static int decoder_thread(void *arg)
         int flush_buffers, have_data;
 
         input_status  = sch_dec_receive(dp->sch, dp->sch_idx, dt.pkt);
+        av_log(dp, AV_LOG_TRACE, "input_status: %d, dt.pkt.buf: %d, dt.pkt.side_data_elems: %d, dt.pkt.opaque: %ld\n", input_status, dt.pkt->buf, dt.pkt->side_data_elems, (intptr_t)dt.pkt->opaque);
         have_data     = input_status >= 0 &&
             (dt.pkt->buf || dt.pkt->side_data_elems ||
              (intptr_t)dt.pkt->opaque == PKT_OPAQUE_SUB_HEARTBEAT ||

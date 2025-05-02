@@ -400,15 +400,19 @@ static int activate(AVFilterContext *ctx)
             ret = ff_inlink_acknowledge_status(inlink, &status, &pts);
             /* TODO use pts */
             if (ret > 0) {
+                av_log(ctx, AV_LOG_DEBUG,
+                    "ff_inlink_acknowledge_status status %d, pts %ld, ret: %d\n", status, pts, ret);
                 close_input(ctx, cat->cur_idx + i);
                 if (cat->cur_idx + ctx->nb_outputs >= ctx->nb_inputs) {
                     int64_t eof_pts = cat->delta_ts;
 
                     eof_pts += av_rescale_q(pts, inlink->time_base, ctx->outputs[i]->time_base);
                     ff_outlink_set_status(ctx->outputs[i], status, eof_pts);
-                }
+		    av_log(ctx, AV_LOG_DEBUG,
+			    "ff_outlink_set_status status, eof_pts: %d, %ld\n", status, eof_pts);
+			}
                 if (!cat->nb_in_active) {
-                    ret = flush_segment(ctx);
+                   ret = flush_segment(ctx);
                     if (ret < 0)
                         return ret;
                 }
