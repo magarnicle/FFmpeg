@@ -1021,6 +1021,7 @@ static int decoder_thread(void *arg)
 finish:
     dec_thread_uninit(&dt);
 
+    av_log(dp, AV_LOG_VERBOSE, "Decoder thread ret: %d\n", ret);
     return ret;
 }
 
