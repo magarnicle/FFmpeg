@@ -174,6 +174,26 @@ static int black_counter(AVFilterContext *ctx, void *arg,
     s->counter[jobnr] = s->func(in->data[plane] + start * linesize,
                                 linesize, in->width, end - start,
                                 s->pixel_black_th_i);
+    if (s->depth == 8) {
+        const uint8_t *p = in->data[0] + start * linesize;
+
+        for (int i = 0; i < size; i++) {
+            for (int x = 0; x < w; x++)
+                counter += p[x] <= threshold;
+            p += linesize;
+        }
+    } else {
+        const uint16_t *p = (const uint16_t *)(in->data[0] + start * linesize);
+
+        // Rademaker
+        for (int i = 0; i < size; i++) {
+            for (int x = 0; x < w; x++)
+                counter += p[x] <= threshold;
+            p += linesize / 2;
+        }
+    }
+
+    *counterp = counter;
 
     return 0;
 }
