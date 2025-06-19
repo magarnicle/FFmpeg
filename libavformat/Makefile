@@ -119,6 +119,8 @@ OBJS-$(CONFIG_APTX_DEMUXER)              += aptxdec.o
 OBJS-$(CONFIG_APTX_MUXER)                += rawenc.o
 OBJS-$(CONFIG_APTX_HD_DEMUXER)           += aptxdec.o
 OBJS-$(CONFIG_APTX_HD_MUXER)             += rawenc.o
+OBJS-$(CONFIG_APV_DEMUXER)               += apvdec.o
+OBJS-$(CONFIG_APV_MUXER)                 += apvenc.o
 OBJS-$(CONFIG_AQTITLE_DEMUXER)           += aqtitledec.o subtitles.o
 OBJS-$(CONFIG_ARGO_ASF_DEMUXER)          += argo_asf.o
 OBJS-$(CONFIG_ARGO_ASF_MUXER)            += argo_asf.o
@@ -377,7 +379,7 @@ OBJS-$(CONFIG_MOV_DEMUXER)               += mov.o mov_chan.o mov_esds.o \
 OBJS-$(CONFIG_MOV_MUXER)                 += movenc.o \
                                             movenchint.o mov_chan.o rtp.o \
                                             movenccenc.o movenc_ttml.o rawutils.o \
-                                            dovi_isom.o evc.o
+                                            dovi_isom.o evc.o cbs.o cbs_av1.o
 OBJS-$(CONFIG_MP2_MUXER)                 += rawenc.o
 OBJS-$(CONFIG_MP3_DEMUXER)               += mp3dec.o replaygain.o
 OBJS-$(CONFIG_MP3_MUXER)                 += mp3enc.o rawenc.o id3v2enc.o

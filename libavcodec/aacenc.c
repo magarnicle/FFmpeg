@@ -1235,14 +1235,13 @@ static av_cold int aac_encode_init(AVCodecContext *avctx)
     }
 
     /* Samplerate */
-    for (i = 0; i < 16; i++)
-        if (avctx->sample_rate == ff_mpeg4audio_sample_rates[i])
+    for (int i = 0;; i++) {
+        av_assert1(i < 13);
+        if (avctx->sample_rate == ff_mpeg4audio_sample_rates[i]) {
+            s->samplerate_index = i;
             break;
-    s->samplerate_index = i;
-    ERROR_IF(s->samplerate_index == 16 ||
-             s->samplerate_index >= ff_aac_swb_size_1024_len ||
-             s->samplerate_index >= ff_aac_swb_size_128_len,
-             "Unsupported sample rate %d\n", avctx->sample_rate);
+        }
+    }
 
     /* Bitrate limiting */
     WARN_IF(1024.0 * avctx->bit_rate / avctx->sample_rate > 6144 * s->channels,
@@ -1344,9 +1343,8 @@ const FFCodec ff_aac_encoder = {
     FF_CODEC_ENCODE_CB(aac_encode_frame),
     .close          = aac_encode_end,
     .defaults       = aac_encode_defaults,
-    .p.supported_samplerates = ff_mpeg4audio_sample_rates,
+    CODEC_SAMPLERATES_ARRAY(ff_mpeg4audio_sample_rates),
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
-    .p.sample_fmts  = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_FLTP,
-                                                     AV_SAMPLE_FMT_NONE },
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP),
     .p.priv_class   = &aacenc_class,
 };

@@ -231,6 +231,10 @@ static const AVOption options[] = {
                                                             OFFSET(max_slice_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VE },
     { "constrained-encoding", "Enable constrainedFrame encoding where each slice in the constrained picture is independent of other slices",
                                                             OFFSET(constrained_encoding), AV_OPT_TYPE_BOOL,  { .i64 = 0 }, 0, 1, VE },
+#ifdef NVENC_HAVE_FILLER_DATA
+    { "cbr_padding",  "Pad the bitstream to ensure bitrate does not drop below the target in CBR mode",
+                                                            OFFSET(cbr_padding),  AV_OPT_TYPE_BOOL,  { .i64 = 0 }, 0, 1, VE },
+#endif
 #ifdef NVENC_HAVE_H264_AND_AV1_TEMPORAL_FILTER
     { "tf_level",     "Specifies the strength of the temporal filtering",
                                                             OFFSET(tf_level),     AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, INT_MAX, VE, .unit = "tf_level" },
@@ -286,7 +290,7 @@ const FFCodec ff_h264_nvenc_encoder = {
                       AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE |
                       FF_CODEC_CAP_INIT_CLEANUP,
-    .p.pix_fmts     = ff_nvenc_pix_fmts,
+    CODEC_PIXFMTS_ARRAY(ff_nvenc_pix_fmts),
     .color_ranges   = AVCOL_RANGE_MPEG | AVCOL_RANGE_JPEG,
     .p.wrapper_name = "nvenc",
     .hw_configs     = ff_nvenc_hw_configs,
