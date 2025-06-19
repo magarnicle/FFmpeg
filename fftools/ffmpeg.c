@@ -579,6 +579,8 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     vid = 0;
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprint_init(&buf_script, 0, AV_BPRINT_SIZE_AUTOMATIC);
+
+    //format_date_now(&buf, AV_LOG_PRINT_DATETIME);
     for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
         const float q = ost->enc ? atomic_load(&ost->quality) / (float) FF_QP2LAMBDA : -1;
 

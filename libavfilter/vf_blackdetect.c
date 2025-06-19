@@ -159,6 +159,7 @@ static int black_counter(AVFilterContext *ctx, void *arg,
     } else {
         const uint16_t *p = (const uint16_t *)(in->data[0] + start * linesize);
 
+        // Rademaker
         for (int i = 0; i < size; i++) {
             for (int x = 0; x < w; x++)
                 counter += p[x] <= threshold;
