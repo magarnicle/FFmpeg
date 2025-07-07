@@ -236,8 +236,8 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     ret = av_interleaved_write_frame(s, pkt);
     if (ret < 0) {
         av_log(ost, AV_LOG_ERROR,
-               "Error submitting a packet to the muxer: %s\n",
-               av_err2str(ret));
+               "Error submitting a packet to the muxer for output '%s': %s\n",
+               s->url ? s->url : "(unknown)", av_err2str(ret));
         goto fail;
     }
 
@@ -752,7 +752,8 @@ int of_write_trailer(OutputFile *of)
 
     ret = av_write_trailer(fc);
     if (ret < 0) {
-        av_log(mux, AV_LOG_ERROR, "Error writing trailer: %s\n", av_err2str(ret));
+        av_log(mux, AV_LOG_ERROR, "Error writing trailer for output '%s': %s\n",
+               of->url ? of->url : "(unknown)", av_err2str(ret));
         mux_result = err_merge(mux_result, ret);
     }
 
@@ -761,7 +762,8 @@ int of_write_trailer(OutputFile *of)
     if (!(fc->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_closep(&fc->pb);
         if (ret < 0) {
-            av_log(mux, AV_LOG_ERROR, "Error closing file: %s\n", av_err2str(ret));
+            av_log(mux, AV_LOG_ERROR, "Error closing file '%s': %s\n",
+               of->url ? of->url : "(unknown)", av_err2str(ret));
             mux_result = err_merge(mux_result, ret);
         }
     }

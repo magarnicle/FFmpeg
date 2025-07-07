@@ -237,7 +237,7 @@ int64_t avio_seek(AVIOContext *s, int64_t offset, int whence)
     int buffer_size;
     int short_seek;
     whence &= ~AVSEEK_FORCE;
-
+    av_log(s, AV_LOG_DEBUG, "Seeking offset: %ld, whence %d\n", offset, whence);
     if(!s)
         return AVERROR(EINVAL);
 
