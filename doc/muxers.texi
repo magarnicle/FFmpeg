@@ -2436,13 +2436,14 @@ ffmpeg -re -i in.ts -b:a:0 32k -b:a:1 64k -b:v:0 1000k \
 @item
 Create a single variant stream. Add the @code{#EXT-X-MEDIA} tag with
 @code{TYPE=SUBTITLES} in the master playlist with webvtt subtitle group name
-'subtitle'. Make sure the input file has one text subtitle stream at least.
+'subtitle' and optional subtitle name, e.g. 'English'. Make sure the input
+file has one text subtitle stream at least.
 @example
 ffmpeg -y -i input_with_subtitle.mkv \
  -b:v:0 5250k -c:v h264 -pix_fmt yuv420p -profile:v main -level 4.1 \
  -b:a:0 256k \
  -c:s webvtt -c:a mp2 -ar 48000 -ac 2 -map 0:v -map 0:a:0 -map 0:s:0 \
- -f hls -var_stream_map "v:0,a:0,s:0,sgroup:subtitle" \
+ -f hls -var_stream_map "v:0,a:0,s:0,sgroup:subtitle,sname:English" \
  -master_pl_name master.m3u8 -t 300 -hls_time 10 -hls_init_time 4 -hls_list_size \
  10 -master_pl_publish_rate 10 -hls_flags \
  delete_segments+discont_start+split_by_time ./tmp/video.m3u8
@@ -3877,5 +3878,54 @@ ffmpeg -f webm_dash_manifest -i video1.webm \
        -adaptation_sets "id=0,streams=0,1 id=1,streams=2,3" \
        manifest.xml
 @end example
+
+@anchor{whip}
+@section whip
+
+WebRTC (Real-Time Communication) muxer that supports sub-second latency streaming according to
+the WHIP (WebRTC-HTTP ingestion protocol) specification.
+
+This is an experimental feature.
+
+It uses HTTP as a signaling protocol to exchange SDP capabilities and ICE lite candidates. Then,
+it uses STUN binding requests and responses to establish a session over UDP. Subsequently, it
+initiates a DTLS handshake to exchange the SRTP encryption keys. Lastly, it splits video and
+audio frames into RTP packets and encrypts them using SRTP.
+
+Ensure that you use H.264 without B frames and Opus for the audio codec. For example, to convert
+an input file with @command{ffmpeg} to WebRTC:
+@example
+ffmpeg -re -i input.mp4 -acodec libopus -ar 48000 -ac 2 \
+  -vcodec libx264 -profile:v baseline -tune zerolatency -threads 1 -bf 0 \
+  -f whip "http://localhost:1985/rtc/v1/whip/?app=live&stream=livestream"
+@end example
+
+For this example, we have employed low latency options, resulting in an end-to-end latency of
+approximately 150ms.
+
+@subsection Options
+
+This muxer supports the following options:
+
+@table @option
+
+@item handshake_timeout @var{integer}
+Set the timeout in milliseconds for ICE and DTLS handshake.
+Default value is 5000.
+
+@item pkt_size @var{integer}
+Set the maximum size, in bytes, of RTP packets that send out.
+Default value is 1500.
+
+@item authorization @var{string}
+The optional Bearer token for WHIP Authorization.
+
+@item cert_file @var{string}
+The optional certificate file path for DTLS.
+
+@item key_file @var{string}
+The optional private key file path for DTLS.
+
+@end table
 
 @c man end MUXERS
