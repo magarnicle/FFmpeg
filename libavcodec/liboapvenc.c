@@ -105,9 +105,6 @@ static inline int get_color_format(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_YUV422P10:
         cf = OAPV_CF_YCBCR422;
         break;
-    case AV_PIX_FMT_YUV444P10:
-        cf = OAPV_CF_YCBCR444;
-        break;
     default:
         av_assert0(cf != OAPV_CF_UNKNOWN);
     }
@@ -310,6 +307,14 @@ static av_cold int liboapve_init(AVCodecContext *avctx)
         return AVERROR_EXTERNAL;
     }
 
+    int value = OAPV_CFG_VAL_AU_BS_FMT_NONE;
+    int size = 4;
+    ret = oapve_config(apv->id, OAPV_CFG_SET_AU_BS_FMT, &value, &size);
+    if (OAPV_FAILED(ret)) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to set config for using encoder output format\n");
+        return AVERROR_EXTERNAL;
+    }
+
     apv->ifrms.frm[FRM_IDX].imgb = apv_imgb_create(avctx);
     if (apv->ifrms.frm[FRM_IDX].imgb == NULL)
         return AVERROR(ENOMEM);
@@ -434,7 +439,6 @@ static av_cold int liboapve_close(AVCodecContext *avctx)
 
 static const enum AVPixelFormat supported_pixel_formats[] = {
     AV_PIX_FMT_YUV422P10,
-    AV_PIX_FMT_YUV444P10,
     AV_PIX_FMT_NONE
 };
 

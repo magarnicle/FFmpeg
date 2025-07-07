@@ -8634,7 +8634,7 @@ Filter out noisy pixels from @code{bitplane} set above.
 Default is disabled.
 @end table
 
-@section blackdetect
+@section blackdetect, blackdetect_vulkan
 
 Detect video intervals that are (almost) completely black. Can be
 useful to detect chapter transitions, commercials, or invalid
@@ -8687,6 +8687,12 @@ the input video format, the range is [0-255] for YUV full-range
 formats and [16-235] for YUV non full-range formats.
 
 Default value is 0.10.
+
+@item alpha
+If true, check the alpha channel instead of the luma channel. Detects frames
+which are (almost) transparent, instead of frames which are almost black.
+
+Default value is disabled.
 @end table
 
 The following example sets the maximum pixel threshold to the minimum
@@ -14541,7 +14547,7 @@ e.g. quality comparison.
 
 Each line of the map file must contain three items per input frame, the input
 PTS (decimal), the output PTS (decimal) and the
-output TIMEBASE (decimal/decimal), seperated by a space.
+output TIMEBASE (decimal/decimal), separated by a space.
 This file format corresponds to the output
 of @code{-stats_mux_pre_fmt="@{ptsi@} @{pts@} @{tb@}"}.
 
@@ -16259,6 +16265,16 @@ and @code{(oh-ph)/2}.
 Set the output placement width/height expressions, default values are @code{ow}
 and @code{oh}.
 
+@item rotate
+Rotate the input frame clockwise by the specified angle.
+
+@table @samp
+@item 0, 360
+@item 90
+@item 180
+@item 270
+@end table
+
 @item fps
 Set the output frame rate. This can be rational, e.g. @code{60000/1001}. If
 set to the special string @code{none} (the default), input timestamps will
@@ -16275,11 +16291,15 @@ will be performed.
 @item force_divisible_by
 Work the same as the identical @ref{scale} filter options.
 
+@item reset_sar
+If enabled, output frames will always have a pixel aspect ratio of 1:1.  If
+disabled (the default), any aspect ratio mismatches, including those from
+e.g. anamorphic video sources, are forwarded to the output pixel aspect ratio.
+
 @item normalize_sar
-If enabled, output frames will always have a pixel aspect ratio of 1:1. This
-will introduce additional padding/cropping as necessary. If disabled (the
-default), any aspect ratio mismatches, including those from e.g. anamorphic
-video sources, are forwarded to the output pixel aspect ratio.
+Like @option{reset_sar}, but instead of stretching the video content to fill
+the new output aspect ratio, the content is instead padded or cropped as
+necessary.
 
 @item pad_crop_ratio
 Specifies a ratio (between @code{0.0} and @code{1.0}) between padding and
@@ -16309,6 +16329,18 @@ to double the input image resolution:
 
 @example
 -vf "libplacebo=w=iw*2:h=ih*2:extra_opts='upscaler=custom\:upscaler_preset=ewa_lanczos\:upscaler_blur=0.9812505644269356'"
+@end example
+
+
+@item shader_cache
+File path of a cache directory that libplacebo will use to store and load
+cached shader objects. This cache is not cleaned up automatically. If the
+path does not end in a directory separator, the generated filenames will be
+effectively prefixed by the last path component. All directories must already
+exist.
+
+@example
+-vf "libplacebo=shader_cache=/tmp/pl-shader-"
 @end example
 
 @item colorspace
@@ -26653,6 +26685,30 @@ See @ref{framesync}.
 @end table
 
 This filter also supports the @ref{framesync} options.
+
+
+@anchor{pad_cuda}
+@subsection pad_cuda
+Add paddings to an input video stream using CUDA.
+
+This filter is the CUDA-accelerated version of the @ref{pad} filter. It accepts the same options and expressions and provides the same core functionality.
+For a detailed description of available options, please see the documentation for the @ref{pad} filter.
+
+@subsubsection Examples
+
+@itemize
+@item
+Add a 200-pixel black border to all sides of a video frame:
+@example
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i input.mp4 -vf "pad_cuda=w=iw+400:h=ih+400:x=200:y=200" -c:v h264_nvenc out.mp4
+@end example
+
+@item
+Pad the input video to a 16:9 aspect ratio, filling with the color "blue":
+@example
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i input.mp4 -vf "pad_cuda=w=ih*16/9/sar:h=ih:x=(ow-iw)/2:y=(oh-ih)/2:color=blue" -c:v h264_nvenc out.mp4
+@end example
+@end itemize
 
 @anchor{scale_cuda}
 @subsection scale_cuda
