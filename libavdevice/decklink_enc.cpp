@@ -51,167 +51,167 @@ extern "C" {
 
 extern bool operator==(const REFIID& me, const REFIID& other){
     return me.byte0 == other.byte0 &&
-	   me.byte1 == other.byte1 &&
-	   me.byte2 == other.byte2 &&
-	   me.byte3 == other.byte3 &&
-	   me.byte4 == other.byte4 &&
-	   me.byte5 == other.byte5 &&
-	   me.byte6 == other.byte6 &&
-	   me.byte7 == other.byte7 &&
-	   me.byte8 == other.byte8 &&
-	   me.byte9 == other.byte9 &&
-	   me.byte10 == other.byte10 &&
-	   me.byte11 == other.byte11 &&
-	   me.byte12 == other.byte12 &&
-	   me.byte13 == other.byte13 &&
-	   me.byte14 == other.byte14 &&
-	   me.byte15 == other.byte15;
+        me.byte1 == other.byte1 &&
+        me.byte2 == other.byte2 &&
+        me.byte3 == other.byte3 &&
+        me.byte4 == other.byte4 &&
+        me.byte5 == other.byte5 &&
+        me.byte6 == other.byte6 &&
+        me.byte7 == other.byte7 &&
+        me.byte8 == other.byte8 &&
+        me.byte9 == other.byte9 &&
+        me.byte10 == other.byte10 &&
+        me.byte11 == other.byte11 &&
+        me.byte12 == other.byte12 &&
+        me.byte13 == other.byte13 &&
+        me.byte14 == other.byte14 &&
+        me.byte15 == other.byte15;
 }
 /* DeckLink callback class declaration */
 class decklink_frame : public IDeckLinkVideoFrame_v14_2_1
 {
-public:
-    decklink_frame(struct decklink_ctx *ctx, AVFrame *avframe, AVCodecID codec_id, int height, int width) :
-        _ctx(ctx), _avframe(avframe), _avpacket(NULL), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width),  _refs(1) { }
-    decklink_frame(struct decklink_ctx *ctx, AVPacket *avpacket, AVCodecID codec_id, int height, int width) :
-        _ctx(ctx), _avframe(NULL), _avpacket(avpacket), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width), _refs(1) { }
-    virtual long           STDMETHODCALLTYPE GetWidth      (void)          { return _width; }
-    virtual long           STDMETHODCALLTYPE GetHeight     (void)          { return _height; }
-    virtual long           STDMETHODCALLTYPE GetRowBytes   (void)
-    {
-      if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME)
-          return _avframe->linesize[0] < 0 ? -_avframe->linesize[0] : _avframe->linesize[0];
-      else
-          return ((GetWidth() + 47) / 48) * 128;
-    }
-    virtual BMDPixelFormat STDMETHODCALLTYPE GetPixelFormat(void)
-    {
-        if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME)
-            return bmdFormat8BitYUV;
-        else
-            return bmdFormat10BitYUV;
-    }
-    virtual BMDFrameFlags  STDMETHODCALLTYPE GetFlags      (void)
-    {
-       if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME)
-           return _avframe->linesize[0] < 0 ? bmdFrameFlagFlipVertical : bmdFrameFlagDefault;
-       else
-           return bmdFrameFlagDefault;
-    }
-
-    virtual HRESULT        STDMETHODCALLTYPE GetBytes      (void **buffer)
-    {
-        if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
-            if (_avframe->linesize[0] < 0)
-                *buffer = (void *)(_avframe->data[0] + _avframe->linesize[0] * (_avframe->height - 1));
+    public:
+        decklink_frame(struct decklink_ctx *ctx, AVFrame *avframe, AVCodecID codec_id, int height, int width) :
+            _ctx(ctx), _avframe(avframe), _avpacket(NULL), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width),  _refs(1) { }
+        decklink_frame(struct decklink_ctx *ctx, AVPacket *avpacket, AVCodecID codec_id, int height, int width) :
+            _ctx(ctx), _avframe(NULL), _avpacket(avpacket), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width), _refs(1) { }
+        virtual long           STDMETHODCALLTYPE GetWidth      (void)          { return _width; }
+        virtual long           STDMETHODCALLTYPE GetHeight     (void)          { return _height; }
+        virtual long           STDMETHODCALLTYPE GetRowBytes   (void)
+        {
+            if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME)
+                return _avframe->linesize[0] < 0 ? -_avframe->linesize[0] : _avframe->linesize[0];
             else
-                *buffer = (void *)(_avframe->data[0]);
-        } else {
-            *buffer = (void *)(_avpacket->data);
+                return ((GetWidth() + 47) / 48) * 128;
         }
-        return S_OK;
-    }
+        virtual BMDPixelFormat STDMETHODCALLTYPE GetPixelFormat(void)
+        {
+            if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME)
+                return bmdFormat8BitYUV;
+            else
+                return bmdFormat10BitYUV;
+        }
+        virtual BMDFrameFlags  STDMETHODCALLTYPE GetFlags      (void)
+        {
+            if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME)
+                return _avframe->linesize[0] < 0 ? bmdFrameFlagFlipVertical : bmdFrameFlagDefault;
+            else
+                return bmdFrameFlagDefault;
+        }
 
-    virtual HRESULT STDMETHODCALLTYPE GetTimecode     (BMDTimecodeFormat format, IDeckLinkTimecode **timecode) { return S_FALSE; }
-    virtual HRESULT STDMETHODCALLTYPE GetAncillaryData(IDeckLinkVideoFrameAncillary **ancillary)
-    {
-        *ancillary = _ancillary;
-        if (_ancillary) {
-            _ancillary->AddRef();
+        virtual HRESULT        STDMETHODCALLTYPE GetBytes      (void **buffer)
+        {
+            if (_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+                if (_avframe->linesize[0] < 0)
+                    *buffer = (void *)(_avframe->data[0] + _avframe->linesize[0] * (_avframe->height - 1));
+                else
+                    *buffer = (void *)(_avframe->data[0]);
+            } else {
+                *buffer = (void *)(_avpacket->data);
+            }
             return S_OK;
-        } else {
-            return S_FALSE;
         }
-    }
-    virtual HRESULT STDMETHODCALLTYPE SetAncillaryData(IDeckLinkVideoFrameAncillary *ancillary)
-    {
-        if (_ancillary)
-            _ancillary->Release();
-        _ancillary = ancillary;
-        _ancillary->AddRef();
-        return S_OK;
-    }
-    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) 
-    {
-        if (iid == IID_IDeckLinkVideoFrame_v14_2_1) 
-        { 
-            *ppv = (IDeckLinkVideoFrame_v14_2_1*)this; 
-            AddRef(); 
-            return S_OK; 
+
+        virtual HRESULT STDMETHODCALLTYPE GetTimecode     (BMDTimecodeFormat format, IDeckLinkTimecode **timecode) { return S_FALSE; }
+        virtual HRESULT STDMETHODCALLTYPE GetAncillaryData(IDeckLinkVideoFrameAncillary **ancillary)
+        {
+            *ancillary = _ancillary;
+            if (_ancillary) {
+                _ancillary->AddRef();
+                return S_OK;
+            } else {
+                return S_FALSE;
+            }
         }
-        return E_NOINTERFACE; 
-    }
-    virtual ULONG   STDMETHODCALLTYPE AddRef(void)                            { return ++_refs; }
-    virtual ULONG   STDMETHODCALLTYPE Release(void)
-    {
-        int ret = --_refs;
-        if (!ret) {
-            av_frame_free(&_avframe);
-            av_packet_free(&_avpacket);
+        virtual HRESULT STDMETHODCALLTYPE SetAncillaryData(IDeckLinkVideoFrameAncillary *ancillary)
+        {
             if (_ancillary)
                 _ancillary->Release();
-            delete this;
+            _ancillary = ancillary;
+            _ancillary->AddRef();
+            return S_OK;
         }
-        return ret;
-    }
+        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) 
+        {
+            if (iid == IID_IDeckLinkVideoFrame_v14_2_1) 
+            { 
+                *ppv = (IDeckLinkVideoFrame_v14_2_1*)this; 
+                AddRef(); 
+                return S_OK; 
+            }
+            return E_NOINTERFACE; 
+        }
+        virtual ULONG   STDMETHODCALLTYPE AddRef(void)                            { return ++_refs; }
+        virtual ULONG   STDMETHODCALLTYPE Release(void)
+        {
+            int ret = --_refs;
+            if (!ret) {
+                av_frame_free(&_avframe);
+                av_packet_free(&_avpacket);
+                if (_ancillary)
+                    _ancillary->Release();
+                delete this;
+            }
+            return ret;
+        }
 
-    struct decklink_ctx *_ctx;
-    AVFrame *_avframe;
-    AVPacket *_avpacket;
-    AVCodecID _codec_id;
-    IDeckLinkVideoFrameAncillary *_ancillary;
-    int _height;
-    int _width;
+        struct decklink_ctx *_ctx;
+        AVFrame *_avframe;
+        AVPacket *_avpacket;
+        AVCodecID _codec_id;
+        IDeckLinkVideoFrameAncillary *_ancillary;
+        int _height;
+        int _width;
 
-private:
-    std::atomic<int>  _refs;
+    private:
+        std::atomic<int>  _refs;
 };
 
 class decklink_output_callback : public IDeckLinkVideoOutputCallback_v14_2_1
 {
-public:
-    virtual HRESULT STDMETHODCALLTYPE ScheduledFrameCompleted(IDeckLinkVideoFrame_v14_2_1 *_frame, BMDOutputFrameCompletionResult result)
-    {
-        decklink_frame *frame = static_cast<decklink_frame *>(_frame);
-        struct decklink_ctx *ctx = frame->_ctx;
+    public:
+        virtual HRESULT STDMETHODCALLTYPE ScheduledFrameCompleted(IDeckLinkVideoFrame_v14_2_1 *_frame, BMDOutputFrameCompletionResult result)
+        {
+            decklink_frame *frame = static_cast<decklink_frame *>(_frame);
+            struct decklink_ctx *ctx = frame->_ctx;
 
-        if (frame->_avframe){
-            av_frame_unref(frame->_avframe);
-            if (result > 0) {
-                av_log(NULL, AV_LOG_WARNING, "AV Frame was not displayed, result code: %d\n", result);
-            }
-        } else if (result > 0) {
+            if (frame->_avframe){
+                av_frame_unref(frame->_avframe);
+                if (result > 0) {
+                    av_log(NULL, AV_LOG_WARNING, "AV Frame was not displayed, result code: %d\n", result);
+                }
+            } else if (result > 0) {
                 av_log(NULL, AV_LOG_WARNING, "Non-AV Frame was not displayed, result code: %d\n", result);
             }
-        if (frame->_avpacket) {
-            av_packet_unref(frame->_avpacket);
-            if (result > 0) {
-                av_log(NULL, AV_LOG_WARNING, "AV Packet was not displayed, result code: %d\n", result);
+            if (frame->_avpacket) {
+                av_packet_unref(frame->_avpacket);
+                if (result > 0) {
+                    av_log(NULL, AV_LOG_WARNING, "AV Packet was not displayed, result code: %d\n", result);
+                }
             }
-        }
-        if (result > 0) {
-            av_log(NULL, AV_LOG_INFO, "decklink output result code: %d\n", result);
-        }
+            if (result > 0) {
+                av_log(NULL, AV_LOG_INFO, "decklink output result code: %d\n", result);
+            }
 
-        pthread_mutex_lock(&ctx->mutex);
-        ctx->frames_buffer_available_spots++;
-        pthread_cond_broadcast(&ctx->cond);
-        pthread_mutex_unlock(&ctx->mutex);
-        return S_OK;
-    }
-    virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
-    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv)
-    {
-        if (iid == IID_IDeckLinkVideoOutputCallback_v14_2_1) 
-        { 
-            *ppv = (IDeckLinkVideoOutputCallback_v14_2_1*)this; 
-            AddRef(); 
-            return S_OK; 
+            pthread_mutex_lock(&ctx->mutex);
+            ctx->frames_buffer_available_spots++;
+            pthread_cond_broadcast(&ctx->cond);
+            pthread_mutex_unlock(&ctx->mutex);
+            return S_OK;
         }
-        return E_NOINTERFACE; 
-    }
-    virtual ULONG   STDMETHODCALLTYPE AddRef(void)                            { return 1; }
-    virtual ULONG   STDMETHODCALLTYPE Release(void)                           { return 1; }
+        virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
+        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv)
+        {
+            if (iid == IID_IDeckLinkVideoOutputCallback_v14_2_1) 
+            { 
+                *ppv = (IDeckLinkVideoOutputCallback_v14_2_1*)this; 
+                AddRef(); 
+                return S_OK; 
+            }
+            return E_NOINTERFACE; 
+        }
+        virtual ULONG   STDMETHODCALLTYPE AddRef(void)                            { return 1; }
+        virtual ULONG   STDMETHODCALLTYPE Release(void)                           { return 1; }
 };
 
 static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
@@ -260,7 +260,7 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
         if (!ctx->block_until_available) {
             av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
             return -1;
-	};
+        };
         if (!already_logged){
             av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
             already_logged = 1;
@@ -315,25 +315,25 @@ static int decklink_setup_audio(AVFormatContext *avctx, AVStream *st)
     } else if (c->codec_id == AV_CODEC_ID_PCM_S16LE) {
         if (c->sample_rate != 48000) {
             av_log(avctx, AV_LOG_ERROR, "Unsupported sample rate!"
-                   " Only 48kHz is supported.\n");
+                    " Only 48kHz is supported.\n");
             return -1;
         }
         if (c->ch_layout.nb_channels != 2 && c->ch_layout.nb_channels != 8 && c->ch_layout.nb_channels != 16) {
             av_log(avctx, AV_LOG_ERROR, "Unsupported number of channels!"
-                   " Only 2, 8 or 16 channels are supported.\n");
+                    " Only 2, 8 or 16 channels are supported.\n");
             return -1;
         }
         ctx->channels = c->ch_layout.nb_channels;
     } else {
         av_log(avctx, AV_LOG_ERROR, "Unsupported codec specified!"
-               " Only PCM_S16LE and AC-3 are supported.\n");
+                " Only PCM_S16LE and AC-3 are supported.\n");
         return -1;
     }
 
     if (ctx->dlo->EnableAudioOutput(bmdAudioSampleRate48kHz,
-                                    bmdAudioSampleType16bitInteger,
-                                    ctx->channels,
-                                    bmdAudioOutputStreamTimestamped) != S_OK) {
+                bmdAudioSampleType16bitInteger,
+                ctx->channels,
+                bmdAudioOutputStreamTimestamped) != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Could not enable audio output!\n");
         return -1;
     }
@@ -395,14 +395,14 @@ static int decklink_setup_subtitle(AVFormatContext *avctx, AVStream *st)
 
     switch(st->codecpar->codec_id) {
 #if CONFIG_LIBKLVANC
-    case AV_CODEC_ID_EIA_608:
-        /* No special setup required */
-        ret = 0;
-        break;
+        case AV_CODEC_ID_EIA_608:
+            /* No special setup required */
+            ret = 0;
+            break;
 #endif
-    default:
-        av_log(avctx, AV_LOG_ERROR, "Unsupported subtitle codec specified\n");
-        break;
+        default:
+            av_log(avctx, AV_LOG_ERROR, "Unsupported subtitle codec specified\n");
+            break;
     }
 
     return ret;
@@ -414,14 +414,14 @@ static int decklink_setup_data(AVFormatContext *avctx, AVStream *st)
 
     switch(st->codecpar->codec_id) {
 #if CONFIG_LIBKLVANC
-    case AV_CODEC_ID_SMPTE_2038:
-        /* No specific setup required */
-        ret = 0;
-        break;
+        case AV_CODEC_ID_SMPTE_2038:
+            /* No specific setup required */
+            ret = 0;
+            break;
 #endif
-    default:
-        av_log(avctx, AV_LOG_ERROR, "Unsupported data codec specified\n");
-        break;
+        default:
+            av_log(avctx, AV_LOG_ERROR, "Unsupported data codec specified\n");
+            break;
     }
 
     return ret;
@@ -436,21 +436,21 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     if (ctx->playback_started) {
         BMDTimeValue actual;
         ctx->dlo->StopScheduledPlayback(ctx->last_pts * ctx->bmd_tb_num,
-                                        &actual, ctx->bmd_tb_den);
+                &actual, ctx->bmd_tb_den);
         av_log(avctx, AV_LOG_INFO, "Stopped at %ld, requested %ld\n", actual, ctx->last_pts * ctx->bmd_tb_num);
-	while (1){
-		ctx->dlo->GetBufferedVideoFrameCount(&buffered);
-		if (buffered == 0){
-			break;
-		}
-		av_log(avctx, AV_LOG_DEBUG, "Waiting for %d buffered frames to finish\n", buffered);
-		if (buffered < 5) {
-			usleep(1);
-		} else {
-			usleep(300);
-		}
-	}
-	av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
+        while (1){
+            ctx->dlo->GetBufferedVideoFrameCount(&buffered);
+            if (buffered == 0){
+                break;
+            }
+            av_log(avctx, AV_LOG_DEBUG, "Waiting for %d buffered frames to finish\n", buffered);
+            if (buffered < 5) {
+                usleep(1);
+            } else {
+                usleep(300);
+            }
+        }
+        av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
 
         ctx->dlo->DisableVideoOutput();
         if (ctx->audio)
@@ -478,7 +478,7 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 
 #if CONFIG_LIBKLVANC
 static void construct_cc(AVFormatContext *avctx, struct decklink_ctx *ctx,
-                         AVPacket *pkt, struct klvanc_line_set_s *vanc_lines)
+        AVPacket *pkt, struct klvanc_line_set_s *vanc_lines)
 {
     struct klvanc_packet_eia_708b_s *cdp;
     uint16_t *cdp_words;
@@ -500,7 +500,7 @@ static void construct_cc(AVFormatContext *avctx, struct decklink_ctx *ctx,
     ret = klvanc_set_framerate_EIA_708B(cdp, ctx->bmd_tb_num, ctx->bmd_tb_den);
     if (ret) {
         av_log(avctx, AV_LOG_ERROR, "Invalid framerate specified: %" PRId64 "/%" PRId64 "\n",
-               ctx->bmd_tb_num, ctx->bmd_tb_den);
+                ctx->bmd_tb_num, ctx->bmd_tb_den);
         klvanc_destroy_eia708_cdp(cdp);
         return;
     }
@@ -540,8 +540,8 @@ static void construct_cc(AVFormatContext *avctx, struct decklink_ctx *ctx,
 
 /* See SMPTE ST 2016-3:2009 */
 static void construct_afd(AVFormatContext *avctx, struct decklink_ctx *ctx,
-                          AVPacket *pkt, struct klvanc_line_set_s *vanc_lines,
-                          AVStream *st)
+        AVPacket *pkt, struct klvanc_line_set_s *vanc_lines,
+        AVStream *st)
 {
     struct klvanc_packet_afd_s *afd = NULL;
     uint16_t *afd_words = NULL;
@@ -560,7 +560,7 @@ static void construct_afd(AVFormatContext *avctx, struct decklink_ctx *ctx,
     ret = klvanc_set_AFD_val(afd, data[0]);
     if (ret) {
         av_log(avctx, AV_LOG_ERROR, "Invalid AFD value specified: %d\n",
-               data[0]);
+                data[0]);
         klvanc_destroy_AFD(afd);
         return;
     }
@@ -570,7 +570,7 @@ static void construct_afd(AVFormatContext *avctx, struct decklink_ctx *ctx,
        of streams in the field that aren't *exactly* 4:3 but a tiny bit larger after doing
        the math... */
     if (av_cmp_q((AVRational) {st->codecpar->width * st->codecpar->sample_aspect_ratio.num,
-                    st->codecpar->height * st->codecpar->sample_aspect_ratio.den}, (AVRational) {14, 10}) == 1)
+                st->codecpar->height * st->codecpar->sample_aspect_ratio.den}, (AVRational) {14, 10}) == 1)
         afd->aspectRatio = ASPECT_16x9;
     else
         afd->aspectRatio = ASPECT_4x3;
@@ -590,21 +590,21 @@ static void construct_afd(AVFormatContext *avctx, struct decklink_ctx *ctx,
     /* For interlaced video, insert into both fields.  Switching lines for field 2
        derived from SMPTE RP 168:2009, Sec 6, Table 2. */
     switch (ctx->bmd_mode) {
-    case bmdModeNTSC:
-    case bmdModeNTSC2398:
-        f2_line = 273 - 10 + f1_line;
-        break;
-    case bmdModePAL:
-        f2_line = 319 - 6 + f1_line;
-        break;
-    case bmdModeHD1080i50:
-    case bmdModeHD1080i5994:
-    case bmdModeHD1080i6000:
-        f2_line = 569 - 7 + f1_line;
-        break;
-    default:
-        f2_line = 0;
-        break;
+        case bmdModeNTSC:
+        case bmdModeNTSC2398:
+            f2_line = 273 - 10 + f1_line;
+            break;
+        case bmdModePAL:
+            f2_line = 319 - 6 + f1_line;
+            break;
+        case bmdModeHD1080i50:
+        case bmdModeHD1080i5994:
+        case bmdModeHD1080i6000:
+            f2_line = 569 - 7 + f1_line;
+            break;
+        default:
+            f2_line = 0;
+            break;
     }
 
     if (f2_line > 0) {
@@ -638,8 +638,8 @@ static void parse_608subs(AVFormatContext *avctx, struct decklink_ctx *ctx, AVPa
 }
 
 static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *ctx,
-                                   AVPacket *pkt, decklink_frame *frame,
-                                   AVStream *st)
+        AVPacket *pkt, decklink_frame *frame,
+        AVStream *st)
 {
     struct klvanc_line_set_s vanc_lines = { 0 };
     int ret = 0, i;
@@ -687,11 +687,11 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
                 uint16_t vancWordCount;
 
                 if (klvanc_smpte2038_convert_line_to_words(l, &vancWords,
-                                                           &vancWordCount) < 0)
+                            &vancWordCount) < 0)
                     break;
 
                 ret = klvanc_line_insert(ctx->vanc_ctx, &vanc_lines, vancWords,
-                                         vancWordCount, l->line_number, 0);
+                        vancWordCount, l->line_number, 0);
                 free(vancWords);
                 if (ret != 0) {
                     av_log(avctx, AV_LOG_ERROR, "VANC line insertion failed\n");
@@ -733,7 +733,7 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
 
         /* Generate the full line taking into account all VANC packets on that line */
         result = klvanc_generate_vanc_line_v210(ctx->vanc_ctx, line, (uint8_t *) buf,
-                                                ctx->bmd_width);
+                ctx->bmd_width);
         if (result) {
             av_log(avctx, AV_LOG_ERROR, "Failed to generate VANC line\n");
             continue;
@@ -757,99 +757,85 @@ done:
 
 static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-	struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-	struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
-	AVStream *st = avctx->streams[pkt->stream_index];
-	AVFrame *avframe = NULL, *tmp = (AVFrame *)pkt->data;
-	AVPacket *avpacket = NULL;
-	decklink_frame *frame;
-	uint32_t buffered;
-	HRESULT hr;
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    AVStream *st = avctx->streams[pkt->stream_index];
+    AVFrame *avframe = NULL, *tmp = (AVFrame *)pkt->data;
+    AVPacket *avpacket = NULL;
+    decklink_frame *frame;
+    uint32_t buffered;
+    HRESULT hr;
 
 
-	ctx->last_pts = FFMAX(ctx->last_pts, pkt->pts);
+    ctx->last_pts = FFMAX(ctx->last_pts, pkt->pts);
 
-	if (st->codecpar->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
-		if (tmp->format != AV_PIX_FMT_UYVY422 ||
-				tmp->width  != ctx->bmd_width ||
-				tmp->height != ctx->bmd_height) {
-			av_log(avctx, AV_LOG_ERROR, "Got a frame with invalid pixel format or dimension.\n");
-			return AVERROR(EINVAL);
-		}
+    if (st->codecpar->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+        if (tmp->format != AV_PIX_FMT_UYVY422 ||
+                tmp->width  != ctx->bmd_width ||
+                tmp->height != ctx->bmd_height) {
+            av_log(avctx, AV_LOG_ERROR, "Got a frame with invalid pixel format or dimension.\n");
+            return AVERROR(EINVAL);
+        }
 
-		avframe = av_frame_clone(tmp);
-		if (!avframe) {
-			av_log(avctx, AV_LOG_ERROR, "Could not clone video frame.\n");
-			return AVERROR(EIO);
-		}
+        avframe = av_frame_clone(tmp);
+        if (!avframe) {
+            av_log(avctx, AV_LOG_ERROR, "Could not clone video frame.\n");
+            return AVERROR(EIO);
+        }
 
-		frame = new decklink_frame(ctx, avframe, st->codecpar->codec_id, avframe->height, avframe->width);
-	} else {
-		avpacket = av_packet_clone(pkt);
-		if (!avpacket) {
-			av_log(avctx, AV_LOG_ERROR, "Could not clone video frame.\n");
-			return AVERROR(EIO);
-		}
+        frame = new decklink_frame(ctx, avframe, st->codecpar->codec_id, avframe->height, avframe->width);
+    } else {
+        avpacket = av_packet_clone(pkt);
+        if (!avpacket) {
+            av_log(avctx, AV_LOG_ERROR, "Could not clone video frame.\n");
+            return AVERROR(EIO);
+        }
 
-		frame = new decklink_frame(ctx, avpacket, st->codecpar->codec_id, ctx->bmd_height, ctx->bmd_width);
+        frame = new decklink_frame(ctx, avpacket, st->codecpar->codec_id, ctx->bmd_height, ctx->bmd_width);
 
 #if CONFIG_LIBKLVANC
-		if (decklink_construct_vanc(avctx, ctx, pkt, frame, st))
-			av_log(avctx, AV_LOG_ERROR, "Failed to construct VANC\n");
+        if (decklink_construct_vanc(avctx, ctx, pkt, frame, st))
+            av_log(avctx, AV_LOG_ERROR, "Failed to construct VANC\n");
 #endif
-	}
+    }
 
-	if (!frame) {
-		av_log(avctx, AV_LOG_ERROR, "Could not create new frame.\n");
-		av_frame_free(&avframe);
-		av_packet_free(&avpacket);
-		return AVERROR(EIO);
-	}
+    if (!frame) {
+        av_log(avctx, AV_LOG_ERROR, "Could not create new frame.\n");
+        av_frame_free(&avframe);
+        av_packet_free(&avpacket);
+        return AVERROR(EIO);
+    }
 
-	/* Always keep at most one second of frames buffered. */
-	pthread_mutex_lock(&ctx->mutex);
-	while (ctx->frames_buffer_available_spots == 0) {
-		pthread_cond_wait(&ctx->cond, &ctx->mutex);
-	}
-	ctx->frames_buffer_available_spots--;
-	pthread_mutex_unlock(&ctx->mutex);
+    /* Always keep at most one second of frames buffered. */
+    pthread_mutex_lock(&ctx->mutex);
+    while (ctx->frames_buffer_available_spots == 0) {
+        pthread_cond_wait(&ctx->cond, &ctx->mutex);
+    }
+    ctx->frames_buffer_available_spots--;
+    pthread_mutex_unlock(&ctx->mutex);
 
-	if (ctx->first_pts == AV_NOPTS_VALUE)
-		ctx->first_pts = pkt->pts;
+    if (ctx->first_pts == AV_NOPTS_VALUE)
+        ctx->first_pts = pkt->pts;
 
-	/* Preroll video frames. */
-	if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
-		av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
-		if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
-			av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
-			return AVERROR(EIO);
-		}
-		av_log(avctx, AV_LOG_INFO, "Starting scheduled playback.\n");
-		if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
-			av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
-			return AVERROR(EIO);
-		}
-		ctx->playback_started = 1;
-	}
-	/* Schedule frame for playback. */
-	hr = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame_v14_2_1 *) frame,
-			pkt->pts * ctx->bmd_tb_num,
-			ctx->bmd_tb_num, ctx->bmd_tb_den);
-	/* Pass ownership to DeckLink, or release on failure */
-	frame->Release();
-	if (hr != S_OK) {
-		av_log(avctx, AV_LOG_ERROR, "Could not schedule video frame."
-				" error %08x.\n", (uint32_t) hr);
-		return AVERROR(EIO);
-	}
+    /* Schedule frame for playback. */
+    hr = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame_v14_2_1 *) frame,
+            pkt->pts * ctx->bmd_tb_num,
+            ctx->bmd_tb_num, ctx->bmd_tb_den);
+    /* Pass ownership to DeckLink, or release on failure */
+    frame->Release();
+    if (hr != S_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Could not schedule video frame."
+                " error %08x.\n", (uint32_t) hr);
+        return AVERROR(EIO);
+    }
 
-	ctx->dlo->GetBufferedVideoFrameCount(&buffered);
-	av_log(avctx, AV_LOG_DEBUG, "Buffered video frames: %d.\n", (int) buffered);
-	if (pkt->pts > 2 && buffered <= 2){
-		av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
-				" Video may misbehave!\n");
-	        return -1;
-	}
+    ctx->dlo->GetBufferedVideoFrameCount(&buffered);
+    av_log(avctx, AV_LOG_DEBUG, "Buffered video frames: %d.\n", (int) buffered);
+    if (pkt->pts > 2 && buffered <= 2){
+        av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
+                " Video may misbehave!\n");
+        return -1;
+    }
 
     /* Preroll video frames. */
     if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
@@ -866,7 +852,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         ctx->playback_started = 1;
     }
 
-	return 0;
+    return 0;
 }
 
 static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
@@ -882,8 +868,8 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
     if (pkt->pts > 1 && !buffered){
         av_log(avctx, AV_LOG_WARNING, "There's no buffered audio."
-               " Audio will misbehave!\n");
-	return -2;
+                " Audio will misbehave!\n");
+        return -2;
     }
 
     if (st->codecpar->codec_id == AV_CODEC_ID_AC3) {
@@ -899,7 +885,7 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     if (ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
-                                       bmdAudioSampleRate48kHz, NULL) != S_OK) {
+                bmdAudioSampleRate48kHz, NULL) != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Could not schedule audio samples.\n");
         ret = AVERROR(EIO);
     }
@@ -934,138 +920,125 @@ static int decklink_write_data_packet(AVFormatContext *avctx, AVPacket *pkt)
 
 extern "C" {
 
-av_cold int ff_decklink_write_header(AVFormatContext *avctx)
-{
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx;
-    unsigned int n;
-    int ret;
-    int already_logged;
+    av_cold int ff_decklink_write_header(AVFormatContext *avctx)
+    {
+        struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+        struct decklink_ctx *ctx;
+        unsigned int n;
+        int ret;
 
-    ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
-    if (!ctx)
-        return AVERROR(ENOMEM);
-    ctx->list_devices = cctx->list_devices;
-    ctx->list_formats = cctx->list_formats;
-    ctx->preroll      = cctx->preroll;
-    ctx->block_until_available      = cctx->block_until_available;
-    ctx->duplex_mode  = cctx->duplex_mode;
-    ctx->first_pts    = AV_NOPTS_VALUE;
-    if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
-        ctx->link = decklink_link_conf_map[cctx->link];
-    cctx->ctx = ctx;
+        ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
+        if (!ctx)
+            return AVERROR(ENOMEM);
+        ctx->list_devices = cctx->list_devices;
+        ctx->list_formats = cctx->list_formats;
+        ctx->preroll      = cctx->preroll;
+        ctx->block_until_available      = cctx->block_until_available;
+        ctx->duplex_mode  = cctx->duplex_mode;
+        ctx->first_pts    = AV_NOPTS_VALUE;
+        if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
+            ctx->link = decklink_link_conf_map[cctx->link];
+        cctx->ctx = ctx;
 #if CONFIG_LIBKLVANC
-    if (klvanc_context_create(&ctx->vanc_ctx) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Cannot create VANC library context\n");
-        return AVERROR(ENOMEM);
-    }
-    ctx->supports_vanc = 1;
+        if (klvanc_context_create(&ctx->vanc_ctx) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot create VANC library context\n");
+            return AVERROR(ENOMEM);
+        }
+        ctx->supports_vanc = 1;
 #endif
 
-    /* List available devices and exit. */
-    if (ctx->list_devices) {
-        ff_decklink_list_devices_legacy(avctx, 0, 1);
-        return AVERROR_EXIT;
-    }
+        /* List available devices and exit. */
+        if (ctx->list_devices) {
+            ff_decklink_list_devices_legacy(avctx, 0, 1);
+            return AVERROR_EXIT;
+        }
 
-    ret = ff_decklink_init_device(avctx, avctx->url);
-    if (ret < 0)
-        return ret;
+        ret = ff_decklink_init_device(avctx, avctx->url);
+        if (ret < 0)
+            return ret;
 
-    /* Get output device. */
-    if (ctx->dl->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void **) &ctx->dlo) != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not open output device from '%s'\n",
-               avctx->url);
-        ret = AVERROR(EIO);
-        goto error;
-    }
-
-    /* List supported formats. */
-    if (ctx->list_formats) {
-        ff_decklink_list_formats(avctx);
-        ret = AVERROR_EXIT;
-        goto error;
-    }
-
-    /* Setup streams. */
-    ret = AVERROR(EIO);
-    for (n = 0; n < avctx->nb_streams; n++) {
-        AVStream *st = avctx->streams[n];
-        AVCodecParameters *c = st->codecpar;
-        if        (c->codec_type == AVMEDIA_TYPE_AUDIO) {
-            if (decklink_setup_audio(avctx, st))
-                goto error;
-        } else if (c->codec_type == AVMEDIA_TYPE_VIDEO) {
-            if (decklink_setup_video(avctx, st))
-                goto error;
-        } else if (c->codec_type == AVMEDIA_TYPE_DATA) {
-            if (decklink_setup_data(avctx, st))
-                goto error;
-        } else if (c->codec_type == AVMEDIA_TYPE_SUBTITLE) {
-            if (decklink_setup_subtitle(avctx, st))
-                goto error;
-        } else {
-            av_log(avctx, AV_LOG_ERROR, "Unsupported stream type.\n");
+        /* Get output device. */
+        if (ctx->dl->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void **) &ctx->dlo) != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not open output device from '%s'\n",
+                    avctx->url);
+            ret = AVERROR(EIO);
             goto error;
         }
-    }
 
-    /* Reconfigure the data/subtitle stream clocks to match the video */
-    for (n = 0; n < avctx->nb_streams; n++) {
-        AVStream *st = avctx->streams[n];
-        AVCodecParameters *c = st->codecpar;
-
-        if(c->codec_type == AVMEDIA_TYPE_DATA ||
-           c->codec_type == AVMEDIA_TYPE_SUBTITLE)
-            avpriv_set_pts_info(st, 64, ctx->bmd_tb_num, ctx->bmd_tb_den);
-    }
-    ff_decklink_packet_queue_init(avctx, &ctx->vanc_queue, cctx->vanc_queue_size);
-
-    ret = ff_ccfifo_init(&ctx->cc_fifo, av_make_q(ctx->bmd_tb_den, ctx->bmd_tb_num), avctx);
-    if (ret < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Failure to setup CC FIFO queue\n");
-        goto error;
-    }
-
-    already_logged = 0;
-    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
-        if (!ctx->block_until_available) {
-            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
-            return -1;
-        };
-        if (!already_logged){
-            av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
-            already_logged = 1;
+        /* List supported formats. */
+        if (ctx->list_formats) {
+            ff_decklink_list_formats(avctx);
+            ret = AVERROR_EXIT;
+            goto error;
         }
-        usleep(1000);
-    }
-    return 0;
+
+        /* Setup streams. */
+        ret = AVERROR(EIO);
+        for (n = 0; n < avctx->nb_streams; n++) {
+            AVStream *st = avctx->streams[n];
+            AVCodecParameters *c = st->codecpar;
+            if        (c->codec_type == AVMEDIA_TYPE_AUDIO) {
+                if (decklink_setup_audio(avctx, st))
+                    goto error;
+            } else if (c->codec_type == AVMEDIA_TYPE_VIDEO) {
+                if (decklink_setup_video(avctx, st))
+                    goto error;
+            } else if (c->codec_type == AVMEDIA_TYPE_DATA) {
+                if (decklink_setup_data(avctx, st))
+                    goto error;
+            } else if (c->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+                if (decklink_setup_subtitle(avctx, st))
+                    goto error;
+            } else {
+                av_log(avctx, AV_LOG_ERROR, "Unsupported stream type.\n");
+                goto error;
+            }
+        }
+
+        /* Reconfigure the data/subtitle stream clocks to match the video */
+        for (n = 0; n < avctx->nb_streams; n++) {
+            AVStream *st = avctx->streams[n];
+            AVCodecParameters *c = st->codecpar;
+
+            if(c->codec_type == AVMEDIA_TYPE_DATA ||
+                    c->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                avpriv_set_pts_info(st, 64, ctx->bmd_tb_num, ctx->bmd_tb_den);
+        }
+        ff_decklink_packet_queue_init(avctx, &ctx->vanc_queue, cctx->vanc_queue_size);
+
+        ret = ff_ccfifo_init(&ctx->cc_fifo, av_make_q(ctx->bmd_tb_den, ctx->bmd_tb_num), avctx);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failure to setup CC FIFO queue\n");
+            goto error;
+        }
+
+        return 0;
 
 error:
-    ff_decklink_cleanup(avctx);
-    return ret;
-}
+        ff_decklink_cleanup(avctx);
+        return ret;
+    }
 
-int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
-{
+    int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
+    {
 
-    AVStream *st = avctx->streams[pkt->stream_index];
+        AVStream *st = avctx->streams[pkt->stream_index];
 
-    if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-        return decklink_write_video_packet(avctx, pkt);
-    else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-        return decklink_write_audio_packet(avctx, pkt);
-    else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
-        return decklink_write_data_packet(avctx, pkt);
-    else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
-        return decklink_write_subtitle_packet(avctx, pkt);
+        if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            return decklink_write_video_packet(avctx, pkt);
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            return decklink_write_audio_packet(avctx, pkt);
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
+            return decklink_write_data_packet(avctx, pkt);
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+            return decklink_write_subtitle_packet(avctx, pkt);
 
-    return AVERROR(EIO);
-}
+        return AVERROR(EIO);
+    }
 
-int ff_decklink_list_output_devices(AVFormatContext *avctx, struct AVDeviceInfoList *device_list)
-{
-    return ff_decklink_list_devices(avctx, device_list, 0, 1);
-}
+    int ff_decklink_list_output_devices(AVFormatContext *avctx, struct AVDeviceInfoList *device_list)
+    {
+        return ff_decklink_list_devices(avctx, device_list, 0, 1);
+    }
 
 } /* extern "C" */
