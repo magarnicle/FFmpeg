@@ -38,7 +38,6 @@
 #include "libavutil/base64.h"
 #include "libavutil/bprint.h"
 #include "libavutil/dict.h"
-#include "libavutil/dict_internal.h"
 #include "libavutil/display.h"
 #include "libavutil/hdr_dynamic_metadata.h"
 #include "libavutil/intfloat.h"
@@ -2137,7 +2136,7 @@ static int matroska_aac_sri(int samplerate)
 static void matroska_metadata_creation_time(AVDictionary **metadata, int64_t date_utc)
 {
     /* Convert to seconds and adjust by number of seconds between 2001-01-01 and Epoch */
-    avpriv_dict_set_timestamp(metadata, "creation_time", date_utc / 1000 + 978307200000000LL);
+    ff_dict_set_timestamp(metadata, "creation_time", date_utc / 1000 + 978307200000000LL);
 }
 
 static int matroska_parse_flac(AVFormatContext *s,
@@ -2843,6 +2842,8 @@ static int mka_parse_audio(MatroskaTrack *track, AVStream *st,
     par->sample_rate = track->audio.out_samplerate;
     // channel layout may be already set by codec private checks above
     if (!av_channel_layout_check(&par->ch_layout)) {
+        if (track->audio.channels > INT32_MAX)
+            return AVERROR_PATCHWELCOME;
         par->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
         par->ch_layout.nb_channels = track->audio.channels;
     }
@@ -2876,6 +2877,11 @@ static int mkv_parse_video_codec(MatroskaTrack *track, AVCodecParameters *par,
 {
     if (!strcmp(track->codec_id, "V_MS/VFW/FOURCC") &&
         track->codec_priv.size >= 40) {
+        uint32_t size = AV_RL32A(track->codec_priv.data);
+        // VFW extradata is padded to an even length, yet
+        // the size field contains the real length.
+        if (size & 1 && size == track->codec_priv.size - 1)
+            --track->codec_priv.size;
         track->ms_compat    = 1;
         par->bits_per_coded_sample = AV_RL16(track->codec_priv.data + 14);
         par->codec_tag      = AV_RL32(track->codec_priv.data + 16);
@@ -3823,9 +3829,6 @@ static int matroska_parse_webvtt(MatroskaDemuxContext *matroska,
         text_len = len;
     }
 
-    if (text_len <= 0)
-        return AVERROR_INVALIDDATA;
-
     err = av_new_packet(pkt, text_len);
     if (err < 0) {
         return err;
@@ -4224,7 +4227,7 @@ static int matroska_parse_block(MatroskaDemuxContext *matroska, AVBufferRef *buf
         } else {
             res = matroska_parse_frame(matroska, track, st, buf, out_data,
                                        out_size, timecode, lace_duration,
-                                       pos, !n ? is_keyframe : 0,
+                                       pos, is_keyframe,
                                        blockmore, nb_blockmore,
                                        discard_padding);
             if (res)
@@ -4618,9 +4621,10 @@ static int64_t webm_dash_manifest_compute_bandwidth(AVFormatContext *s, int64_t 
             // The prebuffer ends in the last Cue. Estimate how much data was
             // prebuffered.
             pre_bytes = desc_end.end_offset - desc_end.start_offset;
-            pre_ns = desc_end.end_time_ns - desc_end.start_time_ns;
-            if (pre_ns <= 0)
+            if (desc_end.end_time_ns <= desc_end.start_time_ns ||
+                desc_end.end_time_ns - (uint64_t)desc_end.start_time_ns > INT64_MAX)
                 return -1;
+            pre_ns = desc_end.end_time_ns - desc_end.start_time_ns;
             pre_sec = pre_ns / nano_seconds_per_second;
             prebuffer_bytes +=
                 pre_bytes * ((temp_prebuffer_ns / nano_seconds_per_second) / pre_sec);
@@ -4633,7 +4637,7 @@ static int64_t webm_dash_manifest_compute_bandwidth(AVFormatContext *s, int64_t 
                 int64_t desc_bytes = desc_end.end_offset - desc_beg.start_offset;
                 int64_t desc_ns = desc_end.end_time_ns - desc_beg.start_time_ns;
                 double desc_sec, calc_bits_per_second, percent, mod_bits_per_second;
-                if (desc_bytes <= 0)
+                if (desc_bytes <= 0 || desc_bytes > INT64_MAX/8)
                     return -1;
 
                 desc_sec = desc_ns / nano_seconds_per_second;
