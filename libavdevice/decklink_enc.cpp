@@ -193,6 +193,15 @@ class decklink_output_callback : public IDeckLinkVideoOutputCallback_v14_2_1
                 av_log(NULL, AV_LOG_INFO, "decklink output result code: %d\n", result);
             }
 
+            bool active = true;
+            HRESULT schedule_running = ctx->dlo->IsScheduledPlaybackRunning(&active);
+            if (schedule_running != S_OK) {
+                av_log(NULL, AV_LOG_INFO, "decklink schedule running result is not ok: %d\n", schedule_running);
+            }
+            if (!active){
+                av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
+            }
+
             pthread_mutex_lock(&ctx->mutex);
             ctx->frames_buffer_available_spots++;
             pthread_cond_broadcast(&ctx->cond);
