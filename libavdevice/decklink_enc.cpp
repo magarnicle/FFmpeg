@@ -262,11 +262,12 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
             return -1;
         };
         if (!already_logged){
-            av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
+            av_log(avctx, AV_LOG_INFO, "Could not enable video output, waiting for device...\n");
             already_logged = 1;
         }
         usleep(1000);
     }
+    av_log(avctx, AV_LOG_INFO, "Device available, video output enabled\n");
 
 
     /* Set callback. */
@@ -284,7 +285,7 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     pthread_cond_init(&ctx->cond, NULL);
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
 
-    av_log(avctx, AV_LOG_DEBUG, "output: %s, preroll: %d, frames buffer size: %d\n",
+    av_log(avctx, AV_LOG_INFO, "output: %s, preroll: %d, frames buffer size: %d\n",
             avctx->url, ctx->frames_preroll, ctx->frames_buffer);
 
     /* The device expects the framerate to be fixed. */
@@ -443,7 +444,7 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
             if (buffered == 0){
                 break;
             }
-            av_log(avctx, AV_LOG_DEBUG, "Waiting for %d buffered frames to finish\n", buffered);
+            av_log(avctx, AV_LOG_INFO, "Waiting for %d buffered frames to finish\n", buffered);
             if (buffered < 5) {
                 usleep(1);
             } else {
@@ -830,7 +831,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
-    av_log(avctx, AV_LOG_DEBUG, "Buffered video frames: %d.\n", (int) buffered);
+    av_log(avctx, AV_LOG_INFO, "Buffered video frames: %d.\n", (int) buffered);
     if (pkt->pts > 2 && buffered <= 2){
         av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
                 " Video may misbehave!\n");
@@ -839,7 +840,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     /* Preroll video frames. */
     if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
-        av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
+        av_log(avctx, AV_LOG_INFO, "Ending audio preroll.\n");
         if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
             av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
             return AVERROR(EIO);
