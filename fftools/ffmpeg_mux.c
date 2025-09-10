@@ -236,8 +236,8 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     ret = av_interleaved_write_frame(s, pkt);
     if (ret < 0) {
         av_log(ost, AV_LOG_ERROR,
-               "Error submitting a packet to the muxer for output '%s': %s\n",
-               s->url ? s->url : "(unknown)", av_err2str(ret));
+               "Error submitting a packet to the muxer for output '%s': %s (%d)\n",
+               s->url ? s->url : "(unknown)", av_err2str(ret), ret);
         goto fail;
     }
 

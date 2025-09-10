@@ -1154,16 +1154,19 @@ static int write_packets_common(AVFormatContext *s, AVPacket *pkt, int interleav
     FFStream *sti;
     int ret = check_packet(s, pkt);
     if (ret < 0)
+        av_log(s, AV_LOG_ERROR, "Packet check failed for stream #%d: %s\n", st->index, av_err2str(ret));
         return ret;
     st = s->streams[pkt->stream_index];
     sti = ffstream(st);
 
     ret = prepare_input_packet(s, st, pkt);
     if (ret < 0)
+        av_log(s, AV_LOG_ERROR, "Could not prepare input packet for stream #%d: %s\n", st->index, av_err2str(ret));
         return ret;
 
     ret = check_bitstream(s, sti, pkt);
     if (ret < 0)
+        av_log(s, AV_LOG_ERROR, "Bitstream check failed for stream #%d: %s\n", st->index, av_err2str(ret));
         return ret;
 
     if (sti->bsfc) {
