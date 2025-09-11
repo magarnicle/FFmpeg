@@ -52,9 +52,12 @@ AVCODECOBJS-$(CONFIG_VVC_DECODER)       += vvc_alf.o vvc_mc.o vvc_sao.o
 CHECKASMOBJS-$(CONFIG_AVCODEC)          += $(AVCODECOBJS-yes)
 
 # libavfilter tests
+AVFILTEROBJS-$(CONFIG_SCENE_SAD)         += scene_sad.o
 AVFILTEROBJS-$(CONFIG_AFIR_FILTER) += af_afir.o
+AVFILTEROBJS-$(CONFIG_BLACKDETECT_FILTER) += vf_blackdetect.o
 AVFILTEROBJS-$(CONFIG_BLEND_FILTER) += vf_blend.o
 AVFILTEROBJS-$(CONFIG_BWDIF_FILTER)      += vf_bwdif.o
+AVFILTEROBJS-$(CONFIG_COLORDETECT_FILTER)+= vf_colordetect.o
 AVFILTEROBJS-$(CONFIG_COLORSPACE_FILTER) += vf_colorspace.o
 AVFILTEROBJS-$(CONFIG_EQ_FILTER)         += vf_eq.o
 AVFILTEROBJS-$(CONFIG_GBLUR_FILTER)      += vf_gblur.o
@@ -66,7 +69,13 @@ AVFILTEROBJS-$(CONFIG_SOBEL_FILTER)      += vf_convolution.o
 CHECKASMOBJS-$(CONFIG_AVFILTER) += $(AVFILTEROBJS-yes)
 
 # swscale tests
-SWSCALEOBJS                             += sw_gbrp.o sw_range_convert.o sw_rgb.o sw_scale.o sw_yuv2rgb.o sw_yuv2yuv.o
+SWSCALEOBJS                             += sw_gbrp.o            \
+                                           sw_ops.o             \
+                                           sw_range_convert.o   \
+                                           sw_rgb.o             \
+                                           sw_scale.o           \
+                                           sw_yuv2rgb.o         \
+                                           sw_yuv2yuv.o
 
 CHECKASMOBJS-$(CONFIG_SWSCALE)  += $(SWSCALEOBJS)
 

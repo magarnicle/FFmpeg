@@ -88,6 +88,7 @@ static int query_formats(const AVFilterContext *ctx,
 static void draw_text(FFDrawContext *draw, AVFrame *frame, FFDrawColor *color,
                       int x0, int y0, const uint8_t *text, int vertical)
 {
+    const uint8_t *cga_font = avpriv_cga_font_get();
     int x = x0;
 
     for (; *text; text++) {
@@ -98,7 +99,7 @@ static void draw_text(FFDrawContext *draw, AVFrame *frame, FFDrawColor *color,
         }
         ff_blend_mask(draw, color, frame->data, frame->linesize,
                       frame->width, frame->height,
-                      avpriv_cga_font + *text * 8, 1, 8, 8, 0, 0, x, y0);
+                      &cga_font[*text * 8], 1, 8, 8, 0, 0, x, y0);
         if (vertical) {
             x = x0;
             y0 += 8;
@@ -389,7 +390,7 @@ static int config_input(AVFilterLink *inlink)
     int ret;
 
     s->nb_planes = av_pix_fmt_count_planes(inlink->format);
-    ret = ff_draw_init2(&s->draw, inlink->format, inlink->colorspace, inlink->color_range, 0);
+    ret = ff_draw_init_from_link(&s->draw, inlink, 0);
     if (ret < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to initialize FFDrawContext\n");
         return ret;

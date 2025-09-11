@@ -330,6 +330,7 @@ typedef struct OutputFilterOptions {
     int                 height;
     enum AVColorSpace   color_space;
     enum AVColorRange   color_range;
+    enum AVAlphaMode    alpha_mode;
 
     enum VideoSyncMethod vsync_method;
     AVRational           frame_rate;
@@ -344,6 +345,7 @@ typedef struct OutputFilterOptions {
     const AVRational         *frame_rates;
     const enum AVColorSpace  *color_spaces;
     const enum AVColorRange  *color_ranges;
+    const enum AVAlphaMode   *alpha_modes;
 
     // for simple filtergraphs only, view specifier passed
     // along to the decoder
@@ -737,6 +739,7 @@ extern float max_error_rate;
 
 extern char *filter_nbthreads;
 extern int filter_complex_nbthreads;
+extern int filter_buffered_frames;
 extern int vstats_version;
 extern int print_graphs;
 extern char *print_graphs_file;
