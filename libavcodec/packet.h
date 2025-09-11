@@ -142,7 +142,7 @@ enum AVPacketSideDataType {
     AV_PKT_DATA_CPB_PROPERTIES,
 
     /**
-     * Recommmends skipping the specified number of samples
+     * Recommends skipping the specified number of samples
      * @code
      * u32le number of samples to skip from start of this packet
      * u32le number of samples to skip from end of this packet
@@ -355,6 +355,18 @@ enum AVPacketSideDataType {
      * libavutil/tdrdi.h.
      */
     AV_PKT_DATA_3D_REFERENCE_DISPLAYS,
+
+    /**
+     * Contains the last received RTCP SR (Sender Report) information
+     * in the form of the AVRTCPSenderReport struct.
+     */
+    AV_PKT_DATA_RTCP_SR,
+
+    /**
+     * Extensible image file format metadata. The payload is a buffer containing
+     * EXIF metadata, starting with either 49 49 2a 00, or 4d 4d 00 2a.
+     */
+     AV_PKT_DATA_EXIF,
 
     /**
      * The number of side data types.

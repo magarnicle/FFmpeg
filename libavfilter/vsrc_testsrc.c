@@ -257,8 +257,7 @@ static int color_config_props(AVFilterLink *inlink)
     TestSourceContext *test = ctx->priv;
     int ret;
 
-    ret = ff_draw_init2(&test->draw, inlink->format, inlink->colorspace,
-                        inlink->color_range, 0);
+    ret = ff_draw_init_from_link(&test->draw, inlink, 0);
     if (ret < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to initialize FFDrawContext\n");
         return ret;
@@ -733,6 +732,7 @@ static uint32_t color_gradient(unsigned index)
 static void draw_text(TestSourceContext *s, AVFrame *frame, FFDrawColor *color,
                       int x0, int y0, const uint8_t *text)
 {
+    const uint8_t *vga16_font = avpriv_vga16_font_get();
     int x = x0;
 
     for (; *text; text++) {
@@ -743,7 +743,7 @@ static void draw_text(TestSourceContext *s, AVFrame *frame, FFDrawColor *color,
         }
         ff_blend_mask(&s->draw, color, frame->data, frame->linesize,
                       frame->width, frame->height,
-                      avpriv_vga16_font + *text * 16, 1, 8, 16, 0, 0, x, y0);
+                      &vga16_font[*text * 16], 1, 8, 16, 0, 0, x, y0);
         x += 8;
     }
 }
@@ -940,8 +940,7 @@ static int test2_config_props(AVFilterLink *inlink)
     AVFilterContext *ctx = inlink->src;
     TestSourceContext *s = ctx->priv;
 
-    av_assert0(ff_draw_init2(&s->draw, inlink->format, inlink->colorspace,
-                             inlink->color_range, 0) >= 0);
+    av_assert0(ff_draw_init_from_link(&s->draw, inlink, 0) >= 0);
     s->w = ff_draw_round_to_sub(&s->draw, 0, -1, s->w);
     s->h = ff_draw_round_to_sub(&s->draw, 1, -1, s->h);
     if (av_image_check_size(s->w, s->h, 0, ctx) < 0)
@@ -2021,8 +2020,7 @@ static int colorchart_config_props(AVFilterLink *inlink)
     AVFilterContext *ctx = inlink->src;
     TestSourceContext *s = ctx->priv;
 
-    av_assert0(ff_draw_init2(&s->draw, inlink->format, inlink->colorspace,
-                             inlink->color_range, 0) >= 0);
+    av_assert0(ff_draw_init_from_link(&s->draw, inlink, 0) >= 0);
     if (av_image_check_size(s->w, s->h, 0, ctx) < 0)
         return AVERROR(EINVAL);
     return config_props(inlink);

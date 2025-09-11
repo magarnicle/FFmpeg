@@ -15,10 +15,12 @@ HEADERS = ac3_parser.h                                                  \
           dirac.h                                                       \
           dv_profile.h                                                  \
           dxva2.h                                                       \
+          exif.h                                                        \
           jni.h                                                         \
           mediacodec.h                                                  \
           packet.h                                                      \
           qsv.h                                                         \
+          smpte_436m.h                                                  \
           vdpau.h                                                       \
           version.h                                                     \
           version_major.h                                               \
@@ -41,6 +43,7 @@ OBJS = ac3_parser.o                                                     \
        dirac.o                                                          \
        dv_profile.o                                                     \
        encode.o                                                         \
+       exif.o                                                           \
        get_buffer.o                                                     \
        imgconvert.o                                                     \
        jni.o                                                            \
@@ -55,6 +58,7 @@ OBJS = ac3_parser.o                                                     \
        qsv_api.o                                                        \
        raw.o                                                            \
        threadprogress.o                                                 \
+       tiff_common.o                                                    \
        utils.o                                                          \
        version.o                                                        \
        vlc.o                                                            \
@@ -99,7 +103,6 @@ OBJS-$(CONFIG_DOVI_RPUDEC)             += dovi_rpu.o dovi_rpudec.o
 OBJS-$(CONFIG_DOVI_RPUENC)             += dovi_rpu.o dovi_rpuenc.o
 OBJS-$(CONFIG_ERROR_RESILIENCE)        += error_resilience.o
 OBJS-$(CONFIG_EVCPARSE)                += evc_parse.o evc_ps.o
-OBJS-$(CONFIG_EXIF)                    += exif.o tiff_common.o
 OBJS-$(CONFIG_FAANDCT)                 += faandct.o
 OBJS-$(CONFIG_FAANIDCT)                += faanidct.o
 OBJS-$(CONFIG_FDCTDSP)                 += fdctdsp.o jfdctfst.o jfdctint.o
@@ -167,6 +170,7 @@ OBJS-$(CONFIG_QSVENC)                  += qsvenc.o
 OBJS-$(CONFIG_RANGECODER)              += rangecoder.o
 OBJS-$(CONFIG_RV34DSP)                 += rv34dsp.o
 OBJS-$(CONFIG_SINEWIN)                 += sinewin.o
+OBJS-$(CONFIG_SMPTE_436M)              += smpte_436m.o
 OBJS-$(CONFIG_SNAPPY)                  += snappy.o
 OBJS-$(CONFIG_STARTCODE)               += startcode.o
 OBJS-$(CONFIG_TEXTUREDSP)              += texturedsp.o
@@ -191,11 +195,13 @@ OBJS-$(CONFIG_A64MULTI5_ENCODER)       += a64multienc.o elbg.o
 OBJS-$(CONFIG_AAC_DECODER)             += aactab.o \
                                           aacsbr.o aacps_common.o aacps_float.o \
                                           kbdwin.o \
-                                          sbrdsp.o aacpsdsp_float.o cbrt_data.o
+                                          sbrdsp.o aacpsdsp_float.o cbrt_data.o \
+                                          $(if $(!CONFIG_HARDCODED_TABLES), cbrt_tablegen_common.o)
 OBJS-$(CONFIG_AAC_FIXED_DECODER)       += aactab.o \
                                           aacsbr_fixed.o aacps_common.o aacps_fixed.o \
                                           kbdwin.o \
-                                          sbrdsp_fixed.o aacpsdsp_fixed.o cbrt_data_fixed.o
+                                          sbrdsp_fixed.o aacpsdsp_fixed.o cbrt_data_fixed.o \
+                                          $(if $(!CONFIG_HARDCODED_TABLES), cbrt_tablegen_common.o)
 OBJS-$(CONFIG_AAC_ENCODER)             += aacenc.o aaccoder.o aacenctab.o    \
                                           aacpsy.o aactab.o      \
                                           aacenc_is.o \
@@ -272,6 +278,8 @@ OBJS-$(CONFIG_AV1_MEDIACODEC_ENCODER)  += mediacodecenc.o
 OBJS-$(CONFIG_AV1_NVENC_ENCODER)       += nvenc_av1.o nvenc.o
 OBJS-$(CONFIG_AV1_QSV_ENCODER)         += qsvenc_av1.o
 OBJS-$(CONFIG_AV1_VAAPI_ENCODER)       += vaapi_encode_av1.o av1_levels.o
+OBJS-$(CONFIG_AV1_VULKAN_ENCODER)      += vulkan_encode.o vulkan_encode_av1.o \
+                                          hw_base_encode.o av1_levels.o
 OBJS-$(CONFIG_AVRN_DECODER)            += avrndec.o
 OBJS-$(CONFIG_AVRP_DECODER)            += r210dec.o
 OBJS-$(CONFIG_AVRP_ENCODER)            += r210enc.o
@@ -428,6 +436,8 @@ OBJS-$(CONFIG_H264_MEDIACODEC_ENCODER) += mediacodecenc.o
 OBJS-$(CONFIG_H264_MF_ENCODER)         += mfenc.o mf_utils.o
 OBJS-$(CONFIG_H264_MMAL_DECODER)       += mmaldec.o
 OBJS-$(CONFIG_H264_NVENC_ENCODER)      += nvenc_h264.o nvenc.o
+OBJS-$(CONFIG_H264_OH_DECODER)         += ohcodec.o ohdec.o
+OBJS-$(CONFIG_H264_OH_ENCODER)         += ohcodec.o ohenc.o
 OBJS-$(CONFIG_H264_OMX_ENCODER)        += omx.o
 OBJS-$(CONFIG_H264_QSV_DECODER)        += qsvdec.o
 OBJS-$(CONFIG_H264_QSV_ENCODER)        += qsvenc_h264.o
@@ -456,6 +466,8 @@ OBJS-$(CONFIG_HEVC_MEDIACODEC_DECODER) += mediacodecdec.o
 OBJS-$(CONFIG_HEVC_MEDIACODEC_ENCODER) += mediacodecenc.o
 OBJS-$(CONFIG_HEVC_MF_ENCODER)         += mfenc.o mf_utils.o
 OBJS-$(CONFIG_HEVC_NVENC_ENCODER)      += nvenc_hevc.o nvenc.o
+OBJS-$(CONFIG_HEVC_OH_DECODER)         += ohcodec.o ohdec.o
+OBJS-$(CONFIG_HEVC_OH_ENCODER)         += ohcodec.o ohenc.o
 OBJS-$(CONFIG_HEVC_QSV_DECODER)        += qsvdec.o
 OBJS-$(CONFIG_HEVC_QSV_ENCODER)        += qsvenc_hevc.o hevc/ps_enc.o
 OBJS-$(CONFIG_HEVC_RKMPP_DECODER)      += rkmppdec.o
@@ -629,6 +641,7 @@ OBJS-$(CONFIG_PRORES_DECODER)          += proresdec.o proresdsp.o proresdata.o
 OBJS-$(CONFIG_PRORES_ENCODER)          += proresenc_anatoliy.o proresdata.o
 OBJS-$(CONFIG_PRORES_AW_ENCODER)       += proresenc_anatoliy.o proresdata.o
 OBJS-$(CONFIG_PRORES_KS_ENCODER)       += proresenc_kostya.o proresdata.o
+OBJS-$(CONFIG_PRORES_RAW_DECODER)      += prores_raw.o proresdsp.o proresdata.o
 OBJS-$(CONFIG_PRORES_VIDEOTOOLBOX_ENCODER) += videotoolboxenc.o
 OBJS-$(CONFIG_PROSUMER_DECODER)        += prosumer.o
 OBJS-$(CONFIG_PSD_DECODER)             += psd.o
@@ -1077,8 +1090,10 @@ OBJS-$(CONFIG_VP9_NVDEC_HWACCEL)          += nvdec_vp9.o
 OBJS-$(CONFIG_VP9_VAAPI_HWACCEL)          += vaapi_vp9.o
 OBJS-$(CONFIG_VP9_VDPAU_HWACCEL)          += vdpau_vp9.o
 OBJS-$(CONFIG_VP9_VIDEOTOOLBOX_HWACCEL)   += videotoolbox_vp9.o
+OBJS-$(CONFIG_VP9_VULKAN_HWACCEL)         += vulkan_decode.o vulkan_vp9.o
 OBJS-$(CONFIG_VP8_QSV_HWACCEL)            += qsvdec.o
 OBJS-$(CONFIG_VVC_VAAPI_HWACCEL)          += vaapi_vvc.o
+OBJS-$(CONFIG_PRORES_RAW_VULKAN_HWACCEL)  += vulkan_decode.o vulkan_prores_raw.o
 
 # Objects duplicated from other libraries for shared builds
 SHLIBOBJS                              += log2_tab.o reverse.o
@@ -1250,6 +1265,7 @@ OBJS-$(CONFIG_MPEGVIDEO_PARSER)        += mpegvideo_parser.o    \
 OBJS-$(CONFIG_OPUS_PARSER)             += vorbis_data.o
 OBJS-$(CONFIG_PNG_PARSER)              += png_parser.o
 OBJS-$(CONFIG_PNM_PARSER)              += pnm_parser.o pnm.o
+OBJS-$(CONFIG_PRORES_RAW_PARSER)       += prores_raw_parser.o
 OBJS-$(CONFIG_QOI_PARSER)              += qoi_parser.o
 OBJS-$(CONFIG_RV34_PARSER)             += rv34_parser.o
 OBJS-$(CONFIG_SBC_PARSER)              += sbc_parser.o
@@ -1314,6 +1330,7 @@ SKIPHEADERS-$(CONFIG_MEDIACODEC)       += mediacodecdec_common.h mediacodec_surf
 SKIPHEADERS-$(CONFIG_MEDIAFOUNDATION)  += mf_utils.h
 SKIPHEADERS-$(CONFIG_NVDEC)            += nvdec.h
 SKIPHEADERS-$(CONFIG_NVENC)            += nvenc.h
+SKIPHEADERS-$(CONFIG_OHCODEC)          += ohcodec.h
 SKIPHEADERS-$(CONFIG_QSV)              += qsv.h qsv_internal.h
 SKIPHEADERS-$(CONFIG_QSVENC)           += qsvenc.h
 SKIPHEADERS-$(CONFIG_VAAPI)            += vaapi_decode.h vaapi_hevc.h vaapi_encode.h

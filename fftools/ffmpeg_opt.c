@@ -75,6 +75,7 @@ int stdin_interaction = 1;
 float max_error_rate  = 2.0/3;
 char *filter_nbthreads;
 int filter_complex_nbthreads = 0;
+int filter_buffered_frames = 0;
 int vstats_version = 2;
 int print_graphs = 0;
 char *print_graphs_file = NULL;
@@ -1049,7 +1050,8 @@ static int opt_preset(void *optctx, const char *opt, const char *arg)
         else if (!strcmp(key, "vcodec")) opt_video_codec   (o, key, value);
         else if (!strcmp(key, "scodec")) opt_subtitle_codec(o, key, value);
         else if (!strcmp(key, "dcodec")) opt_data_codec    (o, key, value);
-        else if (opt_default_new(o, key, value) < 0) {
+        else if ((parse_option(o, key, value, options) < 0) &&
+                 (opt_default_new(o, key, value) < 0)) {
             av_log(NULL, AV_LOG_FATAL, "%s: Invalid option or argument: '%s', parsed as '%s' = '%s'\n",
                    filename, line, key, value);
             ret = AVERROR(EINVAL);
@@ -1714,6 +1716,9 @@ const OptionDef options[] = {
     { "filter_threads",         OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_filter_threads },
         "number of non-complex filter threads" },
+    { "filter_buffered_frames", OPT_TYPE_INT, OPT_EXPERT,
+        { &filter_buffered_frames },
+        "maximum number of buffered frames in a filter graph" },
 #if FFMPEG_OPT_FILTER_SCRIPT
     { "filter_script",          OPT_TYPE_STRING, OPT_PERSTREAM | OPT_EXPERT | OPT_OUTPUT,
         { .off = OFFSET(filter_scripts) },
