@@ -1079,15 +1079,19 @@ static int interleaved_write_packet(AVFormatContext *s, AVPacket *pkt,
 
     for (;; ) {
         int ret = fci->interleave_packet(s, pkt, flush, has_packet);
-        if (ret <= 0)
+        if (ret <= 0){
+            av_log(s, AV_LOG_ERROR, "interleave failed:%d\n", ret);
             return ret;
+        }
 
         has_packet = 0;
 
         ret = write_packet(s, pkt);
         av_packet_unref(pkt);
-        if (ret < 0)
+        if (ret < 0){
+            av_log(s, AV_LOG_ERROR, "write packet failed:%d\n", ret);
             return ret;
+        }
     }
 }
 
@@ -1207,8 +1211,10 @@ int av_write_frame(AVFormatContext *s, AVPacket *in)
         pkt->data = in->data;
         pkt->size = in->size;
         ret = av_packet_copy_props(pkt, in);
-        if (ret < 0)
+        if (ret < 0){
+            av_log(s, AV_LOG_ERROR, "av_packet_copy_props failed: %d\n", ret);
             return ret;
+        }
         if (in->buf) {
             pkt->buf = av_buffer_ref(in->buf);
             if (!pkt->buf) {
@@ -1232,8 +1238,10 @@ int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
 
     if (pkt) {
         ret = write_packets_common(s, pkt, 1/*interleaved*/);
-        if (ret < 0)
+        if (ret < 0){
+            av_log(s, AV_LOG_ERROR, "write_packets_common failed: %d\n", ret);
             av_packet_unref(pkt);
+        }
         return ret;
     } else {
         av_log(s, AV_LOG_TRACE, "av_interleaved_write_frame FLUSH\n");
