@@ -1080,7 +1080,9 @@ static int interleaved_write_packet(AVFormatContext *s, AVPacket *pkt,
     for (;; ) {
         int ret = fci->interleave_packet(s, pkt, flush, has_packet);
         if (ret <= 0){
-            av_log(s, AV_LOG_ERROR, "interleave failed:%d\n", ret);
+            if (ret < 0){
+                av_log(s, AV_LOG_ERROR, "interleave failed:%d\n", ret);
+            }
             return ret;
         }
 

@@ -844,6 +844,14 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     if (pkt->pts > 2 && buffered <= 2){
         av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
                 " Video may misbehave!\n");
+        bool active = true;
+        HRESULT schedule_running = ctx->dlo->IsScheduledPlaybackRunning(&active);
+        if (schedule_running != S_OK) {
+            av_log(NULL, AV_LOG_INFO, "decklink schedule running result is not ok: %d\n", schedule_running);
+        }
+        if (!active){
+            av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
+        }
         return -1;
     }
 
@@ -879,6 +887,14 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     if (pkt->pts > 1 && !buffered){
         av_log(avctx, AV_LOG_WARNING, "There's no buffered audio."
                 " Audio will misbehave!\n");
+        bool active = true;
+        HRESULT schedule_running = ctx->dlo->IsScheduledPlaybackRunning(&active);
+        if (schedule_running != S_OK) {
+            av_log(NULL, AV_LOG_INFO, "decklink schedule running result is not ok: %d\n", schedule_running);
+        }
+        if (!active){
+            av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
+        }
         return -2;
     }
 
