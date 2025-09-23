@@ -292,7 +292,8 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
-    ctx->frames_buffer_available_spots = ctx->frames_buffer;
+    // TEST: Double the size of the available slots and see what happens
+    ctx->frames_buffer_available_spots = ctx->frames_buffer * 2;
 
     av_log(avctx, AV_LOG_INFO, "output: %s, preroll: %d, frames buffer size: %d\n",
             avctx->url, ctx->frames_preroll, ctx->frames_buffer);
