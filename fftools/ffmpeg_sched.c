@@ -407,7 +407,7 @@ static int task_start(SchTask *task)
 {
     int ret;
 
-    av_log(task->func_arg, AV_LOG_VERBOSE, "Starting thread...\n");
+    av_log(task->func_arg, AV_LOG_INFO, "Starting thread...\n");
 
     av_assert0(!task->thread_running);
 
@@ -806,6 +806,7 @@ int sch_add_enc(Scheduler *sch, SchThreadFunc func, void *ctx,
         return AVERROR(ENOMEM);
 
     ret = queue_alloc(&enc->queue, 1, 0, QUEUE_FRAMES);
+    av_log(NULL, AV_LOG_INFO, "Scheduled encoder with %d: %d\n", QUEUE_FRAMES, ret);
     if (ret < 0)
         return ret;
 

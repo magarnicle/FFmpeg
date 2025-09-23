@@ -262,6 +262,7 @@ static int sync_queue_process(Muxer *mux, MuxStream *ms, AVPacket *pkt, int *str
 
         while (1) {
             ret = sq_receive(mux->sq_mux, -1, SQPKT(mux->sq_pkt));
+            av_log(mux, AV_LOG_INFO, "Sync receive\n");
             if (ret < 0) {
                 /* n.b.: We forward EOF from the sync queue, terminating muxing.
                  * This assumes that if a muxing sync queue is present, then all
@@ -273,6 +274,7 @@ static int sync_queue_process(Muxer *mux, MuxStream *ms, AVPacket *pkt, int *str
 
             ret = write_packet(mux, of->streams[ret],
                                mux->sq_pkt);
+            av_log(mux, AV_LOG_INFO, "Sync write packet\n");
             if (ret < 0)
                 return ret;
         }
@@ -420,10 +422,12 @@ int muxer_thread(void *arg)
     thread_set_name(mux);
 
     while (1) {
+        av_log(mux, AV_LOG_INFO, "Mux loop\n");
         OutputStream *ost;
         int stream_idx, stream_eof = 0;
 
         ret = sch_mux_receive(mux->sch, of->index, mt.pkt);
+        av_log(mux, AV_LOG_INFO, "Mux received: %d\n", ret);
         stream_idx = mt.pkt->stream_index;
         if (stream_idx < 0) {
             av_log(mux, AV_LOG_VERBOSE, "All streams finished\n");
@@ -436,6 +440,7 @@ int muxer_thread(void *arg)
         mt.pkt->flags       &= ~AV_PKT_FLAG_TRUSTED;
 
         ret = mux_packet_filter(mux, &mt, ost, ret < 0 ? NULL : mt.pkt, &stream_eof);
+        av_log(mux, AV_LOG_INFO, "Mux filtered: %d\n", ret);
         av_packet_unref(mt.pkt);
         if (ret == AVERROR_EOF) {
             if (stream_eof) {

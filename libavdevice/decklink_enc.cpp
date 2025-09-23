@@ -21,7 +21,8 @@
 
 #include <atomic>
 #include <unistd.h>
-
+#include <iostream>
+#include <stacktrace>
 using std::atomic;
 
 /* Include internal.h first to avoid conflict between winsock.h (used by
@@ -292,8 +293,9 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
-    // TEST: Double the size of the available slots and see what happens
-    ctx->frames_buffer_available_spots = ctx->frames_buffer * 2;
+    //ctx->frames_buffer_available_spots = ctx->frames_buffer;
+    // TEST: How many slots can we have?
+    ctx->frames_buffer_available_spots = 360;
 
     av_log(avctx, AV_LOG_INFO, "output: %s, preroll: %d, frames buffer size: %d\n",
             avctx->url, ctx->frames_preroll, ctx->frames_buffer);
@@ -777,7 +779,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint32_t buffered;
     HRESULT hr;
 
-
+    std::cout << std::stacktrace::current();
     ctx->last_pts = FFMAX(ctx->last_pts, pkt->pts);
 
     if (st->codecpar->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
@@ -820,6 +822,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     /* Always keep at most one second of frames buffered. */
     pthread_mutex_lock(&ctx->mutex);
     while (ctx->frames_buffer_available_spots == 0) {
+        av_log(avctx, AV_LOG_INFO, "Waiting for frame buffer slot.\n");
         pthread_cond_wait(&ctx->cond, &ctx->mutex);
     }
     ctx->frames_buffer_available_spots--;
@@ -829,6 +832,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         ctx->first_pts = pkt->pts;
 
     /* Schedule frame for playback. */
+    av_log(avctx, AV_LOG_INFO, "Scheduling video frame.\n");
     hr = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame_v14_2_1 *) frame,
             pkt->pts * ctx->bmd_tb_num,
             ctx->bmd_tb_num, ctx->bmd_tb_den);
