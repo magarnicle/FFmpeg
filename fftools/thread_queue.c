@@ -128,8 +128,18 @@ int tq_send(ThreadQueue *tq, unsigned int stream_idx, void *data)
         goto finish;
     }
 
-    while (!(*finished & FINISHED_RECV) && !av_fifo_can_write(tq->fifo_stream_index))
+    av_log(NULL, AV_LOG_INFO, "Waiting for fifo to be writable on stream %d, queue %ld\n", stream_idx, tq);
+    av_log(NULL, AV_LOG_INFO, "FIFO %d, queue %ld\n", stream_idx, tq);
+    clock_t start, end;
+    start = clock();
+    while (!(*finished & FINISHED_RECV) && !av_fifo_can_write(tq->fifo_stream_index)){
         pthread_cond_wait(&tq->cond, &tq->lock);
+    }
+    end = clock();
+    double time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    av_log(NULL, AV_LOG_INFO, "FIFO duration on stream %d, thread_queue: %ld: %f\n", stream_idx, tq, time_taken);
+    av_log(NULL, AV_LOG_INFO, "fifo is writable on stream %d, queue %ld\n", stream_idx, tq);
+    av_log(NULL, AV_LOG_INFO, "FIFO %d, queue %ld\n", stream_idx, tq);
 
     if (*finished & FINISHED_RECV) {
         ret = AVERROR_EOF;
@@ -201,13 +211,16 @@ int tq_receive(ThreadQueue *tq, int *stream_idx, void *data)
     while (1) {
         size_t can_read = av_container_fifo_can_read(tq->fifo);
 
+        av_log(NULL, AV_LOG_INFO, "thread queue checking lock for stream %d, queue %ld\n", *stream_idx, tq);
         ret = receive_locked(tq, stream_idx, data);
+        av_log(NULL, AV_LOG_INFO, "thread queue finished checking lock for stream %d, queue %ld\n", *stream_idx, tq);
 
         // signal other threads if the fifo state changed
         if (can_read != av_container_fifo_can_read(tq->fifo))
             pthread_cond_broadcast(&tq->cond);
 
         if (ret == AVERROR(EAGAIN)) {
+            av_log(NULL, AV_LOG_INFO, "thread queue waiting to receive for stream %d, queue %ld\n", *stream_idx, tq);
             pthread_cond_wait(&tq->cond, &tq->lock);
             continue;
         }

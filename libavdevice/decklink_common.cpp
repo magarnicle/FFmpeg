@@ -398,6 +398,7 @@ void ff_decklink_packet_queue_init(AVFormatContext *avctx, DecklinkPacketQueue *
     pthread_cond_init(&q->cond, NULL);
     q->avctx = avctx;
     q->max_q_size = queue_size;
+    av_log(avctx, AV_LOG_INFO, "Initialised packet queue with size %ld\n", queue_size);
 }
 
 void ff_decklink_packet_queue_flush(DecklinkPacketQueue *q)

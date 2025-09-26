@@ -499,6 +499,7 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
 
 static void readrate_sleep(Demuxer *d)
 {
+    av_log(d, AV_LOG_INFO, "readrate_sleep\n");
     InputFile *f = &d->f;
     int64_t file_start = copy_ts * (
                           (f->start_time_effective != AV_NOPTS_VALUE ? f->start_time_effective * !start_at_zero : 0) +

@@ -233,7 +233,10 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     if (ms->stats.io)
         enc_stats_write(ost, &ms->stats, NULL, pkt, frame_num);
 
+    av_log(mux, AV_LOG_INFO, "Write interleaved frame\n");
     ret = av_interleaved_write_frame(s, pkt);
+    av_log(mux, AV_LOG_INFO, "Write interleaved frame\n");
+    av_log(mux, AV_LOG_INFO, "Wrote interleaved frame: %d\n", ret);
     if (ret < 0) {
         av_log(ost, AV_LOG_ERROR,
                "Error submitting a packet to the muxer for output '%s': %s (%d)\n",
@@ -253,6 +256,7 @@ static int sync_queue_process(Muxer *mux, MuxStream *ms, AVPacket *pkt, int *str
 
     if (ms->sq_idx_mux >= 0) {
         int ret = sq_send(mux->sq_mux, ms->sq_idx_mux, SQPKT(pkt));
+        av_log(mux, AV_LOG_INFO, "Sync send\n");
         if (ret < 0) {
             if (ret == AVERROR_EOF)
                 *stream_eof = 1;
@@ -274,12 +278,14 @@ static int sync_queue_process(Muxer *mux, MuxStream *ms, AVPacket *pkt, int *str
 
             ret = write_packet(mux, of->streams[ret],
                                mux->sq_pkt);
-            av_log(mux, AV_LOG_INFO, "Sync write packet\n");
+            av_log(mux, AV_LOG_INFO, "Sync write packet from loop\n");
             if (ret < 0)
                 return ret;
         }
-    } else if (pkt)
+    } else if (pkt){
+        av_log(mux, AV_LOG_INFO, "Sync write packet\n");
         return write_packet(mux, &ms->ost, pkt);
+    }
 
     return 0;
 }
@@ -290,6 +296,8 @@ static int of_streamcopy(OutputFile *of, OutputStream *ost, AVPacket *pkt);
 static int mux_packet_filter(Muxer *mux, MuxThreadContext *mt,
                              OutputStream *ost, AVPacket *pkt, int *stream_eof)
 {
+    clock_t start, end;
+    start = clock();
     MuxStream *ms = ms_from_ost(ost);
     const char *err_msg;
     int ret;
@@ -309,6 +317,7 @@ static int mux_packet_filter(Muxer *mux, MuxThreadContext *mt,
     // emit heartbeat for -fix_sub_duration;
     // we are only interested in heartbeats on on random access points.
     if (pkt && (pkt->flags & AV_PKT_FLAG_KEY)) {
+        av_log(mux, AV_LOG_INFO, "Heartbeat\n");
         mt->fix_sub_duration_pkt->opaque    = (void*)(intptr_t)PKT_OPAQUE_FIX_SUB_DURATION;
         mt->fix_sub_duration_pkt->pts       = pkt->pts;
         mt->fix_sub_duration_pkt->time_base = pkt->time_base;
@@ -355,7 +364,12 @@ static int mux_packet_filter(Muxer *mux, MuxThreadContext *mt,
         }
         *stream_eof = 1;
     } else {
+        av_log(mux, AV_LOG_INFO, "Syncing queue process\n");
         ret = sync_queue_process(mux, ms, pkt, stream_eof);
+        av_log(mux, AV_LOG_INFO, "Synced queue process\n");
+        end = clock();
+        double time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(mux, AV_LOG_INFO, "Synced queue process for %ld took %f\n", pkt, time_taken);
         if (ret < 0)
             goto mux_fail;
     }
@@ -422,12 +436,12 @@ int muxer_thread(void *arg)
     thread_set_name(mux);
 
     while (1) {
-        av_log(mux, AV_LOG_INFO, "Mux loop\n");
+        av_log(mux, AV_LOG_INFO, "Mux loop: %s\n", mux->fc->oformat->name);
         OutputStream *ost;
         int stream_idx, stream_eof = 0;
 
         ret = sch_mux_receive(mux->sch, of->index, mt.pkt);
-        av_log(mux, AV_LOG_INFO, "Mux received: %d\n", ret);
+        av_log(mux, AV_LOG_INFO, "Mux %s received: %d\n", mux->fc->oformat->name, ret);
         stream_idx = mt.pkt->stream_index;
         if (stream_idx < 0) {
             av_log(mux, AV_LOG_VERBOSE, "All streams finished\n");

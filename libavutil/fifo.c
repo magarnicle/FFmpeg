@@ -86,6 +86,7 @@ size_t av_fifo_elem_size(const AVFifo *f)
 
 size_t av_fifo_can_read(const AVFifo *f)
 {
+    av_log(NULL, AV_LOG_INFO, "offset_w: %ld, offset_r: %ld; is_empty: %d, nb_elems: %ld\n", f->offset_w, f->offset_r, f->is_empty, f->nb_elems);
     if (f->offset_w <= f->offset_r && !f->is_empty)
         return f->nb_elems - f->offset_r + f->offset_w;
     return f->offset_w - f->offset_r;

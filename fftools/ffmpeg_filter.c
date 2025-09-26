@@ -18,6 +18,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stdio.h>
+#include <time.h>
 #include <stdint.h>
 
 #include "ffmpeg.h"
@@ -2335,6 +2337,9 @@ static void video_sync_process(OutputFilterPriv *ofp, AVFrame *frame,
     OutputFilter   *ofilter = &ofp->ofilter;
     FPSConvContext     *fps = &ofp->fps;
     double delta0, delta, sync_ipts, duration;
+    av_log(ofp, AV_LOG_INFO, "video_sync_process\n");
+    clock_t start, end;
+    start = clock();
 
     if (!frame) {
         *nb_frames_prev = *nb_frames = mid_pred(fps->frames_prev_hist[0],
@@ -2450,6 +2455,10 @@ finish:
 
     fps->last_dropped = *nb_frames == *nb_frames_prev && frame;
     fps->dropped_keyframe |= fps->last_dropped && (frame->flags & AV_FRAME_FLAG_KEY);
+    av_log(ofp, AV_LOG_INFO, "video_sync_process end\n");
+    end = clock();
+    double time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    av_log(ofp, AV_LOG_INFO, "video_sync_process duration %f\n", time_taken);
 }
 
 static int close_output(OutputFilterPriv *ofp, FilterGraphThread *fgt)
@@ -2882,6 +2891,7 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
     FrameData       *fd;
     AVFrameSideData *sd;
     int need_reinit = 0, ret;
+    av_log(fg, AV_LOG_INFO, "Sending frame %ld\n", frame);
 
     /* determine if the parameters for this input changed */
     switch (ifilter->type) {
@@ -3104,6 +3114,7 @@ static int filter_thread(void *arg)
     }
 
     while (1) {
+        av_log(fg, AV_LOG_VERBOSE, "Filter loop\n");
         InputFilter *ifilter;
         InputFilterPriv *ifp = NULL;
         enum FrameOpaque o;
@@ -3141,7 +3152,7 @@ static int filter_thread(void *arg)
         // we received an input frame or EOF
         ifilter   = fg->inputs[input_idx];
         ifp       = ifp_from_ifilter(ifilter);
-
+        av_log(fg, AV_LOG_VERBOSE, "Filter received input frame\n");
         if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
             int hb_frame = input_status >= 0 && o == FRAME_OPAQUE_SUB_HEARTBEAT;
             ret = sub2video_frame(ifilter, (fgt.frame->buf[0] || hb_frame) ? fgt.frame : NULL,
@@ -3164,7 +3175,12 @@ static int filter_thread(void *arg)
 
 read_frames:
         // retrieve all newly available frames
+        clock_t start, end;
+        start = clock();
         ret = read_frames(fg, &fgt, fgt.frame);
+        end = clock();
+        double time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(fg, AV_LOG_INFO, "read_frames duration %f\n", time_taken);
         if (ret == AVERROR_EOF) {
             av_log(fg, AV_LOG_VERBOSE, "All consumers returned EOF\n");
             if (ifp && ifp->opts.flags & IFILTER_FLAG_DROPCHANGED)
@@ -3175,6 +3191,7 @@ read_frames:
                    av_err2str(ret));
             goto finish;
         }
+        av_log(fg, AV_LOG_INFO, "Filter read frames\n");
     }
 
     for (unsigned i = 0; i < fg->nb_outputs; i++) {

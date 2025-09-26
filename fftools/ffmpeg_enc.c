@@ -889,7 +889,10 @@ int encoder_thread(void *arg)
             goto finish;
     }
 
+    clock_t start, end;
+    double time_taken;
     while (!input_status) {
+        start = clock();
         input_status = sch_enc_receive(ep->sch, ep->sch_idx, et.frame);
         if (input_status < 0) {
             if (input_status == AVERROR_EOF) {
@@ -906,16 +909,27 @@ int encoder_thread(void *arg)
             }
             goto finish;
         }
+        end = clock();
+        time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(e, AV_LOG_INFO, "!!Received a frame for encoding %f\n", time_taken);
 
         if (!name_set) {
             enc_thread_set_name(ost);
             name_set = 1;
         }
 
+        start = clock();
         ret = frame_encode(ost, et.frame, et.pkt);
+        end = clock();
+        time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(e, AV_LOG_INFO, "!!Encoded frame %f\n", time_taken);
 
+        start = clock();
         av_packet_unref(et.pkt);
         av_frame_unref(et.frame);
+        end = clock();
+        time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(e, AV_LOG_INFO, "!!Cleaned up %f\n", time_taken);
 
         if (ret < 0) {
             if (ret == AVERROR_EOF)

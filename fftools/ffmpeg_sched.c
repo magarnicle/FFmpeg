@@ -883,6 +883,7 @@ int sch_add_sq_enc(Scheduler *sch, uint64_t buf_size_us, void *logctx)
     if (ret)
         return AVERROR(ret);
 
+    av_log(NULL, AV_LOG_INFO, "Scheduled sync queue %ld with buf size %ld\n", buf_size_us);
     return sq - sch->sq_enc;
 }
 
@@ -911,8 +912,10 @@ int sch_sq_add_enc(Scheduler *sch, unsigned sq_idx, unsigned enc_idx,
     enc->sq_idx[0] = sq_idx;
     enc->sq_idx[1] = ret;
 
-    if (max_frames != INT64_MAX)
+    if (max_frames != INT64_MAX){
+        av_log(sch, AV_LOG_INFO, "Limiting frames to %ld\n", max_frames);
         sq_limit_frames(sq->sq, enc->sq_idx[1], max_frames);
+    };
 
     return 0;
 }
@@ -1667,7 +1670,9 @@ int sch_wait(Scheduler *sch, uint64_t timeout_us, int64_t *transcode_ts)
     if (sch->nb_mux_done < sch->nb_mux) {
         struct timespec tv = { .tv_sec  =  timeout_us / 1000000,
                                .tv_nsec = (timeout_us % 1000000) * 1000 };
+        av_log(sch, AV_LOG_INFO, "Wait...\n");
         pthread_cond_timedwait(&sch->finish_cond, &sch->finish_lock, &tv);
+        av_log(sch, AV_LOG_INFO, "Wait...\n");
     }
 
     // abort transcoding if any task failed
@@ -1709,6 +1714,7 @@ static int enc_open(Scheduler *sch, SchEnc *enc, const AVFrame *frame)
 static int send_to_enc_thread(Scheduler *sch, SchEnc *enc, AVFrame *frame)
 {
     int ret;
+    av_log(sch, AV_LOG_INFO, "Sending frame %ld to encoding thread %d.%d\n", frame, enc->dst->idx, enc->dst->idx_stream);
 
     if (!frame) {
         tq_send_finish(enc->queue, 0);
@@ -1722,6 +1728,7 @@ static int send_to_enc_thread(Scheduler *sch, SchEnc *enc, AVFrame *frame)
     if (ret < 0)
         enc->in_finished = 1;
 
+    av_log(sch, AV_LOG_INFO, "Sent frame %ld to encoding thread %d.%d\n", frame, enc->dst->idx, enc->dst->idx_stream);
     return ret;
 }
 
@@ -1729,6 +1736,7 @@ static int send_to_enc_sq(Scheduler *sch, SchEnc *enc, AVFrame *frame)
 {
     SchSyncQueue *sq = &sch->sq_enc[enc->sq_idx[0]];
     int ret = 0;
+    av_log(sch, AV_LOG_INFO, "Sending frame %ld to encoding sync queue %d.%d\n", frame, enc->dst->idx, enc->dst->idx_stream);
 
     // inform the scheduling code that no more input will arrive along this path;
     // this is necessary because the sync queue may not send an EOF downstream
@@ -1798,6 +1806,7 @@ static int send_to_enc_sq(Scheduler *sch, SchEnc *enc, AVFrame *frame)
 finish:
     pthread_mutex_unlock(&sq->lock);
 
+    av_log(sch, AV_LOG_INFO, "Sending frame %ld to encoding sync queue %d.%d\n", frame, enc->dst->idx, enc->dst->idx_stream);
     return ret;
 }
 
@@ -2187,6 +2196,7 @@ int sch_dec_receive(Scheduler *sch, unsigned dec_idx, AVPacket *pkt)
 static int send_to_filter(Scheduler *sch, SchFilterGraph *fg,
                           unsigned in_idx, AVFrame *frame)
 {
+    av_log(sch, AV_LOG_INFO, "Sending frame to filter %ld\n", fg);
     if (frame)
         return tq_send(fg->queue, in_idx, frame);
 
@@ -2198,6 +2208,7 @@ static int send_to_filter(Scheduler *sch, SchFilterGraph *fg,
         if (atomic_fetch_add(&fg->nb_inputs_finished_send, 1) == fg->nb_inputs - 1)
             tq_send_finish(fg->queue, fg->nb_inputs);
     }
+    av_log(sch, AV_LOG_INFO, "Sending frame to filter %ld\n", fg);
     return 0;
 }
 
@@ -2462,6 +2473,7 @@ int sch_filter_send(Scheduler *sch, unsigned fg_idx, unsigned out_idx, AVFrame *
 {
     SchFilterGraph *fg;
     SchedulerNode  dst;
+    av_log(sch, AV_LOG_INFO, "Sending frame to filtergraph %d for output %d\n", fg_idx, out_idx);
 
     av_assert0(fg_idx < sch->nb_filters);
     fg = &sch->filters[fg_idx];

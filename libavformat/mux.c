@@ -19,6 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stdio.h>
+#include <time.h>
 #include "avformat.h"
 #include "avformat_internal.h"
 #include "internal.h"
@@ -726,9 +728,13 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
     FFStream *const sti = ffstream(st);
     int ret;
 
+    clock_t start, end;
+    start = clock();
+    av_log(s, AV_LOG_INFO, "writing the packet\n");
     // If the timestamp offsetting below is adjusted, adjust
     // ff_interleaved_peek similarly.
     if (s->output_ts_offset) {
+        av_log(s, AV_LOG_INFO, "rescaling the packet\n");
         int64_t offset = av_rescale_q(s->output_ts_offset, AV_TIME_BASE_Q, st->time_base);
 
         if (pkt->dts != AV_NOPTS_VALUE)
@@ -736,13 +742,16 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
         if (pkt->pts != AV_NOPTS_VALUE)
             pkt->pts += offset;
     }
+    av_log(s, AV_LOG_INFO, "avoiding negative ts\n");
     handle_avoid_negative_ts(si, sti, pkt);
 
     if ((pkt->flags & AV_PKT_FLAG_UNCODED_FRAME)) {
+        av_log(s, AV_LOG_INFO, "writing uncoded frame\n");
         AVFrame **frame = (AVFrame **)pkt->data;
         av_assert0(pkt->size == sizeof(*frame));
         ret = ffofmt(s->oformat)->write_uncoded_frame(s, pkt->stream_index, frame, 0);
     } else {
+        av_log(s, AV_LOG_INFO, "writing frame: %ld\n", pkt);
         ret = ffofmt(s->oformat)->write_packet(s, pkt);
     }
 
@@ -755,6 +764,9 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret >= 0)
         st->nb_frames++;
 
+    end = clock();
+    double time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    av_log(s, AV_LOG_INFO, "Writing frame %ld took %f\n", pkt, time_taken);
     return ret;
 }
 
@@ -1078,7 +1090,10 @@ static int interleaved_write_packet(AVFormatContext *s, AVPacket *pkt,
     FormatContextInternal *const fci = ff_fc_internal(s);
 
     for (;; ) {
+        av_log(s, AV_LOG_INFO, "interleave loop...has_packet: %d, flush: %d\n", has_packet, flush);
+        av_log(s, AV_LOG_INFO, "interleaving packet: %ld\n", pkt);
         int ret = fci->interleave_packet(s, pkt, flush, has_packet);
+        av_log(s, AV_LOG_INFO, "interleaved packet: %d\n", ret);
         if (ret <= 0){
             if (ret < 0){
                 av_log(s, AV_LOG_ERROR, "interleave failed:%d\n", ret);
@@ -1089,6 +1104,7 @@ static int interleaved_write_packet(AVFormatContext *s, AVPacket *pkt,
         has_packet = 0;
 
         ret = write_packet(s, pkt);
+        av_log(s, AV_LOG_INFO, "wrote packet: %d\n", ret);
         av_packet_unref(pkt);
         if (ret < 0){
             av_log(s, AV_LOG_ERROR, "write packet failed:%d\n", ret);
@@ -1115,8 +1131,10 @@ static int write_packet_common(AVFormatContext *s, AVStream *st, AVPacket *pkt, 
     if (interleaved) {
         if (pkt->dts == AV_NOPTS_VALUE && !(s->oformat->flags & AVFMT_NOTIMESTAMPS))
             return AVERROR(EINVAL);
+        av_log(s, AV_LOG_INFO, "writing interleaved packet\n");
         return interleaved_write_packet(s, pkt, 0, 1);
     } else {
+        av_log(s, AV_LOG_INFO, "writing non-interleaved packet\n");
         return write_packet(s, pkt);
     }
 }
@@ -1240,13 +1258,14 @@ int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
 
     if (pkt) {
         ret = write_packets_common(s, pkt, 1/*interleaved*/);
+        av_log(s, AV_LOG_INFO, "wrote packet common: %d\n", ret);
         if (ret < 0){
             av_log(s, AV_LOG_ERROR, "write_packets_common failed: %d\n", ret);
             av_packet_unref(pkt);
         }
         return ret;
     } else {
-        av_log(s, AV_LOG_TRACE, "av_interleaved_write_frame FLUSH\n");
+        av_log(s, AV_LOG_INFO, "av_interleaved_write_frame FLUSH\n");
         return interleaved_write_packet(s, ffformatcontext(s)->parse_pkt, 1/*flush*/, 0);
     }
 }
@@ -1269,6 +1288,7 @@ int av_write_trailer(AVFormatContext *s)
         }
     }
     ret1 = interleaved_write_packet(s, pkt, 1, 0);
+    av_log(s, AV_LOG_INFO, "wrote interleaved packet trailer: %d\n", ret1);
     if (ret >= 0)
         ret = ret1;
 

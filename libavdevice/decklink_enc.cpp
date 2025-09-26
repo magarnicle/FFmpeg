@@ -290,18 +290,20 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
 
     /* Buffer twice as many frames as the preroll. */
     ctx->frames_buffer = ctx->frames_preroll * 2;
+    ctx->frames_buffer = 120;
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
     //ctx->frames_buffer_available_spots = ctx->frames_buffer;
-    // TEST: How many slots can we have?
+    // This is limited by the frame rate of the output anyway
+    // so it is unlikely to get this high
     ctx->frames_buffer_available_spots = 360;
 
     av_log(avctx, AV_LOG_INFO, "output: %s, preroll: %d, frames buffer size: %d\n",
             avctx->url, ctx->frames_preroll, ctx->frames_buffer);
 
     /* The device expects the framerate to be fixed. */
-    avpriv_set_pts_info(st, 64, st->time_base.num, st->time_base.den);
+    //avpriv_set_pts_info(st, 64, st->time_base.num, st->time_base.den);
 
     ctx->video = 1;
 
@@ -824,6 +826,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     while (ctx->frames_buffer_available_spots == 0) {
         av_log(avctx, AV_LOG_INFO, "Waiting for frame buffer slot.\n");
         pthread_cond_wait(&ctx->cond, &ctx->mutex);
+        av_log(avctx, AV_LOG_INFO, "Finished waiting for frame buffer slot.\n");
     }
     ctx->frames_buffer_available_spots--;
     pthread_mutex_unlock(&ctx->mutex);
@@ -889,6 +892,7 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     int ret = 0;
 
     ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
+    av_log(avctx, AV_LOG_INFO, "Buffered audio sample frames: %d.\n", (int) buffered);
     if (pkt->pts > 1 && !buffered){
         av_log(avctx, AV_LOG_WARNING, "There's no buffered audio."
                 " Audio will misbehave!\n");
@@ -1052,18 +1056,24 @@ error:
 
     int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
     {
-
+        av_log(avctx, AV_LOG_INFO, "writing packet to decklink\n");
         AVStream *st = avctx->streams[pkt->stream_index];
 
-        if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+        if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO){
+            av_log(avctx, AV_LOG_INFO, "writing video packet to decklink\n");
             return decklink_write_video_packet(avctx, pkt);
-        else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            av_log(avctx, AV_LOG_INFO, "writing audio packet to decklink\n");
             return decklink_write_audio_packet(avctx, pkt);
-        else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA) {
+            av_log(avctx, AV_LOG_INFO, "writing data packet to decklink\n");
             return decklink_write_data_packet(avctx, pkt);
-        else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            av_log(avctx, AV_LOG_INFO, "writing subtitle packet to decklink\n");
             return decklink_write_subtitle_packet(avctx, pkt);
+        }
 
+        av_log(avctx, AV_LOG_INFO, "packet did not have sensible type\n");
         return AVERROR(EIO);
     }
 

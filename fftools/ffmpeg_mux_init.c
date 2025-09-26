@@ -770,6 +770,7 @@ static int new_stream_video(Muxer *mux, const OptionsContext *o,
 #endif
         opt_match_per_stream_str(ost, &o->fps_mode, oc, st, &fps_mode);
         if (fps_mode) {
+            av_log(mux, AV_LOG_INFO, "fps_mode: %s, vsync_method: %d\n", fps_mode, *vsync_method);
             ret = parse_and_set_vsync(fps_mode, vsync_method, ost->file->index, ost->index, 0);
             if (ret < 0)
                 return ret;
@@ -809,6 +810,7 @@ static int new_stream_video(Muxer *mux, const OptionsContext *o,
         if (*vsync_method == VSYNC_DROP)
             ms->ts_drop = 1;
 #endif
+        av_log(mux, AV_LOG_INFO, "vsync_method: %d\n", *vsync_method);
     }
 
     return 0;
@@ -2073,6 +2075,7 @@ static int setup_sync_queues(Muxer *mux, AVFormatContext *oc,
         limit_frames_av_enc |= (ms->max_frames < INT64_MAX) && IS_AV_ENC(ost, type);
     }
 
+    av_log(mux, AV_LOG_INFO, "Sync queue decision: shortest: %d, nb_av_enc %d, limit_frames_av_enc: %d, nb_audio_fs: %d\n", shortest, nb_av_enc, limit_frames_av_enc, nb_audio_fs);
     if (!((nb_interleaved > 1 && shortest) ||
           (nb_interleaved > 0 && limit_frames) ||
           nb_audio_fs))
@@ -2095,6 +2098,7 @@ static int setup_sync_queues(Muxer *mux, AVFormatContext *oc,
         sq_idx = sch_add_sq_enc(mux->sch, buf_size_us, mux);
         if (sq_idx < 0)
             return sq_idx;
+        av_log(mux, AV_LOG_INFO, "Set up a sync queue\n");
 
         for (int i = 0; i < oc->nb_streams; i++) {
             OutputStream *ost = of->streams[i];
@@ -2133,6 +2137,7 @@ static int setup_sync_queues(Muxer *mux, AVFormatContext *oc,
 
             ms->sq_idx_mux = sq_add_stream(mux->sq_mux,
                                            shortest || ms->max_frames < INT64_MAX);
+            av_log(mux, AV_LOG_INFO, "Added stream to sync queue\n");
             if (ms->sq_idx_mux < 0)
                 return ms->sq_idx_mux;
 
@@ -3253,6 +3258,7 @@ static const AVClass output_file_class = {
 static Muxer *mux_alloc(void)
 {
     Muxer *mux = allocate_array_elem(&output_files, sizeof(*mux), &nb_output_files);
+    av_log(mux, AV_LOG_INFO, "Allocated %d output files\n", nb_output_files);
 
     if (!mux)
         return NULL;
@@ -3276,6 +3282,7 @@ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
     int64_t stop_time      = o->stop_time;
 
     mux = mux_alloc();
+    av_log(mux, AV_LOG_INFO, "Opening file %s\n", filename);
     if (!mux)
         return AVERROR(ENOMEM);
 
