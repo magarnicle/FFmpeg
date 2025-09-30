@@ -870,9 +870,12 @@ int encoder_thread(void *arg)
     EncoderPriv   *ep = ep_from_enc(e);
     EncoderThread et;
     int ret = 0, input_status = 0;
+    int input_status2 = 0;
+    EncoderThread et2;
     int name_set = 0;
 
     ret = enc_thread_init(&et);
+    ret = enc_thread_init(&et2);
     if (ret < 0)
         goto finish;
 
@@ -918,11 +921,18 @@ int encoder_thread(void *arg)
             name_set = 1;
         }
 
+
+        input_status2 = sch_enc_receive(ep->sch, ep->sch_idx, et2.frame);
         start = clock();
         ret = frame_encode(ost, et.frame, et.pkt);
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(e, AV_LOG_INFO, "!!Encoded frame %f\n", time_taken);
+        start = clock();
+        ret = frame_encode(ost, et2.frame, et2.pkt);
+        end = clock();
+        time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(e, AV_LOG_INFO, "!!Encoded frame 2 %f\n", time_taken);
 
         start = clock();
         av_packet_unref(et.pkt);
@@ -931,6 +941,12 @@ int encoder_thread(void *arg)
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(e, AV_LOG_INFO, "!!Cleaned up %f\n", time_taken);
 
+        start = clock();
+        av_packet_unref(et2.pkt);
+        av_frame_unref(et2.frame);
+        end = clock();
+        time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(e, AV_LOG_INFO, "!!Cleaned up 2 %f\n", time_taken);
         if (ret < 0) {
             if (ret == AVERROR_EOF)
                 av_log(e, AV_LOG_VERBOSE, "Encoder returned EOF, finishing\n");
@@ -944,6 +960,10 @@ int encoder_thread(void *arg)
     // flush the encoder
     if (ret == 0 || ret == AVERROR_EOF) {
         ret = frame_encode(ost, NULL, et.pkt);
+        if (ret < 0 && ret != AVERROR_EOF)
+            av_log(e, AV_LOG_ERROR, "Error flushing encoder: %s\n",
+                   av_err2str(ret));
+        ret = frame_encode(ost, NULL, et2.pkt);
         if (ret < 0 && ret != AVERROR_EOF)
             av_log(e, AV_LOG_ERROR, "Error flushing encoder: %s\n",
                    av_err2str(ret));

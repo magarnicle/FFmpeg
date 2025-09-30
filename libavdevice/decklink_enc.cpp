@@ -203,10 +203,10 @@ class decklink_output_callback : public IDeckLinkVideoOutputCallback_v14_2_1
                 av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
             }
 
-            pthread_mutex_lock(&ctx->mutex);
-            ctx->frames_buffer_available_spots++;
-            pthread_cond_broadcast(&ctx->cond);
-            pthread_mutex_unlock(&ctx->mutex);
+            //pthread_mutex_lock(&ctx->mutex);
+            //ctx->frames_buffer_available_spots++;
+            //pthread_cond_broadcast(&ctx->cond);
+            //pthread_mutex_unlock(&ctx->mutex);
             return S_OK;
         }
         virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
@@ -297,7 +297,7 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     //ctx->frames_buffer_available_spots = ctx->frames_buffer;
     // This is limited by the frame rate of the output anyway
     // so it is unlikely to get this high
-    ctx->frames_buffer_available_spots = 360;
+    //ctx->frames_buffer_available_spots = 360;
 
     av_log(avctx, AV_LOG_INFO, "output: %s, preroll: %d, frames buffer size: %d\n",
             avctx->url, ctx->frames_preroll, ctx->frames_buffer);
@@ -822,14 +822,14 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     /* Always keep at most one second of frames buffered. */
-    pthread_mutex_lock(&ctx->mutex);
-    while (ctx->frames_buffer_available_spots == 0) {
-        av_log(avctx, AV_LOG_INFO, "Waiting for frame buffer slot.\n");
-        pthread_cond_wait(&ctx->cond, &ctx->mutex);
-        av_log(avctx, AV_LOG_INFO, "Finished waiting for frame buffer slot.\n");
-    }
-    ctx->frames_buffer_available_spots--;
-    pthread_mutex_unlock(&ctx->mutex);
+    //pthread_mutex_lock(&ctx->mutex);
+    //while (ctx->frames_buffer_available_spots == 0) {
+        //av_log(avctx, AV_LOG_INFO, "Waiting for frame buffer slot.\n");
+        //pthread_cond_wait(&ctx->cond, &ctx->mutex);
+        //av_log(avctx, AV_LOG_INFO, "Finished waiting for frame buffer slot.\n");
+    //}
+    //ctx->frames_buffer_available_spots--;
+    //pthread_mutex_unlock(&ctx->mutex);
 
     if (ctx->first_pts == AV_NOPTS_VALUE)
         ctx->first_pts = pkt->pts;
