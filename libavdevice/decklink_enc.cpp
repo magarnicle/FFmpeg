@@ -290,6 +290,7 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     /* Buffer twice as many frames as the preroll. */
     ctx->frames_buffer = ctx->frames_preroll * 2;
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
+    ctx->frames_buffer = 120;
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
@@ -840,7 +841,9 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
-    av_log(avctx, AV_LOG_INFO, "Buffered video frames: %d.\n", (int) buffered);
+    if (buffered <= 25){
+        av_log(avctx, AV_LOG_INFO, "Buffered video frames: %d.\n", (int) buffered);
+    }
     if (pkt->pts > 2 && buffered <= 2){
         av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
                 " Video may misbehave!\n");
