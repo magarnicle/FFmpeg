@@ -326,11 +326,12 @@ static int waiter_wait(Scheduler *sch, SchWaiter *w)
     double time_taken;
     start = clock();
 
-    if (!atomic_load(&w->choked))
+    if (!atomic_load(&w->choked)){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "waiter_wait %f\n", time_taken);
         return 0;
+    }
 
     pthread_mutex_lock(&w->lock);
 
@@ -358,6 +359,9 @@ static void waiter_set(SchWaiter *w, int choked)
     pthread_cond_signal(&w->cond);
 
     pthread_mutex_unlock(&w->lock);
+    end = clock();
+    time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    av_log(NULL, AV_LOG_INFO, "waiter_set %f\n", time_taken);
 }
 
 static int waiter_init(SchWaiter *w)
@@ -370,19 +374,20 @@ static int waiter_init(SchWaiter *w)
     atomic_init(&w->choked, 0);
 
     ret = pthread_mutex_init(&w->lock, NULL);
-    if (ret)
+    if (ret){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "waiter_init %f\n", time_taken);
         return AVERROR(ret);
+    }
 
     ret = pthread_cond_init(&w->cond, NULL);
-    if (ret)
+    if (ret){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "waiter_init %f\n", time_taken);
         return AVERROR(ret);
-
+    }
     end = clock();
     time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
     av_log(NULL, AV_LOG_INFO, "waiter_init %f\n", time_taken);
@@ -396,6 +401,9 @@ static void waiter_uninit(SchWaiter *w)
     start = clock();
     pthread_mutex_destroy(&w->lock);
     pthread_cond_destroy(&w->cond);
+    end = clock();
+    time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    av_log(NULL, AV_LOG_INFO, "waiter_uninit %f\n", time_taken);
 }
 
 static int queue_alloc(ThreadQueue **ptq, unsigned nb_streams, unsigned queue_size,
@@ -424,11 +432,12 @@ static int queue_alloc(ThreadQueue **ptq, unsigned nb_streams, unsigned queue_si
 
     tq = tq_alloc(nb_streams, queue_size,
                   (type == QUEUE_PACKETS) ? THREAD_QUEUE_PACKETS : THREAD_QUEUE_FRAMES);
-    if (!tq)
+    if (!tq){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "queue_alloc %f\n", time_taken);
         return AVERROR(ENOMEM);
+    }
 
     *ptq = tq;
     end = clock();
@@ -480,6 +489,9 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
 
     task->func      = func;
     task->func_arg  = func_arg;
+    end = clock();
+    time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    av_log(NULL, AV_LOG_INFO, "task_init %f\n", time_taken);
 }
 
 static int64_t trailing_dts(const Scheduler *sch, int count_finished)
@@ -497,11 +509,12 @@ static int64_t trailing_dts(const Scheduler *sch, int count_finished)
 
             if (ms->source_finished && !count_finished)
                 continue;
-            if (ms->last_dts == AV_NOPTS_VALUE)
+            if (ms->last_dts == AV_NOPTS_VALUE){
                 end = clock();
                 time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
                 av_log(NULL, AV_LOG_INFO, "trailing_dts %f\n", time_taken);
                 return AV_NOPTS_VALUE;
+            }
 
             min_dts = FFMIN(min_dts, ms->last_dts);
         }
@@ -520,8 +533,12 @@ void sch_free(Scheduler **psch)
     start = clock();
     Scheduler *sch = *psch;
 
-    if (!sch)
+    if (!sch){
+        end = clock();
+        time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+        av_log(NULL, AV_LOG_INFO, "sch_free %f\n", time_taken);
         return;
+    }
 
     sch_stop(sch, NULL);
 
@@ -627,6 +644,9 @@ void sch_free(Scheduler **psch)
     pthread_cond_destroy(&sch->finish_cond);
 
     av_freep(psch);
+    end = clock();
+    time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
+    av_log(NULL, AV_LOG_INFO, "sch_free %f\n", time_taken);
 }
 
 static const AVClass scheduler_class = {
@@ -643,11 +663,12 @@ Scheduler *sch_alloc(void)
     int ret;
 
     sch = av_mallocz(sizeof(*sch));
-    if (!sch)
+    if (!sch){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_alloc %f\n", time_taken);
         return NULL;
+    }
 
     sch->class    = &scheduler_class;
     sch->sdp_auto = 1;
@@ -711,11 +732,12 @@ int sch_add_mux(Scheduler *sch, SchThreadFunc func, int (*init)(void *),
     int ret;
 
     ret = GROW_ARRAY(sch->mux, sch->nb_mux);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_mux %f\n", time_taken);
         return ret;
+    }
 
     mux             = &sch->mux[idx];
     mux->class      = &sch_mux_class;
@@ -746,21 +768,23 @@ int sch_add_mux_stream(Scheduler *sch, unsigned mux_idx)
     mux = &sch->mux[mux_idx];
 
     ret = GROW_ARRAY(mux->streams, mux->nb_streams);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_mux_stream %f\n", time_taken);
         return ret;
+    }
     stream_idx = mux->nb_streams - 1;
 
     ms = &mux->streams[stream_idx];
 
     ms->pre_mux_queue.fifo = av_fifo_alloc2(8, sizeof(AVPacket*), 0);
-    if (!ms->pre_mux_queue.fifo)
+    if (!ms->pre_mux_queue.fifo){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_mux_stream %f\n", time_taken);
         return AVERROR(ENOMEM);
+    }
 
     ms->last_dts = AV_NOPTS_VALUE;
 
@@ -787,11 +811,12 @@ int sch_add_demux(Scheduler *sch, SchThreadFunc func, void *ctx)
     int ret;
 
     ret = GROW_ARRAY(sch->demux, sch->nb_demux);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_demux %f\n", time_taken);
         return ret;
+    }
 
     d = &sch->demux[idx];
 
@@ -799,18 +824,20 @@ int sch_add_demux(Scheduler *sch, SchThreadFunc func, void *ctx)
 
     d->class    = &sch_demux_class;
     d->send_pkt = av_packet_alloc();
-    if (!d->send_pkt)
+    if (!d->send_pkt){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_demux %f\n", time_taken);
         return AVERROR(ENOMEM);
+    }
 
     ret = waiter_init(&d->waiter);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_demux %f\n", time_taken);
         return ret;
+    }
 
     end = clock();
     time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
@@ -848,11 +875,12 @@ int sch_add_dec_output(Scheduler *sch, unsigned dec_idx)
     dec = &sch->dec[dec_idx];
 
     ret = GROW_ARRAY(dec->outputs, dec->nb_outputs);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_dec_output %f\n", time_taken);
         return ret;
+    }
 
     end = clock();
     time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
@@ -877,11 +905,12 @@ int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx, int send_end_ts)
     int ret;
 
     ret = GROW_ARRAY(sch->dec, sch->nb_dec);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_dec %f\n", time_taken);
         return ret;
+    }
 
     dec = &sch->dec[idx];
 
@@ -889,33 +918,37 @@ int sch_add_dec(Scheduler *sch, SchThreadFunc func, void *ctx, int send_end_ts)
 
     dec->class      = &sch_dec_class;
     dec->send_frame = av_frame_alloc();
-    if (!dec->send_frame)
+    if (!dec->send_frame){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_dec %f\n", time_taken);
         return AVERROR(ENOMEM);
+    }
 
     ret = sch_add_dec_output(sch, idx);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_dec %f\n", time_taken);
         return ret;
+    }
 
     ret = queue_alloc(&dec->queue, 1, 0, QUEUE_PACKETS);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_dec %f\n", time_taken);
         return ret;
+    }
 
     if (send_end_ts) {
         ret = av_thread_message_queue_alloc(&dec->queue_end_ts, 1, sizeof(Timestamp));
-        if (ret < 0)
+        if (ret < 0){
             end = clock();
             time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
             av_log(NULL, AV_LOG_INFO, "sch_add_dec %f\n", time_taken);
             return ret;
+        }
     }
 
     end = clock();
@@ -942,11 +975,12 @@ int sch_add_enc(Scheduler *sch, SchThreadFunc func, void *ctx,
     int ret;
 
     ret = GROW_ARRAY(sch->enc, sch->nb_enc);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_enc %f\n", time_taken);
         return ret;
+    }
 
     enc             = &sch->enc[idx];
 
@@ -958,19 +992,21 @@ int sch_add_enc(Scheduler *sch, SchThreadFunc func, void *ctx,
     task_init(sch, &enc->task, SCH_NODE_TYPE_ENC, idx, func, ctx);
 
     enc->send_pkt = av_packet_alloc();
-    if (!enc->send_pkt)
+    if (!enc->send_pkt){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_enc %f\n", time_taken);
         return AVERROR(ENOMEM);
+    }
 
     ret = queue_alloc(&enc->queue, 1, 0, QUEUE_FRAMES);
     av_log(NULL, AV_LOG_INFO, "Scheduled encoder with %d: %d\n", QUEUE_FRAMES, ret);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_enc %f\n", time_taken);
         return ret;
+    }
 
     end = clock();
     time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
@@ -996,11 +1032,12 @@ int sch_add_filtergraph(Scheduler *sch, unsigned nb_inputs, unsigned nb_outputs,
     int ret;
 
     ret = GROW_ARRAY(sch->filters, sch->nb_filters);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_filtergraph %f\n", time_taken);
         return ret;
+    }
     fg = &sch->filters[idx];
 
     fg->class = &sch_fg_class;
@@ -1009,37 +1046,41 @@ int sch_add_filtergraph(Scheduler *sch, unsigned nb_inputs, unsigned nb_outputs,
 
     if (nb_inputs) {
         fg->inputs = av_calloc(nb_inputs, sizeof(*fg->inputs));
-        if (!fg->inputs)
+        if (!fg->inputs){
             end = clock();
             time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
             av_log(NULL, AV_LOG_INFO, "sch_add_filtergraph %f\n", time_taken);
             return AVERROR(ENOMEM);
+        }
         fg->nb_inputs = nb_inputs;
     }
 
     if (nb_outputs) {
         fg->outputs = av_calloc(nb_outputs, sizeof(*fg->outputs));
-        if (!fg->outputs)
+        if (!fg->outputs){
             end = clock();
             time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
             av_log(NULL, AV_LOG_INFO, "sch_add_filtergraph %f\n", time_taken);
             return AVERROR(ENOMEM);
+        }
         fg->nb_outputs = nb_outputs;
     }
 
     ret = waiter_init(&fg->waiter);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_filtergraph %f\n", time_taken);
         return ret;
+    }
 
     ret = queue_alloc(&fg->queue, fg->nb_inputs + 1, 0, QUEUE_FRAMES);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_filtergraph %f\n", time_taken);
         return ret;
+    }
 
     end = clock();
     time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
@@ -1056,33 +1097,37 @@ int sch_add_sq_enc(Scheduler *sch, uint64_t buf_size_us, void *logctx)
     int ret;
 
     ret = GROW_ARRAY(sch->sq_enc, sch->nb_sq_enc);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_sq_enc %f\n", time_taken);
         return ret;
+    }
     sq = &sch->sq_enc[sch->nb_sq_enc - 1];
 
     sq->sq = sq_alloc(SYNC_QUEUE_FRAMES, buf_size_us, logctx);
-    if (!sq->sq)
+    if (!sq->sq){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_sq_enc %f\n", time_taken);
         return AVERROR(ENOMEM);
+    }
 
     sq->frame = av_frame_alloc();
-    if (!sq->frame)
+    if (!sq->frame){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_sq_enc %f\n", time_taken);
         return AVERROR(ENOMEM);
+    }
 
     ret = pthread_mutex_init(&sq->lock, NULL);
-    if (ret)
+    if (ret){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_add_sq_enc %f\n", time_taken);
         return AVERROR(ret);
+    }
 
     av_log(NULL, AV_LOG_INFO, "Scheduled sync queue %ld with buf size %ld\n", buf_size_us);
     end = clock();
@@ -1108,19 +1153,21 @@ int sch_sq_add_enc(Scheduler *sch, unsigned sq_idx, unsigned enc_idx,
     enc = &sch->enc[enc_idx];
 
     ret = GROW_ARRAY(sq->enc_idx, sq->nb_enc_idx);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_sq_add_enc %f\n", time_taken);
         return ret;
+    }
     sq->enc_idx[sq->nb_enc_idx - 1] = enc_idx;
 
     ret = sq_add_stream(sq->sq, limiting);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "sch_sq_add_enc %f\n", time_taken);
         return ret;
+    }
 
     enc->sq_idx[0] = sq_idx;
     enc->sq_idx[1] = ret;
@@ -1152,11 +1199,12 @@ int sch_connect(Scheduler *sch, SchedulerNode src, SchedulerNode dst)
         ds = &sch->demux[src.idx].streams[src.idx_stream];
 
         ret = GROW_ARRAY(ds->dst, ds->nb_dst);
-        if (ret < 0)
+        if (ret < 0){
             end = clock();
             time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
             av_log(NULL, AV_LOG_INFO, "sch_connect %f\n", time_taken);
             return ret;
+        }
 
         ds->dst[ds->nb_dst - 1] = dst;
 
@@ -1200,11 +1248,12 @@ int sch_connect(Scheduler *sch, SchedulerNode src, SchedulerNode dst)
         o = &dec->outputs[src.idx_stream];
 
         ret = GROW_ARRAY(o->dst, o->nb_dst);
-        if (ret < 0)
+        if (ret < 0){
             end = clock();
             time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
             av_log(NULL, AV_LOG_INFO, "sch_connect %f\n", time_taken);
             return ret;
+        }
 
         o->dst[o->nb_dst - 1] = dst;
 
@@ -1282,11 +1331,12 @@ int sch_connect(Scheduler *sch, SchedulerNode src, SchedulerNode dst)
         enc = &sch->enc[src.idx];
 
         ret = GROW_ARRAY(enc->dst, enc->nb_dst);
-        if (ret < 0)
+        if (ret < 0){
             end = clock();
             time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
             av_log(NULL, AV_LOG_INFO, "sch_connect %f\n", time_taken);
             return ret;
+        }
 
         enc->dst[enc->nb_dst - 1] = dst;
 
@@ -1337,11 +1387,12 @@ static int mux_task_start(SchMux *mux)
     int ret = 0;
 
     ret = task_start(&mux->task);
-    if (ret < 0)
+    if (ret < 0){
         end = clock();
         time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
         av_log(NULL, AV_LOG_INFO, "mux_task_start %f\n", time_taken);
         return ret;
+    }
 
     /* flush the pre-muxing queues */
     while (1) {
