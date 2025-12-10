@@ -42,7 +42,7 @@
 
 // 100 ms
 // FIXME: some other value? make this dynamic?
-#define SCHEDULE_TOLERANCE (100 * 1000)
+#define SCHEDULE_TOLERANCE (10000 * 1000)
 
 enum QueueType {
     QUEUE_PACKETS,
