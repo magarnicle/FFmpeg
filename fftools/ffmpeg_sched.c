@@ -1324,8 +1324,10 @@ static void schedule_update_locked(Scheduler *sch)
                 continue;
             if (dts == AV_NOPTS_VALUE && ms->last_dts != AV_NOPTS_VALUE)
                 continue;
-            if (dts != AV_NOPTS_VALUE && ms->last_dts - dts >= SCHEDULE_TOLERANCE)
+            if (dts != AV_NOPTS_VALUE && ms->last_dts - dts >= SCHEDULE_TOLERANCE){
+                av_log(sch, AV_LOG_FATAL, "Stream %d fallen behind schedule tolerance.\n", j);
                 continue;
+            }
 
             // resolve the source to unchoke
             unchoke_for_stream(sch, ms->src_sched);

@@ -331,8 +331,7 @@ static int init_muxer(AVFormatContext *s, AVDictionary **options)
     fci->interleave_packet = of->interleave_packet;
     if (!fci->interleave_packet)
         fci->interleave_packet = fci->nb_interleaved_streams > 1 ?
-                                 //ff_interleave_packet_per_dts :
-                                 ff_interleave_packet_passthrough :
+                                 ff_interleave_packet_per_dts :
                                  ff_interleave_packet_passthrough;
 
     if (!s->priv_data && of->priv_data_size > 0) {

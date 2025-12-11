@@ -74,6 +74,21 @@ static const AVClass decklink_muxer_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT,
 };
 
+/**
+ * Custom interleave function for decklink output.
+ *
+ * Unlike file-based outputs, decklink schedules frames to play at
+ * specific timestamps via the hardware. The hardware handles the
+ * timing/scheduling, so we don't need the muxer to pace packet
+ * delivery. Using passthrough allows the encoder to run as fast as
+ * possible, feeding frames to the decklink buffer.
+ */
+static int decklink_interleave_packet(AVFormatContext *s, AVPacket *pkt,
+                                      int flush, int has_packet)
+{
+    return ff_interleave_packet_passthrough(s, pkt, flush, has_packet);
+}
+
 const FFOutputFormat ff_decklink_muxer = {
     .p.name           = "decklink",
     .p.long_name      = NULL_IF_CONFIG_SMALL("Blackmagic DeckLink output"),
@@ -87,4 +102,5 @@ const FFOutputFormat ff_decklink_muxer = {
     .write_header   = ff_decklink_write_header,
     .write_packet   = ff_decklink_write_packet,
     .write_trailer  = ff_decklink_write_trailer,
+    //.interleave_packet = decklink_interleave_packet,
 };

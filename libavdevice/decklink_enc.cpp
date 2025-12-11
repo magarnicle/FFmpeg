@@ -202,10 +202,10 @@ class decklink_output_callback : public IDeckLinkVideoOutputCallback_v14_2_1
                 av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
             }
 
-            //pthread_mutex_lock(&ctx->mutex);
-            //ctx->frames_buffer_available_spots++;
-            //pthread_cond_broadcast(&ctx->cond);
-            //pthread_mutex_unlock(&ctx->mutex);
+            pthread_mutex_lock(&ctx->mutex);
+            ctx->frames_buffer_available_spots++;
+            pthread_cond_broadcast(&ctx->cond);
+            pthread_mutex_unlock(&ctx->mutex);
             return S_OK;
         }
         virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
@@ -288,15 +288,12 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
         ctx->frames_preroll /= 1000;
 
     /* Buffer twice as many frames as the preroll. */
-    //ctx->frames_buffer = ctx->frames_preroll * 2;
-    //ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
-    //ctx->frames_buffer = 120;
-    //pthread_mutex_init(&ctx->mutex, NULL);
-    //pthread_cond_init(&ctx->cond, NULL);
-    //ctx->frames_buffer_available_spots = ctx->frames_buffer * 5;
+    pthread_mutex_init(&ctx->mutex, NULL);
+    pthread_cond_init(&ctx->cond, NULL);
+    ctx->frames_buffer_available_spots = FFMAX(ctx->frames_preroll * 2, 30);
 
-    //av_log(avctx, AV_LOG_INFO, "output: %s, preroll: %d, frames buffer size: %d\n",
-            //avctx->url, ctx->frames_preroll, ctx->frames_buffer);
+    av_log(avctx, AV_LOG_INFO, "output: %s, preroll: %d, frames buffer size: %d\n",
+            avctx->url, ctx->frames_preroll, ctx->frames_buffer_available_spots);
 
     /* The device expects the framerate to be fixed. */
     avpriv_set_pts_info(st, 64, st->time_base.num, st->time_base.den);
@@ -473,8 +470,8 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     if (ctx->output_callback)
         delete ctx->output_callback;
 
-    //pthread_mutex_destroy(&ctx->mutex);
-    //pthread_cond_destroy(&ctx->cond);
+    pthread_mutex_destroy(&ctx->mutex);
+    pthread_cond_destroy(&ctx->cond);
 
 #if CONFIG_LIBKLVANC
     klvanc_context_destroy(ctx->vanc_ctx);
@@ -818,12 +815,12 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     /* Always keep at most one second of frames buffered. */
-    //pthread_mutex_lock(&ctx->mutex);
-    //while (ctx->frames_buffer_available_spots == 0) {
-        //pthread_cond_wait(&ctx->cond, &ctx->mutex);
-    //}
-    //ctx->frames_buffer_available_spots--;
-    //pthread_mutex_unlock(&ctx->mutex);
+    pthread_mutex_lock(&ctx->mutex);
+    while (ctx->frames_buffer_available_spots == 0) {
+        pthread_cond_wait(&ctx->cond, &ctx->mutex);
+    }
+    ctx->frames_buffer_available_spots--;
+    pthread_mutex_unlock(&ctx->mutex);
 
     if (ctx->first_pts == AV_NOPTS_VALUE)
         ctx->first_pts = pkt->pts;
@@ -1037,16 +1034,24 @@ error:
 
         AVStream *st = avctx->streams[pkt->stream_index];
 
+        int result;
         if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-            return decklink_write_video_packet(avctx, pkt);
+            result = decklink_write_video_packet(avctx, pkt);
         else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-            return decklink_write_audio_packet(avctx, pkt);
+            result = decklink_write_audio_packet(avctx, pkt);
         else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
-            return decklink_write_data_packet(avctx, pkt);
+            result = decklink_write_data_packet(avctx, pkt);
         else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
-            return decklink_write_subtitle_packet(avctx, pkt);
+            result = decklink_write_subtitle_packet(avctx, pkt);
+        else
+            return AVERROR(EIO);
 
-        return AVERROR(EIO);
+        if (result == 0){
+            return 0;
+        }
+        av_log(avctx, AV_LOG_ERROR, "Error writing packet, retrying...\n");
+        return ff_decklink_write_packet(avctx, pkt);
+
     }
 
     int ff_decklink_list_output_devices(AVFormatContext *avctx, struct AVDeviceInfoList *device_list)
