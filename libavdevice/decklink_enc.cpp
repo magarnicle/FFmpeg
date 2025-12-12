@@ -887,15 +887,24 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint32_t buffered;
     HRESULT hr;
 
-    /* Check if frame is late and should be dropped */
+    /* Check if frame is late and should be dropped or errored */
     if (ctx->playback_started) {
         BMDTimeValue stream_time;
         double speed;
         if (ctx->dlo->GetScheduledStreamTime(ctx->bmd_tb_den, &stream_time, &speed) == S_OK) {
             int64_t stream_pts = stream_time / ctx->bmd_tb_num;
             if (pkt->pts < stream_pts) {
+                double behind_secs = (double)(stream_pts - pkt->pts) * ctx->bmd_tb_num / ctx->bmd_tb_den;
+
+                /* Error if too far behind */
+                if (cctx->late_threshold > 0 && behind_secs > cctx->late_threshold) {
+                    av_log(avctx, AV_LOG_ERROR, "Video frame too late: %.2fs behind (threshold: %.2fs). Aborting.\n",
+                           behind_secs, cctx->late_threshold);
+                    return AVERROR(EIO);
+                }
+
                 av_log(avctx, AV_LOG_WARNING, "Dropping late video frame: pts=%"PRId64" < stream=%"PRId64" (%.2fs behind)\n",
-                       pkt->pts, stream_pts, (double)(stream_pts - pkt->pts) * ctx->bmd_tb_num / ctx->bmd_tb_den);
+                       pkt->pts, stream_pts, behind_secs);
                 ctx->dropped++;
                 return 0;  /* Drop frame, but don't error */
             }
@@ -1035,14 +1044,23 @@ static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint8_t *outbuf = NULL;
     int ret = 0;
 
-    /* Check if audio is late and should be dropped */
+    /* Check if audio is late and should be dropped or errored */
     if (ctx->playback_started) {
         BMDTimeValue stream_time;
         double speed;
         if (ctx->dlo->GetScheduledStreamTime(bmdAudioSampleRate48kHz, &stream_time, &speed) == S_OK) {
             if (pkt->pts < stream_time) {
-                av_log(avctx, AV_LOG_WARNING, "Dropping late audio: pts=%"PRId64" < stream=%"PRId64"\n",
-                       pkt->pts, (int64_t)stream_time);
+                double behind_secs = (double)(stream_time - pkt->pts) / 48000.0;
+
+                /* Error if too far behind */
+                if (cctx->late_threshold > 0 && behind_secs > cctx->late_threshold) {
+                    av_log(avctx, AV_LOG_ERROR, "Audio too late: %.2fs behind (threshold: %.2fs). Aborting.\n",
+                           behind_secs, cctx->late_threshold);
+                    return AVERROR(EIO);
+                }
+
+                av_log(avctx, AV_LOG_WARNING, "Dropping late audio: pts=%"PRId64" < stream=%"PRId64" (%.2fs behind)\n",
+                       pkt->pts, (int64_t)stream_time, behind_secs);
                 return 0;  /* Drop but don't error */
             }
         }

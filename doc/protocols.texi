@@ -139,6 +139,41 @@ async:http://host/resource
 async:cache:http://host/resource
 @end example
 
+@subsection Options
+
+@table @option
+
+@item buffer_size
+Size of the read-ahead buffer in bytes. A background thread fills this buffer
+asynchronously while the demuxer reads from it. Larger values allow more
+read-ahead but use more memory.
+Defaults to @option{4194304} (4 MiB).
+
+@item read_back_size
+Size of the read-back buffer in bytes. This allows seeking backwards within
+the buffered data without triggering a new read from the underlying protocol.
+Defaults to @option{4194304} (4 MiB).
+
+@end table
+
+@subsection Examples
+
+@itemize
+
+@item
+Read with 16MB read-ahead buffer:
+@example
+ffmpeg -buffer_size 16777216 -i async:http://host/resource output.mp4
+@end example
+
+@item
+Read with large buffer and no read-back (streaming, no seeking):
+@example
+ffmpeg -buffer_size 33554432 -read_back_size 0 -i async:http://host/resource output.mp4
+@end example
+
+@end itemize
+
 @section bluray
 
 Read BluRay playlist.
