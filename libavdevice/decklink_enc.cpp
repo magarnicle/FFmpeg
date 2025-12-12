@@ -887,6 +887,20 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint32_t buffered;
     HRESULT hr;
 
+    /* Check if frame is late and should be dropped */
+    if (ctx->playback_started) {
+        BMDTimeValue stream_time;
+        double speed;
+        if (ctx->dlo->GetScheduledStreamTime(ctx->bmd_tb_den, &stream_time, &speed) == S_OK) {
+            int64_t stream_pts = stream_time / ctx->bmd_tb_num;
+            if (pkt->pts < stream_pts) {
+                av_log(avctx, AV_LOG_WARNING, "Dropping late video frame: pts=%"PRId64" < stream=%"PRId64" (%.2fs behind)\n",
+                       pkt->pts, stream_pts, (double)(stream_pts - pkt->pts) * ctx->bmd_tb_num / ctx->bmd_tb_den);
+                ctx->dropped++;
+                return 0;  /* Drop frame, but don't error */
+            }
+        }
+    }
 
     ctx->last_pts = FFMAX(ctx->last_pts, pkt->pts);
 
@@ -951,13 +965,8 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
-    //if (buffered <= 25){
-        av_log(avctx, AV_LOG_INFO, "Buffered video frames: %d.\n", (int) buffered);
-    //}
-    if (pkt->pts > 2 && buffered <= 2){
-        av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
-                " Video may misbehave!\n");
-        return -1;
+    if (buffered <= 2) {
+        av_log(avctx, AV_LOG_WARNING, "Low video buffer: %d frames. Video may stutter!\n", (int) buffered);
     }
 
     /* Preroll video frames. */
@@ -1026,11 +1035,22 @@ static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     uint8_t *outbuf = NULL;
     int ret = 0;
 
+    /* Check if audio is late and should be dropped */
+    if (ctx->playback_started) {
+        BMDTimeValue stream_time;
+        double speed;
+        if (ctx->dlo->GetScheduledStreamTime(bmdAudioSampleRate48kHz, &stream_time, &speed) == S_OK) {
+            if (pkt->pts < stream_time) {
+                av_log(avctx, AV_LOG_WARNING, "Dropping late audio: pts=%"PRId64" < stream=%"PRId64"\n",
+                       pkt->pts, (int64_t)stream_time);
+                return 0;  /* Drop but don't error */
+            }
+        }
+    }
+
     ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
-    if (pkt->pts > 1 && !buffered){
-        av_log(avctx, AV_LOG_WARNING, "There's no buffered audio."
-                " Audio will misbehave!\n");
-        return -2;
+    if (!buffered) {
+        av_log(avctx, AV_LOG_WARNING, "No buffered audio. Audio may stutter!\n");
     }
 
     if (st->codecpar->codec_id == AV_CODEC_ID_AC3) {
@@ -1224,27 +1244,18 @@ error:
 
     int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
     {
-
         AVStream *st = avctx->streams[pkt->stream_index];
 
-        int result;
-        if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-            result = decklink_write_video_packet(avctx, pkt);
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            return decklink_write_video_packet(avctx, pkt);
         else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-            result = decklink_write_audio_packet(avctx, pkt);
+            return decklink_write_audio_packet(avctx, pkt);
         else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
-            result = decklink_write_data_packet(avctx, pkt);
+            return decklink_write_data_packet(avctx, pkt);
         else if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
-            result = decklink_write_subtitle_packet(avctx, pkt);
-        else
-            return AVERROR(EIO);
+            return decklink_write_subtitle_packet(avctx, pkt);
 
-        if (result == 0){
-            return 0;
-        }
-        av_log(avctx, AV_LOG_ERROR, "Error writing packet, retrying...\n");
-        return ff_decklink_write_packet(avctx, pkt);
-
+        return AVERROR(EIO);
     }
 
     int ff_decklink_list_output_devices(AVFormatContext *avctx, struct AVDeviceInfoList *device_list)
