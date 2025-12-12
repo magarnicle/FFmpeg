@@ -34,6 +34,7 @@ static const AVOption options[] = {
     { "preroll"     , "video preroll in seconds", OFFSET(preroll     ), AV_OPT_TYPE_DOUBLE, { .dbl = 0.5 }, 0, 5, ENC },
     { "block_until_available",     "wait for device to become available instead of raising error", OFFSET(block_until_available), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "vanc_queue_size", "VANC queue buffer size", OFFSET(vanc_queue_size), AV_OPT_TYPE_INT64, { .i64 = (1024 * 1024)}, 0, INT64_MAX, ENC },
+    { "output_buffer_size", "Async output buffer size in bytes (0 = disabled)", OFFSET(output_buffer_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, ENC },
 #if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0b000000
     { "duplex_mode" , "duplex mode"             , OFFSET(duplex_mode ), AV_OPT_TYPE_INT   , { .i64 = 0   }, 0, 5, ENC, .unit = "duplex_mode"},
 #else
