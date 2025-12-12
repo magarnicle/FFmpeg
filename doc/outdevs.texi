@@ -244,6 +244,32 @@ Defaults to @samp{1048576}.
 Retries output if device appears unavailable. Retry rate is 60 times a second.
 Defaults to @option{0}.
 
+@item output_buffer_size
+Sets the size of the async output buffer in bytes. When enabled, the encoder
+can run as fast as possible, buffering output frames in memory. A consumer
+thread drains this buffer and feeds frames to the DeckLink hardware at the
+appropriate rate. This allows complex filtergraphs to be pre-rendered ahead
+of playback time.
+
+Set to @option{0} to disable async buffering (synchronous mode).
+Defaults to @option{0}.
+
+For example, to buffer approximately 5 minutes of 1080p video (assuming ~4MB
+per uncompressed UYVY frame at 25fps):
+@example
+-output_buffer_size 30000000000
+@end example
+
+@item late_threshold
+Sets the maximum number of seconds a frame can be behind the current playback
+position before FFmpeg errors out. Frames that are late but within this
+threshold are dropped with a warning. Frames that exceed this threshold cause
+a fatal error.
+
+Set to @option{0} to disable the error threshold (always drop late frames,
+never error).
+Defaults to @option{5.0}.
+
 @end table
 
 @subsection Examples
@@ -272,6 +298,13 @@ ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 'DeckLink Mini Monitor'
 Play video clip with non-standard framerate or video size:
 @example
 ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 -s 720x486 -r 24000/1001 'DeckLink Mini Monitor'
+@end example
+
+@item
+Play with async buffering (pre-render complex filtergraph, 10GB buffer, error if 10s behind):
+@example
+ffmpeg -i test.avi -vf "complex_filtergraph" -f decklink -pix_fmt uyvy422 \
+    -output_buffer_size 10000000000 -late_threshold 10 'DeckLink Mini Monitor'
 @end example
 
 @end itemize

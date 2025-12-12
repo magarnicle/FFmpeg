@@ -77,6 +77,7 @@ struct decklink_cctx {
     int block_until_available;
     DecklinkSignalLossAction signal_loss_action;
     int64_t output_buffer_size;
+    double late_threshold;
 };
 
 #endif /* AVDEVICE_DECKLINK_COMMON_C_H */
