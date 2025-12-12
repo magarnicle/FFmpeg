@@ -192,6 +192,13 @@ struct decklink_ctx {
     int channels;
     int audio_depth;
     unsigned long tc_seen;    // used with option wait_for_tc
+
+    /* Async output buffer */
+    DecklinkPacketQueue output_queue;
+    pthread_t output_thread;
+    int output_thread_started;
+    int output_thread_stop;
+    AVFormatContext *avctx;  // for consumer thread access
 };
 
 typedef enum { DIRECTION_IN, DIRECTION_OUT} decklink_direction_t;
