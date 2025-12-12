@@ -78,6 +78,10 @@ typedef struct AsyncContext {
 
     int             abort_request;
     AVIOInterruptCB interrupt_callback;
+
+    /* options */
+    int             buffer_size;
+    int             read_back_size;
 } AsyncContext;
 
 static int ring_init(RingBuffer *ring, unsigned int capacity, int read_back_capacity)
@@ -255,9 +259,12 @@ static int async_open(URLContext *h, const char *arg, int flags, AVDictionary **
 
     av_strstart(arg, "async:", &arg);
 
-    ret = ring_init(&c->ring, BUFFER_CAPACITY, READ_BACK_CAPACITY);
+    ret = ring_init(&c->ring, c->buffer_size, c->read_back_size);
     if (ret < 0)
         goto fifo_fail;
+
+    av_log(h, AV_LOG_INFO, "async: buffer_size=%d, read_back_size=%d\n",
+           c->buffer_size, c->read_back_size);
 
     /* wrap interrupt callback */
     c->interrupt_callback = h->interrupt_callback;
@@ -356,6 +363,11 @@ static int async_read_internal(URLContext *h, void *dest, int size)
         fifo_size = ring_size(ring);
         to_copy   = FFMIN(to_read, fifo_size);
         if (to_copy > 0) {
+            av_log(h, AV_LOG_INFO, "async read: buffer_fill=%d/%d (%.1f%%), read_back=%d/%d (%.1f%%), reading %d bytes\n",
+                   fifo_size, c->buffer_size, 100.0 * fifo_size / c->buffer_size,
+                   ring_size_of_read_back(ring), c->read_back_size,
+                   c->read_back_size ? 100.0 * ring_size_of_read_back(ring) / c->read_back_size : 0.0,
+                   to_copy);
             ring_read(ring, dest, to_copy);
             if (dest)
                 dest = (uint8_t *)dest + to_copy;
@@ -476,6 +488,8 @@ static int64_t async_seek(URLContext *h, int64_t pos, int whence)
 #define D AV_OPT_FLAG_DECODING_PARAM
 
 static const AVOption options[] = {
+    { "buffer_size", "Buffer size in bytes for read-ahead", OFFSET(buffer_size), AV_OPT_TYPE_INT, { .i64 = BUFFER_CAPACITY }, 1024, INT_MAX, D },
+    { "read_back_size", "Read-back buffer size in bytes for seeking backwards", OFFSET(read_back_size), AV_OPT_TYPE_INT, { .i64 = READ_BACK_CAPACITY }, 0, INT_MAX, D },
     {NULL},
 };
 
