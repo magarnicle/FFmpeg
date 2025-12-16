@@ -1,0 +1,42 @@
+When video/audio misbehaves it returns -2, which is interpretted by FFmpeg as
+file not found. Return something like this instead:
+AVERROR(EAGAIN) or AVERROR(EIO))
+
+Use the async: protocal (a prefix before an input url) to read source files into
+a buffer. The buffer is only 4MB, though, so you should increase it. BUFFER_CAPACITY in async.c
+● Implementation complete. Here's a summary of the changes:
+
+  Summary
+
+  Files modified:
+  - libavdevice/decklink_common_c.h - Added output_buffer_size option field
+  - libavdevice/decklink_common.h - Added queue, thread, and state fields to decklink_ctx
+  - libavdevice/decklink_enc_c.c - Added -output_buffer_size command line option
+  - libavdevice/decklink_enc.cpp - Main implementation
+
+  Architecture
+
+  Encoder/Filtergraph (runs as fast as possible)
+          ↓
+    decklink_write_video_packet()
+          ↓
+    decklink_output_queue_put_blocking() ←── blocks when buffer full
+          ↓
+    DecklinkPacketQueue (configurable size in bytes)
+          ↓
+    decklink_output_thread (consumer) ←── pulls from queue
+          ↓
+    decklink_schedule_video_packet()
+          ↓
+    DeckLink ScheduleVideoFrame() → Hardware (25fps output)
+
+  Usage
+
+  # 5 minutes of buffering at 1080p UYVY (~1.5GB)
+  ffmpeg -i input.mp4 -f decklink -output_buffer_size 1500000000 'DeckLink'
+
+  # Or calculate: frames × frame_size
+  # 5min × 60s × 25fps × 4MB/frame = 30GB for uncompressed 1080p
+  ffmpeg -i input.mp4 -f decklink -output_buffer_size 30000000000 'DeckLink'
+
+  The encoder will run at full speed, filling the buffer. Once the buffer is full, it blocks until the decklink consumer thread makes space. The consumer schedules frames to decklink which plays them out at 25fps.
