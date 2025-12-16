@@ -171,6 +171,25 @@ struct decklink_ctx {
     int output_thread_started;
     int output_thread_stop;
     AVFormatContext *avctx;  // for consumer thread access
+
+    /* Health monitoring */
+    pthread_t health_thread;
+    int health_thread_started;
+    int health_thread_stop;
+    int64_t last_health_check_time;
+    uint32_t consecutive_low_buffer_warnings;
+    uint32_t consecutive_hardware_errors;
+
+    /* Dropped frame tracking with exponential backoff */
+    unsigned int dropped_total;
+    unsigned int dropped_recent;
+    int64_t last_drop_log_time;
+    unsigned int drop_log_interval;  // frames between logs, exponentially increases
+
+    /* Async buffer prefill and watermark tracking */
+    int prefill_complete;
+    int64_t prefill_target_bytes;
+    int64_t last_buffer_low_warning;
 };
 
 typedef enum { DIRECTION_IN, DIRECTION_OUT} decklink_direction_t;

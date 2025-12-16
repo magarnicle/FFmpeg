@@ -21,6 +21,8 @@
 
 #include <atomic>
 #include <unistd.h>
+#include <sys/time.h>
+#include <errno.h>
 
 using std::atomic;
 
@@ -227,6 +229,21 @@ class decklink_output_callback : public IDeckLinkVideoOutputCallback_v14_2_1
 static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt);
 static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt);
 
+/* Helper function for timed wait with timeout */
+static int timed_wait_with_timeout(pthread_cond_t *cond, pthread_mutex_t *mutex, int timeout_ms)
+{
+    struct timespec ts;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ts.tv_sec = tv.tv_sec + (timeout_ms / 1000);
+    ts.tv_nsec = (tv.tv_usec * 1000) + ((timeout_ms % 1000) * 1000000);
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    return pthread_cond_timedwait(cond, mutex, &ts);
+}
+
 /* Consumer thread for async output buffer - pulls packets and schedules to decklink */
 static void *decklink_output_thread(void *arg)
 {
@@ -272,12 +289,120 @@ static void *decklink_output_thread(void *arg)
     return NULL;
 }
 
-/* Blocking put for output queue - waits if queue is full */
+/* Hardware health monitoring thread - checks device state periodically */
+static void *decklink_health_monitor_thread(void *arg)
+{
+    struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    uint32_t video_buffered = 0, audio_buffered = 0;
+    int64_t check_interval_us = 100000;  // 100ms
+
+    av_log(avctx, AV_LOG_INFO, "Hardware health monitor thread started\n");
+
+    while (!ctx->health_thread_stop) {
+        usleep(check_interval_us);
+
+        if (!ctx->playback_started)
+            continue;
+
+        /* Check if playback is still running */
+        bool active = true;
+        HRESULT hr = ctx->dlo->IsScheduledPlaybackRunning(&active);
+        if (hr != S_OK) {
+            ctx->consecutive_hardware_errors++;
+            if (ctx->consecutive_hardware_errors >= 5) {
+                av_log(avctx, AV_LOG_ERROR, "Hardware health check failed %d times consecutively. "
+                       "Device may be unresponsive.\n", ctx->consecutive_hardware_errors);
+                if (ctx->consecutive_hardware_errors >= 50) {
+                    av_log(avctx, AV_LOG_FATAL, "Hardware appears permanently unresponsive. "
+                           "Consider restarting playout.\n");
+                }
+            }
+        } else if (!active) {
+            av_log(avctx, AV_LOG_ERROR, "Scheduled playback has stopped unexpectedly! "
+                   "Device may have encountered a fatal error.\n");
+            ctx->consecutive_hardware_errors++;
+        } else {
+            ctx->consecutive_hardware_errors = 0;
+        }
+
+        /* Check video buffer health */
+        if (ctx->video) {
+            ctx->dlo->GetBufferedVideoFrameCount(&video_buffered);
+            if (video_buffered <= 2) {
+                ctx->consecutive_low_buffer_warnings++;
+                if (ctx->consecutive_low_buffer_warnings == 1) {
+                    av_log(avctx, AV_LOG_WARNING, "Low video buffer detected: %d frames\n", video_buffered);
+                } else if (ctx->consecutive_low_buffer_warnings % 10 == 0) {
+                    av_log(avctx, AV_LOG_WARNING, "Video buffer critically low for %d checks: %d frames. "
+                           "Processing may not be keeping up with real-time.\n",
+                           ctx->consecutive_low_buffer_warnings, video_buffered);
+                }
+            } else {
+                if (ctx->consecutive_low_buffer_warnings > 0) {
+                    av_log(avctx, AV_LOG_INFO, "Video buffer recovered: %d frames (after %d low buffer warnings)\n",
+                           video_buffered, ctx->consecutive_low_buffer_warnings);
+                }
+                ctx->consecutive_low_buffer_warnings = 0;
+            }
+        }
+
+        /* Check audio buffer health */
+        if (ctx->audio) {
+            ctx->dlo->GetBufferedAudioSampleFrameCount(&audio_buffered);
+            if (!audio_buffered) {
+                av_log(avctx, AV_LOG_WARNING, "Audio buffer empty! Audio may stutter.\n");
+            }
+        }
+
+        /* Check async buffer watermark (if enabled) */
+        if (ctx->output_thread_started && ctx->prefill_complete) {
+            unsigned long long queue_size = ff_decklink_packet_queue_size(&ctx->output_queue);
+            int64_t queue_max = ctx->output_queue.max_q_size;
+            int buffer_percent = (int)((queue_size * 100) / queue_max);
+
+            /* Warn if buffer drops below 25% (but only once per minute) */
+            if (buffer_percent < 25) {
+                int64_t now = av_gettime();
+                if (now - ctx->last_buffer_low_warning > 60000000) {  // 60 seconds
+                    av_log(avctx, AV_LOG_WARNING, "Async buffer low: %d%% (%llu / %"PRId64" bytes). "
+                           "Processing may not be keeping ahead of playout.\n",
+                           buffer_percent, queue_size, queue_max);
+                    ctx->last_buffer_low_warning = now;
+                }
+            }
+        }
+
+        /* Log periodic health status (every 10 seconds) */
+        int64_t now = av_gettime();
+        if (now - ctx->last_health_check_time > 10000000) {  // 10 seconds
+            ctx->last_health_check_time = now;
+
+            if (ctx->output_thread_started) {
+                unsigned long long queue_size = ff_decklink_packet_queue_size(&ctx->output_queue);
+                int64_t queue_max = ctx->output_queue.max_q_size;
+                int buffer_percent = (int)((queue_size * 100) / queue_max);
+                av_log(avctx, AV_LOG_INFO, "Health: video_hw_buf=%d audio_hw_buf=%d async_buf=%d%% dropped_total=%d dropped_recent=%d\n",
+                       video_buffered, audio_buffered, buffer_percent, ctx->dropped_total, ctx->dropped_recent);
+            } else {
+                av_log(avctx, AV_LOG_INFO, "Health: video_hw_buf=%d audio_hw_buf=%d dropped_total=%d dropped_recent=%d\n",
+                       video_buffered, audio_buffered, ctx->dropped_total, ctx->dropped_recent);
+            }
+            ctx->dropped_recent = 0;  // Reset recent counter every 10 seconds
+        }
+    }
+
+    av_log(avctx, AV_LOG_INFO, "Hardware health monitor thread exiting\n");
+    return NULL;
+}
+
+/* Blocking put for output queue - waits if queue is full with timeout */
 static int decklink_output_queue_put_blocking(struct decklink_ctx *ctx, AVPacket *pkt)
 {
     DecklinkPacketQueue *q = &ctx->output_queue;
     int pkt_size = pkt->size;
     int ret;
+    int timeout_count = 0;
 
     if (av_packet_make_refcounted(pkt) < 0) {
         av_packet_unref(pkt);
@@ -286,9 +411,26 @@ static int decklink_output_queue_put_blocking(struct decklink_ctx *ctx, AVPacket
 
     pthread_mutex_lock(&q->mutex);
 
-    /* Block while queue is full (unless stopping) */
+    /* Block while queue is full (unless stopping) with timeout protection */
     while ((int64_t)q->size >= q->max_q_size && !ctx->output_thread_stop) {
-        pthread_cond_wait(&q->cond, &q->mutex);
+        ret = timed_wait_with_timeout(&q->cond, &q->mutex, 5000);  // 5 second timeout
+        if (ret == ETIMEDOUT) {
+            timeout_count++;
+            if (timeout_count == 1) {
+                av_log(ctx->avctx, AV_LOG_WARNING, "Async output queue full for 5 seconds. "
+                       "Processing may not be keeping up. Queue: %llu / %"PRId64" bytes\n",
+                       q->size, q->max_q_size);
+            } else if (timeout_count >= 12) {  // 60 seconds total
+                av_log(ctx->avctx, AV_LOG_ERROR, "Async output queue blocked for 60 seconds. "
+                       "Aborting to prevent deadlock. Consider increasing output_buffer_size.\n");
+                pthread_mutex_unlock(&q->mutex);
+                av_packet_unref(pkt);
+                return AVERROR(ETIMEDOUT);
+            } else if (timeout_count % 6 == 0) {  // Log every 30 seconds
+                av_log(ctx->avctx, AV_LOG_WARNING, "Async output queue still full after %d seconds\n",
+                       timeout_count * 5);
+            }
+        }
     }
 
     if (ctx->output_thread_stop) {
@@ -528,13 +670,30 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     uint32_t buffered;
 
+    /* Stop health monitoring thread if running */
+    if (ctx->health_thread_started) {
+        av_log(avctx, AV_LOG_INFO, "Stopping hardware health monitor...\n");
+        ctx->health_thread_stop = 1;
+        pthread_join(ctx->health_thread, NULL);
+        ctx->health_thread_started = 0;
+        av_log(avctx, AV_LOG_INFO, "Health monitor thread stopped\n");
+    }
+
     /* Stop async output thread if running */
     if (ctx->output_thread_started) {
         av_log(avctx, AV_LOG_INFO, "Waiting for async output buffer to drain...\n");
 
-        /* Wait for queue to drain before stopping */
-        while (ff_decklink_packet_queue_size(&ctx->output_queue) > 0) {
+        /* Wait for queue to drain before stopping with timeout */
+        int drain_timeout = 0;
+        while (ff_decklink_packet_queue_size(&ctx->output_queue) > 0 && drain_timeout < 100) {
             usleep(10000);  /* 10ms */
+            drain_timeout++;
+        }
+
+        if (drain_timeout >= 100) {
+            av_log(avctx, AV_LOG_WARNING, "Async output queue did not drain within 1 second. "
+                   "Forcing shutdown. %llu bytes remaining.\n",
+                   ff_decklink_packet_queue_size(&ctx->output_queue));
         }
 
         /* Signal thread to stop */
@@ -903,10 +1062,33 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
                     return AVERROR(EIO);
                 }
 
-                av_log(avctx, AV_LOG_WARNING, "Dropping late video frame: pts=%"PRId64" < stream=%"PRId64" (%.2fs behind)\n",
-                       pkt->pts, stream_pts, behind_secs);
-                ctx->dropped++;
+                /* Track dropped frames with exponential backoff logging */
+                ctx->dropped_total++;
+                ctx->dropped_recent++;
+
+                /* Log with exponential backoff to avoid log spam */
+                if (ctx->drop_log_interval == 0)
+                    ctx->drop_log_interval = 1;
+
+                if (ctx->dropped_total % ctx->drop_log_interval == 0) {
+                    av_log(avctx, AV_LOG_WARNING, "Dropping late video frame #%d: pts=%"PRId64" < stream=%"PRId64" (%.2fs behind)\n",
+                           ctx->dropped_total, pkt->pts, stream_pts, behind_secs);
+
+                    /* Increase log interval exponentially, max every 100 drops */
+                    if (ctx->drop_log_interval < 100)
+                        ctx->drop_log_interval *= 2;
+                } else if (ctx->dropped_total == 1) {
+                    /* Always log the first drop */
+                    av_log(avctx, AV_LOG_WARNING, "First dropped frame: pts=%"PRId64" < stream=%"PRId64" (%.2fs behind)\n",
+                           pkt->pts, stream_pts, behind_secs);
+                }
+
                 return 0;  /* Drop frame, but don't error */
+            } else {
+                /* Frame is on time, reset log interval if we had been dropping */
+                if (ctx->dropped_total > 0 && ctx->drop_log_interval > 1) {
+                    ctx->drop_log_interval = 1;
+                }
             }
         }
     }
@@ -950,10 +1132,31 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         return AVERROR(EIO);
     }
 
-    /* Wait for decklink buffer slot */
+    /* Wait for decklink buffer slot with timeout protection */
     pthread_mutex_lock(&ctx->mutex);
+    int wait_attempts = 0;
     while (ctx->frames_buffer_available_spots == 0) {
-        pthread_cond_wait(&ctx->cond, &ctx->mutex);
+        int ret = timed_wait_with_timeout(&ctx->cond, &ctx->mutex, 5000);  // 5 second timeout
+        if (ret == ETIMEDOUT) {
+            wait_attempts++;
+            if (wait_attempts == 1) {
+                av_log(avctx, AV_LOG_WARNING, "Waiting for hardware buffer slot for 5 seconds. "
+                       "Hardware may not be returning frames. Buffered frames: %d\n",
+                       ctx->frames_buffer_available_spots);
+            } else if (wait_attempts >= 6) {  // 30 seconds total
+                av_log(avctx, AV_LOG_ERROR, "Hardware buffer timeout after 30 seconds. "
+                       "Hardware appears to have stopped returning frames. Aborting.\n");
+                pthread_mutex_unlock(&ctx->mutex);
+                av_frame_free(&avframe);
+                av_packet_free(&avpacket);
+                if (frame)
+                    frame->Release();
+                return AVERROR(ETIMEDOUT);
+            } else if (wait_attempts % 2 == 0) {  // Log every 10 seconds
+                av_log(avctx, AV_LOG_WARNING, "Still waiting for hardware buffer after %d seconds\n",
+                       wait_attempts * 5);
+            }
+        }
     }
     ctx->frames_buffer_available_spots--;
     pthread_mutex_unlock(&ctx->mutex);
@@ -978,8 +1181,30 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         av_log(avctx, AV_LOG_WARNING, "Low video buffer: %d frames. Video may stutter!\n", (int) buffered);
     }
 
-    /* Preroll video frames. */
+    /* Preroll video frames and wait for async buffer to fill if enabled */
     if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
+        /* If async buffer is enabled, wait for prefill before starting */
+        if (ctx->output_thread_started && !ctx->prefill_complete) {
+            unsigned long long queue_size = ff_decklink_packet_queue_size(&ctx->output_queue);
+            int buffer_percent = (int)((queue_size * 100) / ctx->prefill_target_bytes);
+
+            if (queue_size < ctx->prefill_target_bytes) {
+                /* Log prefill progress every 10% */
+                static int last_logged_percent = -1;
+                if (buffer_percent >= last_logged_percent + 10 || buffer_percent >= 75) {
+                    av_log(avctx, AV_LOG_INFO, "Prefilling async buffer: %d%% (%llu / %"PRId64" bytes)\n",
+                           buffer_percent, queue_size, ctx->prefill_target_bytes);
+                    last_logged_percent = buffer_percent;
+                }
+                return 0;  /* Continue buffering, don't start playback yet */
+            }
+
+            /* Prefill complete */
+            ctx->prefill_complete = 1;
+            av_log(avctx, AV_LOG_INFO, "Async buffer prefill complete: %llu bytes (target: %"PRId64" bytes)\n",
+                   queue_size, ctx->prefill_target_bytes);
+        }
+
         av_log(avctx, AV_LOG_INFO, "Ending audio preroll.\n");
         if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
             av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
@@ -1164,6 +1389,20 @@ extern "C" {
         if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
             ctx->link = decklink_link_conf_map[cctx->link];
         cctx->ctx = ctx;
+
+        /* Initialize health monitoring fields */
+        ctx->health_thread_started = 0;
+        ctx->health_thread_stop = 0;
+        ctx->last_health_check_time = av_gettime();
+        ctx->consecutive_low_buffer_warnings = 0;
+        ctx->consecutive_hardware_errors = 0;
+        ctx->dropped_total = 0;
+        ctx->dropped_recent = 0;
+        ctx->last_drop_log_time = 0;
+        ctx->drop_log_interval = 0;
+        ctx->prefill_complete = 0;
+        ctx->prefill_target_bytes = 0;
+        ctx->last_buffer_low_warning = 0;
 #if CONFIG_LIBKLVANC
         if (klvanc_context_create(&ctx->vanc_ctx) < 0) {
             av_log(avctx, AV_LOG_ERROR, "Cannot create VANC library context\n");
@@ -1243,6 +1482,11 @@ extern "C" {
             ctx->output_thread_stop = 0;
             ff_decklink_packet_queue_init(avctx, &ctx->output_queue, cctx->output_buffer_size);
 
+            /* Calculate prefill target based on percentage */
+            ctx->prefill_target_bytes = (cctx->output_buffer_size * cctx->output_buffer_prefill) / 100;
+            if (ctx->prefill_target_bytes < 1)
+                ctx->prefill_target_bytes = cctx->output_buffer_size;  /* If 0%, fill completely */
+
             ret = pthread_create(&ctx->output_thread, NULL, decklink_output_thread, ctx);
             if (ret != 0) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to create async output thread: %s\n", av_err2str(AVERROR(ret)));
@@ -1250,7 +1494,23 @@ extern "C" {
                 goto error;
             }
             ctx->output_thread_started = 1;
-            av_log(avctx, AV_LOG_INFO, "Async output buffer enabled: %"PRId64" bytes\n", cctx->output_buffer_size);
+            av_log(avctx, AV_LOG_INFO, "Async output buffer enabled: %"PRId64" bytes (will prefill to %d%% = %"PRId64" bytes before starting)\n",
+                   cctx->output_buffer_size, cctx->output_buffer_prefill, ctx->prefill_target_bytes);
+        } else {
+            ctx->avctx = avctx;  /* Store for health monitor even without async buffer */
+            ctx->prefill_complete = 1;  /* No async buffer, so prefill is "complete" */
+        }
+
+        /* Start hardware health monitoring thread */
+        ctx->health_thread_stop = 0;
+        ret = pthread_create(&ctx->health_thread, NULL, decklink_health_monitor_thread, ctx);
+        if (ret != 0) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to create health monitor thread: %s. Continuing without monitoring.\n",
+                   av_err2str(AVERROR(ret)));
+            ctx->health_thread_started = 0;
+        } else {
+            ctx->health_thread_started = 1;
+            av_log(avctx, AV_LOG_INFO, "Hardware health monitoring enabled\n");
         }
 
         return 0;
