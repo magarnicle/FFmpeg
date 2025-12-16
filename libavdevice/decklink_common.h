@@ -190,6 +190,11 @@ struct decklink_ctx {
     int prefill_complete;
     int64_t prefill_target_bytes;
     int64_t last_buffer_low_warning;
+
+    /* Device initialization state */
+    int device_output_ready;       // Hardware output is enabled and ready
+    int device_init_deferred;      // Device init was deferred due to unavailability
+    pthread_mutex_t device_mutex;  // Protects device initialization
 };
 
 typedef enum { DIRECTION_IN, DIRECTION_OUT} decklink_direction_t;

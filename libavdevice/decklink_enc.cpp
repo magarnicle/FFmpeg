@@ -244,6 +244,69 @@ static int timed_wait_with_timeout(pthread_cond_t *cond, pthread_mutex_t *mutex,
     return pthread_cond_timedwait(cond, mutex, &ts);
 }
 
+/* Helper function to initialize deferred device output */
+static int decklink_initialize_deferred_output(struct decklink_ctx *ctx, AVFormatContext *avctx)
+{
+    pthread_mutex_lock(&ctx->device_mutex);
+
+    /* Check if already initialized by another thread */
+    if (ctx->device_output_ready) {
+        pthread_mutex_unlock(&ctx->device_mutex);
+        return 0;
+    }
+
+    av_log(avctx, AV_LOG_INFO, "Attempting to enable deferred video output...\n");
+
+    /* Try to enable video output */
+    HRESULT hr;
+    if (ctx->supports_vanc) {
+        hr = ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC);
+        if (hr != S_OK) {
+            av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
+            ctx->supports_vanc = 0;
+        }
+    }
+
+    if (!ctx->supports_vanc) {
+        hr = ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault);
+        if (hr != S_OK) {
+            pthread_mutex_unlock(&ctx->device_mutex);
+            /* Device still not available - will retry on next packet */
+            return -1;
+        }
+    }
+
+    /* Enable audio if needed */
+    if (ctx->audio) {
+        hr = ctx->dlo->EnableAudioOutput(bmdAudioSampleRate48kHz,
+                                          bmdAudioSampleType16bitInteger,
+                                          ctx->channels,
+                                          bmdAudioOutputStreamTimestamped);
+        if (hr != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not enable audio output after deferred init!\n");
+            pthread_mutex_unlock(&ctx->device_mutex);
+            return -1;
+        }
+
+        if (ctx->dlo->BeginAudioPreroll() != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not begin audio preroll after deferred init!\n");
+            pthread_mutex_unlock(&ctx->device_mutex);
+            return -1;
+        }
+    }
+
+    /* Set frame completion callback */
+    if (ctx->output_callback) {
+        ctx->dlo->SetScheduledFrameCompletionCallback(ctx->output_callback);
+    }
+
+    av_log(avctx, AV_LOG_INFO, "Device became available - video output enabled, continuing buffering\n");
+    ctx->device_output_ready = 1;
+
+    pthread_mutex_unlock(&ctx->device_mutex);
+    return 0;
+}
+
 /* Consumer thread for async output buffer - pulls packets and schedules to decklink */
 static void *decklink_output_thread(void *arg)
 {
@@ -252,10 +315,29 @@ static void *decklink_output_thread(void *arg)
     DecklinkPacketQueue *q = &ctx->output_queue;
     AVPacket pkt;
     int ret;
+    int device_wait_logged = 0;
 
     av_log(avctx, AV_LOG_INFO, "Async output thread started\n");
 
     while (!ctx->output_thread_stop) {
+        /* If device initialization was deferred, check if device is ready */
+        if (ctx->device_init_deferred && !ctx->device_output_ready) {
+            /* Try to initialize device */
+            ret = decklink_initialize_deferred_output(ctx, avctx);
+            if (ret < 0) {
+                /* Device not yet available */
+                if (!device_wait_logged) {
+                    av_log(avctx, AV_LOG_INFO, "Device not available yet - continuing to buffer frames while waiting...\n");
+                    device_wait_logged = 1;
+                }
+                /* Continue buffering - don't schedule to hardware yet */
+                usleep(100000);  /* 100ms between device checks */
+                continue;
+            } else {
+                av_log(avctx, AV_LOG_INFO, "Device ready - will begin scheduling frames from buffer\n");
+            }
+        }
+
         /* Use non-blocking get so we can check stop flag periodically */
         ret = ff_decklink_packet_queue_get(q, &pkt, 0);
         if (ret <= 0) {
@@ -269,20 +351,28 @@ static void *decklink_output_thread(void *arg)
         pthread_cond_broadcast(&q->cond);
         pthread_mutex_unlock(&q->mutex);
 
-        /* Dispatch based on stream type */
-        AVStream *st = avctx->streams[pkt.stream_index];
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            ret = decklink_schedule_video_packet(avctx, &pkt);
-        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            ret = decklink_schedule_audio_packet(avctx, &pkt);
-        } else {
-            ret = 0;  /* Ignore other types in async path */
-        }
-        av_packet_unref(&pkt);
+        /* Only schedule to hardware if device is ready */
+        if (ctx->device_output_ready) {
+            /* Dispatch based on stream type */
+            AVStream *st = avctx->streams[pkt.stream_index];
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                ret = decklink_schedule_video_packet(avctx, &pkt);
+            } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                ret = decklink_schedule_audio_packet(avctx, &pkt);
+            } else {
+                ret = 0;  /* Ignore other types in async path */
+            }
 
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Async output thread: schedule failed\n");
+            if (ret < 0) {
+                av_log(avctx, AV_LOG_ERROR, "Async output thread: schedule failed\n");
+            }
+        } else {
+            /* Device not ready yet - this shouldn't happen but handle gracefully */
+            av_log(avctx, AV_LOG_WARNING, "Packet dequeued but device not ready - requeuing\n");
+            usleep(10000);
         }
+
+        av_packet_unref(&pkt);
     }
 
     av_log(avctx, AV_LOG_INFO, "Async output thread exiting\n");
@@ -489,28 +579,39 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
                 " Check available formats with -list_formats 1.\n");
         return -1;
     }
-    if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
-        av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
-        ctx->supports_vanc = 0;
-    }
-    already_logged = 0;
-    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
-        if (!ctx->block_until_available) {
-            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
-            return -1;
-        };
-        if (!already_logged){
-            av_log(avctx, AV_LOG_INFO, "Could not enable video output, waiting for device...\n");
-            already_logged = 1;
+    /* If async buffer is enabled and device is blocked, defer hardware initialization
+     * This allows ffmpeg to continue encoding/filtering into the buffer while waiting */
+    if (ctx->device_init_deferred) {
+        av_log(avctx, AV_LOG_INFO, "Device initialization deferred - will enable output when device becomes available\n");
+        ctx->device_output_ready = 0;
+    } else {
+        /* Normal path: try to enable output immediately */
+        if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
+            av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
+            ctx->supports_vanc = 0;
         }
-        usleep(1000);
+        already_logged = 0;
+        while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
+            if (!ctx->block_until_available) {
+                av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
+                return -1;
+            };
+            if (!already_logged){
+                av_log(avctx, AV_LOG_INFO, "Could not enable video output, waiting for device...\n");
+                already_logged = 1;
+            }
+            usleep(1000);
+        }
+        av_log(avctx, AV_LOG_INFO, "Device available, video output enabled\n");
+        ctx->device_output_ready = 1;
     }
-    av_log(avctx, AV_LOG_INFO, "Device available, video output enabled\n");
 
 
-    /* Set callback. */
+    /* Set callback (even if device init is deferred, we'll need this) */
     ctx->output_callback = new decklink_output_callback();
-    ctx->dlo->SetScheduledFrameCompletionCallback(ctx->output_callback);
+    if (!ctx->device_init_deferred) {
+        ctx->dlo->SetScheduledFrameCompletionCallback(ctx->output_callback);
+    }
 
     ctx->frames_preroll = st->time_base.den * ctx->preroll;
     if (st->time_base.den > 1000)
@@ -567,16 +668,21 @@ static int decklink_setup_audio(AVFormatContext *avctx, AVStream *st)
         return -1;
     }
 
-    if (ctx->dlo->EnableAudioOutput(bmdAudioSampleRate48kHz,
-                bmdAudioSampleType16bitInteger,
-                ctx->channels,
-                bmdAudioOutputStreamTimestamped) != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not enable audio output!\n");
-        return -1;
-    }
-    if (ctx->dlo->BeginAudioPreroll() != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not begin audio preroll!\n");
-        return -1;
+    /* Audio output will be enabled later if device init is deferred */
+    if (!ctx->device_init_deferred) {
+        if (ctx->dlo->EnableAudioOutput(bmdAudioSampleRate48kHz,
+                    bmdAudioSampleType16bitInteger,
+                    ctx->channels,
+                    bmdAudioOutputStreamTimestamped) != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not enable audio output!\n");
+            return -1;
+        }
+        if (ctx->dlo->BeginAudioPreroll() != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Could not begin audio preroll!\n");
+            return -1;
+        }
+    } else {
+        av_log(avctx, AV_LOG_INFO, "Audio output initialization deferred until device is available\n");
     }
 
     /* The device expects the sample rate to be fixed. */
@@ -738,6 +844,7 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 
     pthread_mutex_destroy(&ctx->mutex);
     pthread_cond_destroy(&ctx->cond);
+    pthread_mutex_destroy(&ctx->device_mutex);
 
 #if CONFIG_LIBKLVANC
     klvanc_context_destroy(ctx->vanc_ctx);
@@ -1254,6 +1361,12 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         return 0;
     }
 
+    /* Synchronous mode - check if device is ready */
+    if (!ctx->device_output_ready) {
+        av_log(avctx, AV_LOG_ERROR, "Device output not ready in synchronous mode. This should not happen.\n");
+        return AVERROR(EIO);
+    }
+
     /* Otherwise schedule directly (synchronous mode) */
     return decklink_schedule_video_packet(avctx, pkt);
 }
@@ -1403,6 +1516,19 @@ extern "C" {
         ctx->prefill_complete = 0;
         ctx->prefill_target_bytes = 0;
         ctx->last_buffer_low_warning = 0;
+
+        /* Initialize device state */
+        ctx->device_output_ready = 0;
+        ctx->device_init_deferred = 0;
+        pthread_mutex_init(&ctx->device_mutex, NULL);
+
+        /* Decide if we should defer device initialization:
+         * Only defer if BOTH async buffer is enabled AND block_until_available is set
+         * This allows buffering while waiting for device to become available */
+        if (cctx->output_buffer_size > 0 && cctx->block_until_available) {
+            ctx->device_init_deferred = 1;
+            av_log(avctx, AV_LOG_INFO, "Async buffer enabled with block_until_available - will defer device initialization to allow buffering while waiting\n");
+        }
 #if CONFIG_LIBKLVANC
         if (klvanc_context_create(&ctx->vanc_ctx) < 0) {
             av_log(avctx, AV_LOG_ERROR, "Cannot create VANC library context\n");
