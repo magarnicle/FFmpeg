@@ -363,7 +363,7 @@ static int async_read_internal(URLContext *h, void *dest, int size)
         fifo_size = ring_size(ring);
         to_copy   = FFMIN(to_read, fifo_size);
         if (to_copy > 0) {
-            av_log(h, AV_LOG_INFO, "async read: buffer_fill=%d/%d (%.1f%%), read_back=%d/%d (%.1f%%), reading %d bytes\n",
+            av_log(h, AV_LOG_DEBUG, "async read: buffer_fill=%d/%d (%.1f%%), read_back=%d/%d (%.1f%%), reading %d bytes\n",
                    fifo_size, c->buffer_size, 100.0 * fifo_size / c->buffer_size,
                    ring_size_of_read_back(ring), c->read_back_size,
                    c->read_back_size ? 100.0 * ring_size_of_read_back(ring) / c->read_back_size : 0.0,
