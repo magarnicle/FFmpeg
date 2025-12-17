@@ -141,6 +141,8 @@ async:cache:http://host/resource
 
 @subsection Options
 
+These are per-input options, specified before each input URL that uses the async protocol.
+
 @table @option
 
 @item buffer_size
