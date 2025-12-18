@@ -364,7 +364,9 @@ static void *decklink_output_thread(void *arg)
             }
 
             if (ret < 0) {
-                av_log(avctx, AV_LOG_ERROR, "Async output thread: schedule failed\n");
+                av_log(avctx, AV_LOG_ERROR, "Async output thread: schedule failed with error %d. Stopping thread.\n", ret);
+                ctx->output_thread_error = ret;
+                break;  /* Exit thread on fatal error */
             }
         } else {
             /* Device not ready yet - this shouldn't happen but handle gracefully */
@@ -1336,6 +1338,12 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     /* If async buffer is enabled, queue the packet */
     if (ctx->output_thread_started) {
+        /* Check for fatal errors from output thread */
+        if (ctx->output_thread_error) {
+            av_log(avctx, AV_LOG_ERROR, "Output thread encountered fatal error: %d\n", ctx->output_thread_error);
+            return ctx->output_thread_error;
+        }
+
         AVPacket *pkt_copy = av_packet_clone(pkt);
         if (!pkt_copy) {
             av_log(avctx, AV_LOG_ERROR, "Could not clone packet for async buffer.\n");
@@ -1346,6 +1354,12 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "Failed to queue packet to async buffer.\n");
             return ret;
+        }
+
+        /* Check again after queuing in case error occurred during queueing */
+        if (ctx->output_thread_error) {
+            av_log(avctx, AV_LOG_ERROR, "Output thread encountered fatal error: %d\n", ctx->output_thread_error);
+            return ctx->output_thread_error;
         }
 
         /* Log buffer fill level periodically (every ~100 video frames) */
@@ -1441,6 +1455,12 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     /* If async buffer is enabled, queue the packet */
     if (ctx->output_thread_started) {
+        /* Check for fatal errors from output thread */
+        if (ctx->output_thread_error) {
+            av_log(avctx, AV_LOG_ERROR, "Output thread encountered fatal error: %d\n", ctx->output_thread_error);
+            return ctx->output_thread_error;
+        }
+
         AVPacket *pkt_copy = av_packet_clone(pkt);
         if (!pkt_copy) {
             av_log(avctx, AV_LOG_ERROR, "Could not clone audio packet for async buffer.\n");
@@ -1452,6 +1472,13 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
             av_log(avctx, AV_LOG_ERROR, "Failed to queue audio packet to async buffer.\n");
             return ret;
         }
+
+        /* Check again after queuing in case error occurred during queueing */
+        if (ctx->output_thread_error) {
+            av_log(avctx, AV_LOG_ERROR, "Output thread encountered fatal error: %d\n", ctx->output_thread_error);
+            return ctx->output_thread_error;
+        }
+
         return 0;
     }
 
@@ -1606,6 +1633,7 @@ extern "C" {
         if (cctx->output_buffer_size > 0) {
             ctx->avctx = avctx;  /* Store for consumer thread access */
             ctx->output_thread_stop = 0;
+            ctx->output_thread_error = 0;
             ff_decklink_packet_queue_init(avctx, &ctx->output_queue, cctx->output_buffer_size);
 
             /* Calculate prefill target based on percentage */
