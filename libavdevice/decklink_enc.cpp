@@ -40,6 +40,7 @@ extern "C" {
 #include "libavutil/frame.h"
 #include "libavutil/internal.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/time.h"
 #include "avdevice.h"
 }
 
