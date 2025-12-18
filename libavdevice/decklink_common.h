@@ -170,6 +170,7 @@ struct decklink_ctx {
     pthread_t output_thread;
     int output_thread_started;
     int output_thread_stop;
+    int output_thread_error;   // Fatal error from output thread
     AVFormatContext *avctx;  // for consumer thread access
 };
 
