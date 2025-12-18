@@ -532,13 +532,17 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
         av_log(avctx, AV_LOG_INFO, "Waiting for async output buffer to drain...\n");
 
         /* Wait for queue to drain before stopping */
+        static int log_counter = 0;
         while (ff_decklink_packet_queue_size(&ctx->output_queue) > 0) {
             usleep(10000);  /* 10ms */
-            unsigned long long qsize = ff_decklink_packet_queue_size(&ctx->output_queue);
-            av_log(avctx, AV_LOG_INFO, "Async buffer: %llu / %"PRId64" bytes (%.1f%%), %d packets\n",
-                   qsize, cctx->output_buffer_size,
-                   100.0 * qsize / cctx->output_buffer_size,
-                   ctx->output_queue.nb_packets);
+            if (++log_counter >= 100) {
+                unsigned long long qsize = ff_decklink_packet_queue_size(&ctx->output_queue);
+                av_log(avctx, AV_LOG_INFO, "Async buffer: %llu / %"PRId64" bytes (%.1f%%), %d packets\n",
+                       qsize, cctx->output_buffer_size,
+                       100.0 * qsize / cctx->output_buffer_size,
+                       ctx->output_queue.nb_packets);
+                log_counter = 0;
+            }
         }
 
         /* Signal thread to stop */
