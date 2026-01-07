@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <unistd.h>
+#include <time.h>
 
 using std::atomic;
 
@@ -992,6 +993,33 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     /* Preroll video frames. */
     if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
+        /* If delayed start is enabled, wait for target time */
+        if (ctx->delayed_start_mode) {
+            int64_t now_us = av_gettime();
+
+            if (now_us < ctx->start_time_us) {
+                int64_t wait_us = ctx->start_time_us - now_us;
+                av_log(avctx, AV_LOG_INFO,
+                       "Preroll complete. Waiting %.2f seconds until start time.\n",
+                       wait_us / 1000000.0);
+
+                /* Sleep until start time (with periodic wakeups for responsiveness) */
+                while (av_gettime() < ctx->start_time_us) {
+                    int64_t remaining = ctx->start_time_us - av_gettime();
+                    if (remaining <= 0) break;
+
+                    /* Sleep max 100ms at a time for ctrl+c responsiveness */
+                    int sleep_us = FFMIN(remaining, 100000);
+                    av_usleep(sleep_us);
+                }
+
+                av_log(avctx, AV_LOG_INFO, "Target start time reached. Starting playback.\n");
+            } else {
+                av_log(avctx, AV_LOG_WARNING,
+                       "Target start time already passed. Starting immediately.\n");
+            }
+        }
+
         av_log(avctx, AV_LOG_INFO, "Ending audio preroll.\n");
         if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
             av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
@@ -1289,6 +1317,59 @@ extern "C" {
             }
             ctx->output_thread_started = 1;
             av_log(avctx, AV_LOG_INFO, "Async output buffer enabled: %"PRId64" bytes\n", cctx->output_buffer_size);
+        }
+
+        /* Parse delayed start time if provided */
+        if (cctx->start_time_str && strlen(cctx->start_time_str) > 0) {
+            char *endptr;
+            int64_t timestamp = strtoll(cctx->start_time_str, &endptr, 10);
+
+            /* Check if it's a Unix timestamp (all digits) */
+            if (*endptr == '\0' && timestamp > 0) {
+                /* Unix timestamp in seconds, convert to microseconds */
+                ctx->start_time_us = timestamp * 1000000LL;
+                av_log(avctx, AV_LOG_INFO, "Delayed start enabled: Unix timestamp %"PRId64" (%s)\n",
+                       timestamp, cctx->start_time_str);
+            } else {
+                /* Try parsing as HH:MM:SS */
+                int hours = 0, minutes = 0, seconds = 0;
+                if (sscanf(cctx->start_time_str, "%d:%d:%d", &hours, &minutes, &seconds) == 3) {
+                    /* Get current time */
+                    int64_t now_us = av_gettime();
+                    time_t now_sec = now_us / 1000000LL;
+                    struct tm *tm_info = localtime(&now_sec);
+
+                    /* Set to today's date with specified time */
+                    tm_info->tm_hour = hours;
+                    tm_info->tm_min = minutes;
+                    tm_info->tm_sec = seconds;
+
+                    time_t target_sec = mktime(tm_info);
+                    ctx->start_time_us = target_sec * 1000000LL;
+
+                    av_log(avctx, AV_LOG_INFO, "Delayed start enabled: %s (timestamp %"PRId64")\n",
+                           cctx->start_time_str, target_sec);
+                } else {
+                    av_log(avctx, AV_LOG_ERROR, "Invalid start_time format: '%s'. Use HH:MM:SS or Unix timestamp.\n",
+                           cctx->start_time_str);
+                    ret = AVERROR(EINVAL);
+                    goto error;
+                }
+            }
+
+            ctx->delayed_start_mode = 1;
+
+            /* Warn if start time is in the past */
+            int64_t now_us = av_gettime();
+            if (ctx->start_time_us < now_us) {
+                av_log(avctx, AV_LOG_WARNING, "Start time is %"PRId64" seconds in the past. Will start immediately.\n",
+                       (now_us - ctx->start_time_us) / 1000000LL);
+            } else {
+                av_log(avctx, AV_LOG_INFO, "Will wait %"PRId64" seconds until start time.\n",
+                       (ctx->start_time_us - now_us) / 1000000LL);
+            }
+        } else {
+            ctx->delayed_start_mode = 0;
         }
 
         return 0;

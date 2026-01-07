@@ -172,6 +172,10 @@ struct decklink_ctx {
     int output_thread_stop;
     int output_thread_error;   // Fatal error from output thread
     AVFormatContext *avctx;  // for consumer thread access
+
+    /* Delayed start */
+    int64_t start_time_us;      // Target start time in microseconds (wall clock)
+    int delayed_start_mode;      // Flag: 1 if delayed start is active
 };
 
 typedef enum { DIRECTION_IN, DIRECTION_OUT} decklink_direction_t;

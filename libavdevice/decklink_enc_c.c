@@ -65,6 +65,7 @@ static const AVOption options[] = {
     { "true"        ,  NULL                     , 0                   , AV_OPT_TYPE_CONST , { .i64 = 1   }, 0, 0, ENC, .unit = "level_a"},
     { "timing_offset", "genlock timing pixel offset", OFFSET(timing_offset), AV_OPT_TYPE_INT,   { .i64 = INT_MIN }, INT_MIN, INT_MAX, ENC, .unit = "timing_offset"},
     { "unset"       ,  NULL                     , 0                        , AV_OPT_TYPE_CONST, { .i64 = INT_MIN },       0,       0, ENC, .unit = "timing_offset"},
+    { "start_time", "wall clock time to start playback (HH:MM:SS or Unix timestamp)", OFFSET(start_time_str), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { NULL },
 };
 

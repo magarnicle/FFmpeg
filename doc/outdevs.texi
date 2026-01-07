@@ -270,6 +270,48 @@ Set to @option{0} to disable the error threshold (always drop late frames,
 never error).
 Defaults to @option{5.0}.
 
+@item start_time
+Specifies a wall clock time when playback should start on the DeckLink card.
+Frames are encoded and buffered normally, but are not sent to the card until
+the specified time is reached. This allows pre-rendering content and starting
+playback at a precise scheduled time.
+
+Accepts two time formats:
+@itemize @bullet
+@item
+@samp{HH:MM:SS} - Time of day in 24-hour format (e.g., @samp{14:30:00} for 2:30 PM).
+Uses the current date with the specified time in local timezone.
+@item
+Unix timestamp - Seconds since epoch (e.g., @samp{1704124800}).
+Provides absolute time regardless of timezone.
+@end itemize
+
+The actual playback start time will be the later of:
+@itemize @bullet
+@item
+The specified @option{start_time}
+@item
+When the @option{preroll} buffer is filled
+@end itemize
+
+If the specified time is in the past, playback starts immediately with a warning.
+
+If encoding is faster than real-time and buffers fill before the start time,
+encoding will block until the start time is reached or buffer space becomes
+available.
+
+Not set by default (playback starts immediately after preroll).
+
+Example - start playback at exactly 2:30 PM today:
+@example
+-start_time "14:30:00"
+@end example
+
+Example - start at a specific Unix timestamp:
+@example
+-start_time "1704124800"
+@end example
+
 @end table
 
 @subsection Examples
@@ -305,6 +347,20 @@ Play with async buffering (pre-render complex filtergraph, 10GB buffer, error if
 @example
 ffmpeg -i test.avi -vf "complex_filtergraph" -f decklink -pix_fmt uyvy422 \
     -output_buffer_size 10000000000 -late_threshold 10 'DeckLink Mini Monitor'
+@end example
+
+@item
+Pre-render content and start playback at a scheduled time (2:30 PM):
+@example
+ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 \
+    -start_time "14:30:00" 'DeckLink Mini Monitor'
+@end example
+
+@item
+Delayed start with async buffering (pre-render, buffer in memory, start at specific time):
+@example
+ffmpeg -i test.avi -vf "complex_filtergraph" -f decklink -pix_fmt uyvy422 \
+    -output_buffer_size 5000000000 -start_time "14:30:00" 'DeckLink Mini Monitor'
 @end example
 
 @end itemize
