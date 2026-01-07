@@ -270,6 +270,28 @@ Set to @option{0} to disable the error threshold (always drop late frames,
 never error).
 Defaults to @option{5.0}.
 
+@item start_time
+ISO 8601 timestamp (with timezone) specifying the wall-clock time at which to
+begin DeckLink playout. FFmpeg will wait until this time is reached before
+enabling the hardware output. Useful for synchronized multi-device playback or
+scheduled broadcast.
+
+Supports millisecond precision and timezone offsets. Examples:
+@itemize
+@item @code{2024-01-15T14:30:00Z} - UTC time
+@item @code{2024-01-15T14:30:00.500Z} - With milliseconds
+@item @code{2024-01-15T14:30:00+05:00} - With timezone offset
+@end itemize
+
+If @code{start_time} is in the past, playback starts immediately with a warning.
+If more than 24 hours in the future, a warning is logged but the wait proceeds.
+
+The DeckLink card output will not be enabled until the specified time is reached.
+This means preroll and all other processing happens after the start time, ensuring
+precise synchronization.
+
+No default value (immediate start if not specified).
+
 @end table
 
 @subsection Examples
@@ -305,6 +327,13 @@ Play with async buffering (pre-render complex filtergraph, 10GB buffer, error if
 @example
 ffmpeg -i test.avi -vf "complex_filtergraph" -f decklink -pix_fmt uyvy422 \
     -output_buffer_size 10000000000 -late_threshold 10 'DeckLink Mini Monitor'
+@end example
+
+@item
+Schedule playout to start at a specific wall-clock time (useful for synchronized multi-device output):
+@example
+ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 \
+    -start_time '2024-01-15T14:30:00.500Z' 'DeckLink Mini Monitor'
 @end example
 
 @end itemize

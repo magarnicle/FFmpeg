@@ -38,6 +38,7 @@ extern "C" {
 #include "libavutil/frame.h"
 #include "libavutil/internal.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/parseutils.h"
 #include "libavutil/time.h"
 #include "avdevice.h"
 }
@@ -350,6 +351,43 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
                 " Check available formats with -list_formats 1.\n");
         return -1;
     }
+
+    /* If start_time is enabled, wait until that wall-clock time before enabling output */
+    if (ctx->start_time_enabled) {
+        int64_t now = av_gettime();
+        int64_t wait_us = ctx->start_time_us - now;
+
+        if (wait_us > 0) {
+            av_log(avctx, AV_LOG_INFO, "Waiting %.2f seconds until start_time before enabling output...\n",
+                   (double)wait_us / 1000000.0);
+
+            /* Sleep in small intervals to allow graceful shutdown */
+            const int64_t check_interval_us = 100000;  /* Check every 100ms */
+            while (wait_us > 0) {
+                int64_t sleep_us = FFMIN(wait_us, check_interval_us);
+
+                /* Use av_usleep for portable sleep */
+                int sleep_ret = av_usleep((unsigned)sleep_us);
+                if (sleep_ret < 0) {
+                    av_log(avctx, AV_LOG_WARNING, "Sleep interrupted: %s\n", av_err2str(sleep_ret));
+                }
+
+                /* Update remaining wait time */
+                now = av_gettime();
+                wait_us = ctx->start_time_us - now;
+            }
+
+            av_log(avctx, AV_LOG_INFO, "Start time reached. Enabling output.\n");
+        } else {
+            /* Already past start time */
+            av_log(avctx, AV_LOG_WARNING, "Start time is %.2f seconds in the past. Enabling output immediately.\n",
+                   (double)(-wait_us) / 1000000.0);
+        }
+
+        /* Disable further start_time checks */
+        ctx->start_time_enabled = 0;
+    }
+
     if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
         av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
         ctx->supports_vanc = 0;
@@ -1201,6 +1239,41 @@ extern "C" {
         if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
             ctx->link = decklink_link_conf_map[cctx->link];
         cctx->ctx = ctx;
+
+        /* Parse start_time if provided */
+        ctx->start_time_enabled = 0;
+        ctx->start_time_us = 0;
+        if (cctx->start_time_str) {
+            int64_t parsed_time;
+            int ret = av_parse_time(&parsed_time, cctx->start_time_str, 0);
+            if (ret < 0) {
+                av_log(avctx, AV_LOG_ERROR, "Invalid start_time format '%s'. Expected ISO 8601 timestamp (e.g., '2024-01-15T14:30:00.500Z').\n",
+                       cctx->start_time_str);
+                ret = AVERROR(EINVAL);
+                goto error;
+            }
+
+            /* av_parse_time returns microseconds since epoch for absolute timestamps */
+            ctx->start_time_us = parsed_time;
+            ctx->start_time_enabled = 1;
+
+            /* Validate: warn if in the past */
+            int64_t now = av_gettime();
+            int64_t delta_us = ctx->start_time_us - now;
+
+            if (delta_us < 0) {  /* In the past, allow with warning */
+                av_log(avctx, AV_LOG_WARNING, "start_time is %.2f seconds in the past. Starting immediately.\n",
+                       (double)(-delta_us) / 1000000.0);
+                ctx->start_time_enabled = 0;  /* Disable delay, start now */
+            } else if (delta_us > 86400000000LL) {  /* More than 24 hours in future */
+                av_log(avctx, AV_LOG_WARNING, "start_time is %.1f hours in the future. Make sure this is intentional.\n",
+                       (double)delta_us / 3600000000.0);
+            } else {
+                av_log(avctx, AV_LOG_INFO, "Scheduled playback start in %.2f seconds (at %s)\n",
+                       (double)delta_us / 1000000.0, cctx->start_time_str);
+            }
+        }
+
 #if CONFIG_LIBKLVANC
         if (klvanc_context_create(&ctx->vanc_ctx) < 0) {
             av_log(avctx, AV_LOG_ERROR, "Cannot create VANC library context\n");

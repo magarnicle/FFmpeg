@@ -78,6 +78,7 @@ struct decklink_cctx {
     DecklinkSignalLossAction signal_loss_action;
     int64_t output_buffer_size;
     double late_threshold;
+    char *start_time_str;      // ISO 8601 timestamp string (option input)
 };
 
 #endif /* AVDEVICE_DECKLINK_COMMON_C_H */

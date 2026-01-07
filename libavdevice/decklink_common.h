@@ -148,6 +148,8 @@ struct decklink_ctx {
     BMDPixelFormat raw_format;
     DecklinkSignalLossAction signal_loss_action;
 
+    int64_t start_time_us;     // Parsed start time in microseconds (UTC wall-clock)
+    int start_time_enabled;    // Flag: 1 if start_time should be used, 0 otherwise
 
     int frames_preroll;
 
