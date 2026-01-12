@@ -31,7 +31,11 @@ extern "C" {
 #include "libavformat/internal.h"
 }
 
+#include <DeckLinkAPIVersion.h>
+#include <DeckLinkAPI.h>
+#if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0e030000
 #include <DeckLinkAPI_v14_2_1.h>
+#endif
 
 extern "C" {
 #include "config.h"
@@ -130,15 +134,21 @@ public:
         virtual HRESULT STDMETHODCALLTYPE Decommit() { return S_OK; }
 
         // IUnknown methods
-        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) 
+        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv)
         {
-            if (iid == IID_IDeckLinkMemoryAllocator_v14_2_1) { 
-                *ppv = (IDeckLinkMemoryAllocator_v14_2_1*)this; 
-                AddRef(); 
-                return S_OK; 
+            if (DECKLINK_IsEqualIID(riid, IID_IUnknown)) {
+                *ppv = static_cast<IUnknown*>(this);
+            } else if (DECKLINK_IsEqualIID(riid, IID_IDeckLinkMemoryAllocator_v14_2_1)) {
+                *ppv = static_cast<IDeckLinkMemoryAllocator_v14_2_1*>(this);
+            } else {
+                *ppv = NULL;
+                return E_NOINTERFACE;
             }
-            return E_NOINTERFACE; 
+
+            AddRef();
+            return S_OK;
         }
+
         virtual ULONG   STDMETHODCALLTYPE AddRef(void) { return ++_refs; }
         virtual ULONG   STDMETHODCALLTYPE Release(void)
         {
@@ -589,14 +599,19 @@ public:
         explicit decklink_input_callback(AVFormatContext *_avctx);
         ~decklink_input_callback();
 
-        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv)
+        virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv)
         {
-            if (iid == IID_IDeckLinkInputCallback_v14_2_1) {
-                *ppv = (IDeckLinkInputCallback_v14_2_1*)this;
-                AddRef();
-                return S_OK;
+            if (DECKLINK_IsEqualIID(riid, IID_IUnknown)) {
+                *ppv = static_cast<IUnknown*>(this);
+            } else if (DECKLINK_IsEqualIID(riid, IID_IDeckLinkInputCallback_v14_2_1)) {
+                *ppv = static_cast<IDeckLinkInputCallback_v14_2_1*>(this);
+            } else {
+                *ppv = NULL;
+                return E_NOINTERFACE;
             }
-            return E_NOINTERFACE; 
+
+            AddRef();
+            return S_OK;
         }
         virtual ULONG STDMETHODCALLTYPE AddRef(void);
         virtual ULONG STDMETHODCALLTYPE  Release(void);

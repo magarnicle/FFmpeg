@@ -237,8 +237,10 @@ static int ogg_replace_stream(AVFormatContext *s, uint32_t serial, char *magic, 
     os->serial  = serial;
     os->lastpts = 0;
     os->lastdts = 0;
+    os->flags   = 0;
     os->start_trimming = 0;
     os->end_trimming = 0;
+    os->replace = 1;
 
     return i;
 }
@@ -879,8 +881,13 @@ retry:
         os->end_trimming = 0;
     }
 
+    if (os->replace) {
+        os->replace = 0;
+        pkt->dts = pkt->pts = AV_NOPTS_VALUE;
+    }
+
     if (os->new_metadata) {
-        ret = av_packet_add_side_data(pkt, AV_PKT_DATA_METADATA_UPDATE,
+        ret = av_packet_add_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA,
                                       os->new_metadata, os->new_metadata_size);
         if (ret < 0)
             return ret;

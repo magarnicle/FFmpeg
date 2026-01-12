@@ -917,6 +917,7 @@ static int hls_slice_header(SliceHeader *sh, const HEVCContext *s, GetBitContext
             sh->short_term_ref_pic_set_size     = 0;
             sh->short_term_rps                  = NULL;
             sh->long_term_ref_pic_set_size      = 0;
+            sh->long_term_rps.nb_refs           = 0;
             sh->slice_temporal_mvp_enabled_flag = 0;
         }
 
@@ -3410,7 +3411,6 @@ fail:
         ff_hevc_unref_frame(l->cur_frame, ~0);
     l->cur_frame = NULL;
     s->cur_frame = s->collocated_ref = NULL;
-    s->slice_initialized = 0;
     return ret;
 }
 
@@ -3543,9 +3543,11 @@ static int decode_slice(HEVCContext *s, unsigned nal_idx, GetBitContext *gb)
         return 0;
 
     ret = hls_slice_header(&s->sh, s, gb);
+    // Once hls_slice_header has been called, the context is inconsistent with the slice header
+    // until the context is reinitialized according to the contents of the new slice header
+    // at the start of decode_slice_data.
+    s->slice_initialized = 0;
     if (ret < 0) {
-        // hls_slice_header() does not cleanup on failure thus the state now is inconsistent so we cannot use it on dependent slices
-        s->slice_initialized = 0;
         return ret;
     }
 
@@ -4106,7 +4108,7 @@ static int hevc_sei_to_context(AVCodecContext *avctx, HEVCSEI *sei)
 {
     int ret;
 
-    if (sei->tdrdi.num_ref_displays) {
+    if (sei->tdrdi.present) {
         AVBufferRef *buf;
         size_t size;
         AV3DReferenceDisplaysInfo *tdrdi = av_tdrdi_alloc(sei->tdrdi.num_ref_displays, &size);

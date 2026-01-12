@@ -744,11 +744,14 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     while (1) {
         FrameData *fd;
         unsigned outputs_mask = 1;
+        unsigned flags = 0;
+        if (!dp->dec.frames_decoded)
+            flags |= AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS;
 
         av_frame_unref(frame);
 
         update_benchmark(NULL);
-        ret = avcodec_receive_frame(dec, frame);
+        ret = avcodec_receive_frame_flags(dec, frame, flags);
         update_benchmark("decode_%s %s", type_desc, dp->parent_name);
 
         if (ret == AVERROR(EAGAIN)) {
@@ -1007,7 +1010,7 @@ static int decoder_thread(void *arg)
         ret = 0;
 
         err_rate = (dp->dec.frames_decoded || dp->dec.decode_errors) ?
-                   dp->dec.decode_errors / (dp->dec.frames_decoded + dp->dec.decode_errors) : 0.f;
+                   (float)dp->dec.decode_errors / (dp->dec.frames_decoded + dp->dec.decode_errors) : 0.f;
         if (err_rate > max_error_rate) {
             av_log(dp, AV_LOG_FATAL, "Decode error rate %g exceeds maximum %g\n",
                    err_rate, max_error_rate);
@@ -1018,6 +1021,7 @@ static int decoder_thread(void *arg)
 
 finish:
     dec_thread_uninit(&dt);
+    avcodec_free_context(&dp->dec_ctx);
 
     return ret;
 }

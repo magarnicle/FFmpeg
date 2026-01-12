@@ -30,7 +30,11 @@ extern "C" {
 #include "libavformat/internal.h"
 }
 
+#include <DeckLinkAPIVersion.h>
+#include <DeckLinkAPI.h>
+#if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0e030000
 #include <DeckLinkAPI_v14_2_1.h>
+#endif
 
 extern "C" {
 #include "libavformat/avformat.h"
@@ -131,15 +135,19 @@ public:
         _ancillary->AddRef();
         return S_OK;
     }
-    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) 
+    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv)
     {
-        if (iid == IID_IDeckLinkVideoFrame_v14_2_1) 
-        { 
-            *ppv = (IDeckLinkVideoFrame_v14_2_1*)this; 
-            AddRef(); 
-            return S_OK; 
+        if (DECKLINK_IsEqualIID(riid, IID_IUnknown)) {
+            *ppv = static_cast<IUnknown*>(this);
+        } else if (DECKLINK_IsEqualIID(riid, IID_IDeckLinkVideoFrame_v14_2_1)) {
+            *ppv = static_cast<IDeckLinkVideoFrame_v14_2_1*>(this);
+        } else {
+            *ppv = NULL;
+            return E_NOINTERFACE;
         }
-        return E_NOINTERFACE; 
+
+        AddRef();
+        return S_OK;
     }
     virtual ULONG   STDMETHODCALLTYPE AddRef(void)                            { return ++_refs; }
     virtual ULONG   STDMETHODCALLTYPE Release(void)
@@ -200,15 +208,19 @@ public:
         return S_OK;
     }
     virtual HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped(void)       { return S_OK; }
-    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv)
+    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv)
     {
-        if (iid == IID_IDeckLinkVideoOutputCallback_v14_2_1) 
-        { 
-            *ppv = (IDeckLinkVideoOutputCallback_v14_2_1*)this; 
-            AddRef(); 
-            return S_OK; 
+        if (DECKLINK_IsEqualIID(riid, IID_IUnknown)) {
+            *ppv = static_cast<IUnknown*>(this);
+        } else if (DECKLINK_IsEqualIID(riid, IID_IDeckLinkVideoOutputCallback_v14_2_1)) {
+            *ppv = static_cast<IDeckLinkVideoOutputCallback_v14_2_1*>(this);
+        } else {
+            *ppv = NULL;
+            return E_NOINTERFACE;
         }
-        return E_NOINTERFACE; 
+
+        AddRef();
+        return S_OK;
     }
     virtual ULONG   STDMETHODCALLTYPE AddRef(void)                            { return 1; }
     virtual ULONG   STDMETHODCALLTYPE Release(void)                           { return 1; }
@@ -824,7 +836,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         ctx->first_pts = pkt->pts;
 
     /* Schedule frame for playback. */
-    hr = ctx->dlo->ScheduleVideoFrame((class IDeckLinkVideoFrame_v14_2_1 *) frame,
+    hr = ctx->dlo->ScheduleVideoFrame(frame,
                                       pkt->pts * ctx->bmd_tb_num,
                                       ctx->bmd_tb_num, ctx->bmd_tb_den);
     /* Pass ownership to DeckLink, or release on failure */

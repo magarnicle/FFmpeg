@@ -23,6 +23,7 @@
 #include "libavutil/emms.h"
 #include "libavutil/frame.h"
 #include "libavutil/internal.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/samplefmt.h"
@@ -316,12 +317,13 @@ static int encode_simple_internal(AVCodecContext *avctx, AVPacket *avpkt)
 
     av_assert0(codec->cb_type == FF_CODEC_CB_TYPE_ENCODE);
 
-    if (CONFIG_FRAME_THREAD_ENCODER && avci->frame_thread_encoder)
+#if CONFIG_FRAME_THREAD_ENCODER
+    if (avci->frame_thread_encoder)
         /* This will unref frame. */
         ret = ff_thread_video_encode_frame(avctx, avpkt, frame, &got_packet);
-    else {
+    else
+#endif
         ret = ff_encode_encode_cb(avctx, avpkt, frame, &got_packet);
-    }
 
     if (avci->draining && !got_packet)
         avci->draining_done = 1;
@@ -824,11 +826,11 @@ int ff_encode_preinit(AVCodecContext *avctx)
         memcpy(sd_packet->data, sd_frame->data, sd_frame->size);
     }
 
-    if (CONFIG_FRAME_THREAD_ENCODER) {
-        ret = ff_frame_thread_encoder_init(avctx);
-        if (ret < 0)
-            return ret;
-    }
+#if CONFIG_FRAME_THREAD_ENCODER
+    ret = ff_frame_thread_encoder_init(avctx);
+    if (ret < 0)
+        return ret;
+#endif
 
     return 0;
 }
@@ -912,6 +914,31 @@ AVCPBProperties *ff_encode_add_cpb_side_data(AVCodecContext *avctx)
     avctx->coded_side_data[avctx->nb_coded_side_data - 1].size = size;
 
     return props;
+}
+
+int ff_encode_add_stats_side_data(AVPacket *pkt, int quality, const int64_t error[],
+                                  int error_count, enum AVPictureType pict_type)
+{
+    uint8_t *side_data;
+    size_t side_data_size;
+
+    side_data = av_packet_get_side_data(pkt, AV_PKT_DATA_QUALITY_STATS, &side_data_size);
+    if (!side_data) {
+        side_data_size = 4+4+8*error_count;
+        side_data = av_packet_new_side_data(pkt, AV_PKT_DATA_QUALITY_STATS,
+                                            side_data_size);
+    }
+
+    if (!side_data || side_data_size < 4+4+8*error_count)
+        return AVERROR(ENOMEM);
+
+    AV_WL32(side_data, quality);
+    side_data[4] = pict_type;
+    side_data[5] = error_count;
+    for (int i = 0; i < error_count; ++i)
+        AV_WL64(side_data+8 + 8*i , error[i]);
+
+    return 0;
 }
 
 int ff_check_codec_matrices(AVCodecContext *avctx, unsigned types, uint16_t min, uint16_t max)

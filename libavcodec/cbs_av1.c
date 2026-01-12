@@ -462,7 +462,7 @@ static int cbs_av1_get_relative_dist(const AV1RawSequenceHeader *seq,
     return diff;
 }
 
-static av_unused size_t cbs_av1_get_payload_bytes_left(GetBitContext *gbc)
+av_unused static size_t cbs_av1_get_payload_bytes_left(GetBitContext *gbc)
 {
     GetBitContext tmp = *gbc;
     size_t size = 0;
@@ -714,7 +714,7 @@ static int cbs_av1_split_fragment(CodedBitstreamContext *ctx,
 
     if (INT_MAX / 8 < size) {
         av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid fragment: "
-               "too large (%"SIZE_SPECIFIER" bytes).\n", size);
+               "too large (%zu bytes).\n", size);
         err = AVERROR_INVALIDDATA;
         goto fail;
     }
@@ -765,7 +765,7 @@ static int cbs_av1_split_fragment(CodedBitstreamContext *ctx,
         if (obu_header.obu_has_size_field) {
             if (get_bits_left(&gbc) < 8) {
                 av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid OBU: fragment "
-                       "too short (%"SIZE_SPECIFIER" bytes).\n", size);
+                       "too short (%zu bytes).\n", size);
                 err = AVERROR_INVALIDDATA;
                 goto fail;
             }
@@ -782,7 +782,7 @@ static int cbs_av1_split_fragment(CodedBitstreamContext *ctx,
 
         if (size < obu_length) {
             av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid OBU length: "
-                   "%"PRIu64", but only %"SIZE_SPECIFIER" bytes remaining in fragment.\n",
+                   "%"PRIu64", but only %zu bytes remaining in fragment.\n",
                    obu_length, size);
             err = AVERROR_INVALIDDATA;
             goto fail;
@@ -868,7 +868,7 @@ static int cbs_av1_read_unit(CodedBitstreamContext *ctx,
     } else {
         if (unit->data_size < 1 + obu->header.obu_extension_flag) {
             av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid OBU length: "
-                   "unit too short (%"SIZE_SPECIFIER").\n", unit->data_size);
+                   "unit too short (%zu).\n", unit->data_size);
             return AVERROR_INVALIDDATA;
         }
         obu->obu_size = unit->data_size - 1 - obu->header.obu_extension_flag;
@@ -1312,7 +1312,7 @@ static void cbs_av1_free_metadata(AVRefStructOpaque unused, void *content)
 }
 #endif
 
-static const CodedBitstreamUnitTypeDescriptor cbs_av1_unit_types[] = {
+static CodedBitstreamUnitTypeDescriptor cbs_av1_unit_types[] = {
     CBS_UNIT_TYPE_POD(AV1_OBU_SEQUENCE_HEADER,        AV1RawOBU),
     CBS_UNIT_TYPE_POD(AV1_OBU_TEMPORAL_DELIMITER,     AV1RawOBU),
     CBS_UNIT_TYPE_POD(AV1_OBU_FRAME_HEADER,           AV1RawOBU),

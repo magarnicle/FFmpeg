@@ -38,7 +38,6 @@
 #include "codec_internal.h"
 #include "dovi_rpu.h"
 #include "encode.h"
-#include "packet_internal.h"
 #include "atsc_a53.h"
 #include "sei.h"
 
@@ -293,7 +292,6 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
     } else {
         ctx->params->fpsNum      = avctx->time_base.den;
         ctx->params->fpsDenom    = avctx->time_base.num;
-FF_ENABLE_DEPRECATION_WARNINGS
     }
     ctx->params->sourceWidth     = avctx->width;
     ctx->params->sourceHeight    = avctx->height;
@@ -695,7 +693,6 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     x265_nal *nal;
     x265_sei *sei;
     uint8_t *dst;
-    int pict_type;
     int payload = 0;
     int nnal;
     int ret;
@@ -773,7 +770,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                 sei_payload = &sei->payloads[sei->numPayloads];
                 sei_payload->payload = sei_data;
                 sei_payload->payloadSize = sei_size;
-                sei_payload->payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
+                sei_payload->payloadType = (SEIPayloadType)SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
                 sei->numPayloads++;
             }
         }
@@ -804,7 +801,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                 }
                 sei_payload->payloadSize = side_data->size;
                 /* Equal to libx265 USER_DATA_UNREGISTERED */
-                sei_payload->payloadType = SEI_TYPE_USER_DATA_UNREGISTERED;
+                sei_payload->payloadType = (SEIPayloadType)SEI_TYPE_USER_DATA_UNREGISTERED;
                 sei->numPayloads++;
             }
         }
@@ -871,6 +868,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     pkt->pts = x265pic_out->pts;
     pkt->dts = x265pic_out->dts;
 
+    enum AVPictureType pict_type;
     switch (x265pic_out->sliceType) {
     case X265_TYPE_IDR:
     case X265_TYPE_I:
@@ -895,7 +893,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 #endif
         pkt->flags |= AV_PKT_FLAG_DISPOSABLE;
 
-    ff_side_data_set_encoder_stats(pkt, x265pic_out->frameData.qp * FF_QP2LAMBDA, NULL, 0, pict_type);
+    ff_encode_add_stats_side_data(pkt, x265pic_out->frameData.qp * FF_QP2LAMBDA, NULL, 0, pict_type);
 
     if (x265pic_out->userData) {
         int idx = (int)(intptr_t)x265pic_out->userData - 1;

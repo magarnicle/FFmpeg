@@ -625,7 +625,7 @@ static int http_write_reply(URLContext* h, int status_code)
         message_len = snprintf(message, sizeof(message),
                  "HTTP/1.1 %03d %s\r\n"
                  "Content-Type: %s\r\n"
-                 "Content-Length: %"SIZE_SPECIFIER"\r\n"
+                 "Content-Length: %zu\r\n"
                  "%s"
                  "\r\n"
                  "%03d %s\r\n",
@@ -1875,7 +1875,7 @@ static int store_icy(URLContext *h, int size)
             ret = http_read_stream_all(h, data, len);
             if (ret < 0)
                 return ret;
-            data[len + 1] = 0;
+            data[len] = 0;
             if ((ret = av_opt_set(s, "icy_metadata_packet", data, 0)) < 0)
                 return ret;
             update_metadata(h, data);

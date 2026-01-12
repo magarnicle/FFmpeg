@@ -914,6 +914,8 @@ av_cold int ff_ffv1_encode_setup_plane_info(AVCodecContext *avctx,
     case AV_PIX_FMT_GBRP9:
         if (!avctx->bits_per_raw_sample)
             s->bits_per_raw_sample = 9;
+    case AV_PIX_FMT_X2BGR10:
+    case AV_PIX_FMT_X2RGB10:
     case AV_PIX_FMT_GBRP10:
     case AV_PIX_FMT_GBRAP10:
         if (!avctx->bits_per_raw_sample && !s->bits_per_raw_sample)
@@ -1684,9 +1686,11 @@ size_t ff_ffv1_encode_buffer_size(AVCodecContext *avctx)
 {
     FFV1Context *f = avctx->priv_data;
 
-    size_t maxsize = avctx->width*avctx->height * (1 + f->transparency);
+    int w = avctx->width  + f->num_h_slices;
+    int h = avctx->height + f->num_v_slices;
+    size_t maxsize = w*h * (1 + f->transparency);
     if (f->chroma_planes)
-        maxsize += AV_CEIL_RSHIFT(avctx->width, f->chroma_h_shift) * AV_CEIL_RSHIFT(f->height, f->chroma_v_shift) * 2;
+        maxsize += AV_CEIL_RSHIFT(w, f->chroma_h_shift) * AV_CEIL_RSHIFT(h, f->chroma_v_shift) * 2;
     maxsize += f->slice_count * 800; //for slice header
     if (f->version > 3) {
         maxsize *= f->bits_per_raw_sample + 1;

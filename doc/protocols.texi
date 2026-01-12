@@ -352,6 +352,17 @@ means auto (seekable for normal files, non-seekable for named pipes).
 Many demuxers handle seekable and non-seekable resources differently,
 overriding this might speed up opening certain files at the cost of losing some
 features (e.g. accurate seeking).
+
+@item pkt_size
+Set the maximum packet size used for file I/O. A smaller value may reduce
+memory usage. A higher value may increase throughput especially with networked
+filesystems.
+
+For reading, if explicitly set, it overrides the default internal buffer size
+(32 KB) and limits the maximum amount of data read per operation.
+
+For writing, this sets the size of each write operation. The default is 256 KB
+for regular files, 32 KB otherwise.
 @end table
 
 @section ftp
@@ -1162,9 +1173,13 @@ rtp://@var{hostname}[:@var{port}][?@var{options}]
 @var{port} specifies the RTP port to use.
 
 @var{options} contains a list of &-separated options of the form
-@var{key}=@var{val}.
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
 
-The following options are supported:
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
+The list of supported options follows.
 
 @table @option
 
@@ -1535,7 +1550,15 @@ The accepted URL syntax is:
 sctp://@var{host}:@var{port}[?@var{options}]
 @end example
 
-The protocol accepts the following options:
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
+The list of supported options follows.
+
 @table @option
 @item listen
 If set to any value, listen for an incoming connection. Outgoing connection is done by default.
@@ -1554,18 +1577,13 @@ srt://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
 @var{options} contains a list of &-separated options of the form
-@var{key}=@var{val}.
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
 
-or
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
 
-@example
-@var{options} srt://@var{hostname}:@var{port}
-@end example
-
-@var{options} contains a list of '-@var{key} @var{val}'
-options.
-
-This protocol accepts the following options.
+The list of supported options follows.
 
 @table @option
 @item connect_timeout=@var{milliseconds}
@@ -1918,7 +1936,11 @@ tcp://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
 @var{options} contains a list of &-separated options of the form
-@var{key}=@var{val}.
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
 
 The list of supported options follows.
 
@@ -1973,8 +1995,14 @@ The required syntax for a TLS/SSL url is:
 tls://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
-The following parameters can be set via command line options
-(or in code via @code{AVOption}s):
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
+The list of supported options follows.
 
 @table @option
 
@@ -2035,12 +2063,19 @@ Datagram Transport Layer Security (DTLS)
 
 The required syntax for a DTLS URL is:
 @example
-dtls://@var{hostname}:@var{port}
+dtls://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
+
 DTLS shares most options with TLS, but operates over UDP instead of TCP.
-The following parameters can be set via command line options
-(or in code via @code{AVOption}s):
+
+The list of supported options follows.
 
 @table @option
 
@@ -2119,7 +2154,12 @@ The required syntax for an UDP URL is:
 udp://@var{hostname}:@var{port}[?@var{options}]
 @end example
 
-@var{options} contains a list of &-separated options of the form @var{key}=@var{val}.
+@var{options} contains a list of &-separated options of the form
+@var{key}=@var{val}. Standard percent-encoding (and using the plus sign for
+space) can be used to escape keys and values.
+
+Options can also can be specified via command line options (or in code via
+@code{AVOption}s).
 
 In case threading is enabled on the system, a circular buffer is used
 to store the incoming data, which allows one to reduce loss of data due to
@@ -2242,6 +2282,10 @@ The following parameters can be set via command line options
 Timeout in ms.
 @item listen
 Create the Unix socket in listening mode.
+@item pkt_size
+Maximum packet size for packet-oriented sockets (SOCK_DGRAM and
+SOCK_SEQPACKET). If greater than zero, this value is used as
+@code{max_packet_size}. Ignored for SOCK_STREAM. Default is @code{0}.
 @end table
 
 @section zmq

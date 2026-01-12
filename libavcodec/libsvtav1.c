@@ -38,7 +38,6 @@
 #include "codec_internal.h"
 #include "dovi_rpu.h"
 #include "encode.h"
-#include "packet_internal.h"
 #include "avcodec.h"
 #include "profiles.h"
 
@@ -210,7 +209,7 @@ static int config_enc_params(EbSvtAv1EncConfiguration *param,
 {
     SvtContext *svt_enc = avctx->priv_data;
     const AVPixFmtDescriptor *desc;
-    const AVDictionaryEntry av_unused *en = NULL;
+    av_unused const AVDictionaryEntry *en = NULL;
 
     // Update param from options
     if (svt_enc->enc_mode >= -1)
@@ -242,10 +241,10 @@ static int config_enc_params(EbSvtAv1EncConfiguration *param,
     }
 
     desc = av_pix_fmt_desc_get(avctx->pix_fmt);
-    param->color_primaries          = avctx->color_primaries;
-    param->matrix_coefficients      = (desc->flags & AV_PIX_FMT_FLAG_RGB) ?
-                                      AVCOL_SPC_RGB : avctx->colorspace;
-    param->transfer_characteristics = avctx->color_trc;
+    param->color_primaries          = (enum EbColorPrimaries)avctx->color_primaries;
+    param->matrix_coefficients      = (enum EbMatrixCoefficients)((desc->flags & AV_PIX_FMT_FLAG_RGB) ?
+                                      AVCOL_SPC_RGB : avctx->colorspace);
+    param->transfer_characteristics = (enum EbTransferCharacteristics)avctx->color_trc;
 
     if (avctx->color_range != AVCOL_RANGE_UNSPECIFIED)
         param->color_range = avctx->color_range == AVCOL_RANGE_JPEG;
@@ -591,7 +590,7 @@ static int eb_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
     AVFrame *frame = svt_enc->frame;
     EbErrorType svt_ret;
     AVBufferRef *ref;
-    int ret = 0, pict_type;
+    int ret = 0;
 
     if (svt_enc->eos_flag == EOS_RECEIVED)
         return AVERROR_EOF;
@@ -637,6 +636,7 @@ static int eb_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
     pkt->pts  = headerPtr->pts;
     pkt->dts  = headerPtr->dts;
 
+    enum AVPictureType pict_type;
     switch (headerPtr->pic_type) {
     case EB_AV1_KEY_PICTURE:
         pkt->flags |= AV_PKT_FLAG_KEY;
@@ -660,7 +660,7 @@ static int eb_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
         svt_enc->eos_flag = EOS_RECEIVED;
 #endif
 
-    ff_side_data_set_encoder_stats(pkt, headerPtr->qp * FF_QP2LAMBDA, NULL, 0, pict_type);
+    ff_encode_add_stats_side_data(pkt, headerPtr->qp * FF_QP2LAMBDA, NULL, 0, pict_type);
 
     svt_av1_enc_release_out_buffer(&headerPtr);
 

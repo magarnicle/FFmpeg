@@ -842,7 +842,7 @@ static int flv_read_metabody(AVFormatContext *s, int64_t next_pos)
     FLVContext *flv = s->priv_data;
     AMFDataType type;
     AVStream *stream, *astream, *vstream;
-    AVStream av_unused *dstream;
+    av_unused AVStream *dstream;
     AVIOContext *ioc;
     int i;
     char buffer[32];
@@ -1635,6 +1635,7 @@ retry_duration:
             if (!av_channel_layout_check(&st->codecpar->ch_layout) ||
                 !st->codecpar->sample_rate ||
                 !st->codecpar->bits_per_coded_sample) {
+                av_channel_layout_uninit(&st->codecpar->ch_layout);
                 av_channel_layout_default(&st->codecpar->ch_layout, channels);
                 st->codecpar->sample_rate           = sample_rate;
                 st->codecpar->bits_per_coded_sample = bits_per_coded_sample;

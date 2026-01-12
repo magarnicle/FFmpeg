@@ -25,7 +25,12 @@ extern "C" {
 #include "libavformat/internal.h"
 }
 
+#include <DeckLinkAPIVersion.h>
+#include <DeckLinkAPI.h>
+#if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0e030000
 #include <DeckLinkAPI_v14_2_1.h>
+#endif
+
 #ifdef _WIN32
 #include <DeckLinkAPI_i.c>
 #else

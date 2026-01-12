@@ -12,14 +12,18 @@ AVCODECOBJS-$(CONFIG_H264CHROMA)        += h264chroma.o
 AVCODECOBJS-$(CONFIG_H264DSP)           += h264dsp.o
 AVCODECOBJS-$(CONFIG_H264PRED)          += h264pred.o
 AVCODECOBJS-$(CONFIG_H264QPEL)          += h264qpel.o
+AVCODECOBJS-$(CONFIG_HPELDSP)           += hpeldsp.o
 AVCODECOBJS-$(CONFIG_IDCTDSP)           += idctdsp.o
 AVCODECOBJS-$(CONFIG_LLAUDDSP)          += llauddsp.o
 AVCODECOBJS-$(CONFIG_LLVIDDSP)          += llviddsp.o
-AVCODECOBJS-$(CONFIG_LLVIDENCDSP)       += llviddspenc.o
+AVCODECOBJS-$(CONFIG_LLVIDENCDSP)       += llvidencdsp.o
 AVCODECOBJS-$(CONFIG_LPC)               += lpc.o
 AVCODECOBJS-$(CONFIG_ME_CMP)            += motion.o
+AVCODECOBJS-$(CONFIG_MPEGVIDEO)         += mpegvideo_unquantize.o
 AVCODECOBJS-$(CONFIG_MPEGVIDEOENCDSP)   += mpegvideoencdsp.o
+AVCODECOBJS-$(CONFIG_QPELDSP)           += qpeldsp.o
 AVCODECOBJS-$(CONFIG_VC1DSP)            += vc1dsp.o
+AVCODECOBJS-$(CONFIG_VP3DSP)            += vp3dsp.o
 AVCODECOBJS-$(CONFIG_VP8DSP)            += vp8dsp.o
 AVCODECOBJS-$(CONFIG_VIDEODSP)          += videodsp.o
 
@@ -29,7 +33,8 @@ AVCODECOBJS-$(CONFIG_AAC_DECODER)       += aacpsdsp.o \
 AVCODECOBJS-$(CONFIG_AAC_ENCODER)       += aacencdsp.o
 AVCODECOBJS-$(CONFIG_ALAC_DECODER)      += alacdsp.o
 AVCODECOBJS-$(CONFIG_APV_DECODER)       += apv_dsp.o
-AVCODECOBJS-$(CONFIG_DCA_DECODER)       += synth_filter.o
+AVCODECOBJS-$(CONFIG_CAVS_DECODER)      += cavsdsp.o
+AVCODECOBJS-$(CONFIG_DCA_DECODER)       += dcadsp.o synth_filter.o
 AVCODECOBJS-$(CONFIG_DIRAC_DECODER)     += diracdsp.o
 AVCODECOBJS-$(CONFIG_EXR_DECODER)       += exrdsp.o
 AVCODECOBJS-$(CONFIG_FLAC_DECODER)      += flacdsp.o
@@ -46,6 +51,7 @@ AVCODECOBJS-$(CONFIG_UTVIDEO_DECODER)   += utvideodsp.o
 AVCODECOBJS-$(CONFIG_V210_DECODER)      += v210dec.o
 AVCODECOBJS-$(CONFIG_V210_ENCODER)      += v210enc.o
 AVCODECOBJS-$(CONFIG_VORBIS_DECODER)    += vorbisdsp.o
+AVCODECOBJS-$(CONFIG_VP6_DECODER)       += vp6dsp.o
 AVCODECOBJS-$(CONFIG_VP9_DECODER)       += vp9dsp.o
 AVCODECOBJS-$(CONFIG_VVC_DECODER)       += vvc_alf.o vvc_mc.o vvc_sao.o
 
@@ -60,6 +66,7 @@ AVFILTEROBJS-$(CONFIG_BWDIF_FILTER)      += vf_bwdif.o
 AVFILTEROBJS-$(CONFIG_COLORDETECT_FILTER)+= vf_colordetect.o
 AVFILTEROBJS-$(CONFIG_COLORSPACE_FILTER) += vf_colorspace.o
 AVFILTEROBJS-$(CONFIG_EQ_FILTER)         += vf_eq.o
+AVFILTEROBJS-$(CONFIG_FSPP_FILTER)       += vf_fspp.o
 AVFILTEROBJS-$(CONFIG_GBLUR_FILTER)      += vf_gblur.o
 AVFILTEROBJS-$(CONFIG_HFLIP_FILTER)      += vf_hflip.o
 AVFILTEROBJS-$(CONFIG_IDET_FILTER)       += vf_idet.o
@@ -75,6 +82,7 @@ SWSCALEOBJS                             += sw_gbrp.o            \
                                            sw_range_convert.o   \
                                            sw_rgb.o             \
                                            sw_scale.o           \
+                                           sw_xyz2rgb.o         \
                                            sw_yuv2rgb.o         \
                                            sw_yuv2yuv.o
 
@@ -83,6 +91,7 @@ CHECKASMOBJS-$(CONFIG_SWSCALE)  += $(SWSCALEOBJS)
 # libavutil tests
 AVUTILOBJS                              += aes.o
 AVUTILOBJS                              += av_tx.o
+AVUTILOBJS                              += crc.o
 AVUTILOBJS                              += fixed_dsp.o
 AVUTILOBJS                              += float_dsp.o
 AVUTILOBJS                              += lls.o
