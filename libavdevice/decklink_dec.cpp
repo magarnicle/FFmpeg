@@ -60,6 +60,7 @@ extern "C" {
 #include "decklink_common.h"
 #include "decklink_dec.h"
 
+extern bool operator==(const REFIID& me, const REFIID& other);
 #define MAX_WIDTH_VANC 1920
 const BMDDisplayMode AUTODETECT_DEFAULT_MODE = bmdModeNTSC;
 
@@ -115,7 +116,7 @@ public:
         decklink_allocator(): _refs(1) { }
         virtual ~decklink_allocator() { }
 
-        // IDeckLinkMemoryAllocator methods
+        // IDeckLinkMemoryAllocator_v14_2_1 methods
         virtual HRESULT STDMETHODCALLTYPE AllocateBuffer(unsigned int bufferSize, void* *allocatedBuffer)
         {
             void *buf = av_malloc(bufferSize + AV_INPUT_BUFFER_PADDING_SIZE);

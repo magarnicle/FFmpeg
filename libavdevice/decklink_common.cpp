@@ -58,6 +58,7 @@ extern "C" {
 
 #include "decklink_common.h"
 
+
 static IDeckLinkIterator *decklink_create_iterator(AVFormatContext *avctx)
 {
     IDeckLinkIterator *iter;

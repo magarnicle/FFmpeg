@@ -54,6 +54,24 @@ extern "C" {
 #include "libklvanc/pixels.h"
 #endif
 
+extern bool operator==(const REFIID& me, const REFIID& other){
+    return me.byte0 == other.byte0 &&
+	   me.byte1 == other.byte1 &&
+	   me.byte2 == other.byte2 &&
+	   me.byte3 == other.byte3 &&
+	   me.byte4 == other.byte4 &&
+	   me.byte5 == other.byte5 &&
+	   me.byte6 == other.byte6 &&
+	   me.byte7 == other.byte7 &&
+	   me.byte8 == other.byte8 &&
+	   me.byte9 == other.byte9 &&
+	   me.byte10 == other.byte10 &&
+	   me.byte11 == other.byte11 &&
+	   me.byte12 == other.byte12 &&
+	   me.byte13 == other.byte13 &&
+	   me.byte14 == other.byte14 &&
+	   me.byte15 == other.byte15;
+}
 /* DeckLink callback class declaration */
 class decklink_frame : public IDeckLinkVideoFrame_v14_2_1
 {
@@ -166,10 +184,7 @@ public:
         decklink_frame *frame = static_cast<decklink_frame *>(_frame);
         struct decklink_ctx *ctx = frame->_ctx;
 
-        if (frame->_avframe){
-            if (result > 0){
-                printf("Frame %ld not displayed correctly, result is: %d\n", frame->_avframe->pts, result);
-            }
+        if (frame->_avframe) {
             av_frame_unref(frame->_avframe);
             if (result > 0) {
                 av_log(NULL, AV_LOG_WARNING, "AV Frame was not displayed, result code: %d\n", result);
@@ -324,16 +339,16 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     return -1;
 }
 
-if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
-    if (c->format != AV_PIX_FMT_UYVY422) {
-        av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format!"
-                   " Only AV_PIX_FMT_UYVY422 is supported.\n");
+    if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+        if (c->format != AV_PIX_FMT_UYVY422) {
+            av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format!"
+                    " Only AV_PIX_FMT_UYVY422 is supported.\n");
             return -1;
         }
         ctx->raw_format = bmdFormat8BitYUV;
     } else if (c->codec_id != AV_CODEC_ID_V210) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported codec type!"
-               " Only V210 and wrapped frame with AV_PIX_FMT_UYVY422 are supported.\n");
+                " Only V210 and wrapped frame with AV_PIX_FMT_UYVY422 are supported.\n");
         return -1;
     } else {
         ctx->raw_format = bmdFormat10BitYUV;
@@ -344,9 +359,9 @@ if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
         return -1;
     }
     if (ff_decklink_set_format(avctx, c->width, c->height,
-                            st->time_base.num, st->time_base.den, c->field_order)) {
+                st->time_base.num, st->time_base.den, c->field_order)) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported video size, framerate or field order!"
-               " Check available formats with -list_formats 1.\n");
+                " Check available formats with -list_formats 1.\n");
         return -1;
     }
     if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
@@ -366,6 +381,7 @@ if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
         usleep(1000);
     }
 
+
     /* Set callback. */
     ctx->output_callback = new decklink_output_callback();
     ctx->dlo->SetScheduledFrameCompletionCallback(ctx->output_callback);
@@ -382,12 +398,14 @@ if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
 
     av_log(avctx, AV_LOG_DEBUG, "output: %s, preroll: %d, frames buffer size: %d\n",
-           avctx->url, ctx->frames_preroll, ctx->frames_buffer);
+            avctx->url, ctx->frames_preroll, ctx->frames_buffer);
 
     /* The device expects the framerate to be fixed. */
     avpriv_set_pts_info(st, 64, st->time_base.num, st->time_base.den);
 
     ctx->video = 1;
+
+
 
     return 0;
 }
@@ -527,7 +545,6 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     uint32_t buffered;
-
     /* Stop async output thread if running */
     if (ctx->output_thread_started) {
         av_log(avctx, AV_LOG_INFO, "Waiting for async output buffer to drain...\n");
@@ -1300,6 +1317,7 @@ error:
 
 int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
+
     AVStream *st = avctx->streams[pkt->stream_index];
 
     if      (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
