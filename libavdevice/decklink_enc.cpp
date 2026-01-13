@@ -188,14 +188,14 @@ public:
             av_log(NULL, AV_LOG_DEBUG, "decklink output result is normal\n");
         }
 
-	bool active = true;
-	HRESULT schedule_running = ctx->dlo->IsScheduledPlaybackRunning(&active);
-	if (schedule_running != S_OK) {
-	    av_log(NULL, AV_LOG_INFO, "decklink schedule running result is not ok: %d\n", schedule_running);
-	}
-	if (!active){
-	    av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
-	}
+        bool active = true;
+        HRESULT schedule_running = ctx->dlo->IsScheduledPlaybackRunning(&active);
+        if (schedule_running != S_OK) {
+            av_log(NULL, AV_LOG_INFO, "decklink schedule running result is not ok: %d\n", schedule_running);
+        }
+        if (!active){
+            av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
+        }
 
         pthread_mutex_lock(&ctx->mutex);
         ctx->frames_buffer_available_spots++;
