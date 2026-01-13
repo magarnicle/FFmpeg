@@ -626,6 +626,35 @@ int ff_buffer_packet(AVFormatContext *s, AVPacket *pkt)
     return err < 0 ? err : 0;
 }
 
+static int add_source_filename_metadata(AVFormatContext *s, AVPacket *pkt)
+{
+    AVDictionary *d = NULL;
+    char *packed_metadata = NULL;
+    size_t metadata_len;
+    int ret;
+
+    /* Only add metadata if URL is available (skip pipes, stdin, etc.) */
+    if (!s->url || !s->url[0])
+        return 0;
+
+    av_dict_set(&d, "lavf.source_filename", s->url, 0);
+    av_dict_set(&d, "lavf.source_basename", av_basename(s->url), 0);
+    av_log(NULL, AV_LOG_DEBUG, "source filename: %s\n", s->url);
+
+    packed_metadata = av_packet_pack_dictionary(d, &metadata_len);
+    av_dict_free(&d);
+    if (!packed_metadata)
+        return AVERROR(ENOMEM);
+
+    ret = av_packet_add_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA,
+                                  packed_metadata, metadata_len);
+    if (ret < 0) {
+        av_freep(&packed_metadata);
+        return ret;
+    }
+    return 0;
+}
+
 int ff_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     FormatContextInternal *const fci = ff_fc_internal(s);
@@ -682,6 +711,14 @@ FF_ENABLE_DEPRECATION_WARNINGS
         if (err < 0) {
             av_packet_unref(pkt);
             return err;
+        }
+
+        /* Add source filename metadata to packet */
+        if (0){
+        err = add_source_filename_metadata(s, pkt);
+        if (err < 0)
+            av_log(s, AV_LOG_WARNING, "Failed to add source filename metadata: %s\n",
+                   av_err2str(err));
         }
 
         err = handle_new_packet(s, pkt, 1);

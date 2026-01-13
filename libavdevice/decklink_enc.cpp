@@ -620,6 +620,9 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
         ff_decklink_packet_queue_end(&ctx->output_queue);
     }
 
+    /* Free source filename tracking */
+    av_freep(&ctx->last_logged_source_filename);
+
     ff_ccfifo_uninit(&ctx->cc_fifo);
     av_freep(&cctx->ctx);
 
@@ -905,6 +908,34 @@ done:
 }
 #endif
 
+/* Extract source filename from packet metadata */
+static char *get_packet_source_filename(AVPacket *pkt)
+{
+    size_t size;
+    const uint8_t *side_metadata;
+    AVDictionary *metadata = NULL;
+    AVDictionaryEntry *entry = NULL;
+    char *filename = NULL;
+
+    side_metadata = av_packet_get_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA, &size);
+    if (!side_metadata || size == 0)
+        return NULL;
+
+    if (av_packet_unpack_dictionary(side_metadata, size, &metadata) < 0)
+        return NULL;
+
+    /* Try both possible key names */
+    entry = av_dict_get(metadata, "lavf.source_filename", NULL, 0);
+    if (!entry)
+        entry = av_dict_get(metadata, "lavf.source_basename", NULL, 0);
+
+    if (entry)
+        filename = av_strdup(entry->value);
+
+    av_dict_free(&metadata);
+    return filename;
+}
+
 /* Schedule a video packet to decklink - called directly or from consumer thread */
 static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
@@ -916,6 +947,21 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     decklink_frame *frame;
     uint32_t buffered;
     HRESULT hr;
+
+    /* Log source filename when it changes */
+    char *source_filename = get_packet_source_filename(pkt);
+    if (source_filename) {
+        /* Only log if filename changed to avoid log spam */
+        if (!ctx->last_logged_source_filename ||
+            strcmp(source_filename, ctx->last_logged_source_filename) != 0) {
+            av_log(avctx, AV_LOG_INFO,
+                   "Now playing from source: %s (pts=%"PRId64")\n",
+                   source_filename, pkt->pts);
+            av_free(ctx->last_logged_source_filename);
+            ctx->last_logged_source_filename = av_strdup(source_filename);
+        }
+        av_free(source_filename);
+    }
 
     /* Check if frame is late and should be dropped or errored */
     if (ctx->playback_started) {
