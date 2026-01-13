@@ -838,7 +838,9 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
-    av_log(avctx, AV_LOG_DEBUG, "Buffered video frames: %d.\n", (int) buffered);
+    if (buffered <= 25){
+        av_log(avctx, AV_LOG_INFO, "Buffered video frames: %d.\n", (int) buffered);
+    }
     if (pkt->pts > 2 && buffered <= 2)
         av_log(avctx, AV_LOG_WARNING, "There are not enough buffered video frames."
                " Video may misbehave!\n");
