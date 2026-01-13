@@ -31405,6 +31405,12 @@ streams in each segment. Default is 0.
 @item unsafe
 Activate unsafe mode: do not fail if segments have a different format.
 
+@item segment_labels
+Set pipe-separated labels for each segment. When set, the filter logs
+at INFO level when each segment starts and finishes, including the label
+in the log message. For example, @code{segment_labels=intro|main|outro}
+will produce log messages like "Segment 0 'intro' started at pts=0".
+
 @end table
 
 The filter has @var{v}+@var{a} outputs: first @var{v} video outputs, then

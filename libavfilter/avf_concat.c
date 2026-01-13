@@ -43,6 +43,9 @@ typedef struct ConcatContext {
     int64_t delta_ts; /**< timestamp to add to produce output timestamps */
     unsigned nb_in_active; /**< number of active inputs in current segment */
     unsigned unsafe;
+    char *segment_labels;          /**< pipe-separated labels for each segment */
+    char **labels;                 /**< parsed array of segment labels */
+    uint8_t *segment_started;      /**< track if each segment has started */
     struct concat_in {
         int64_t pts;
         int64_t nb_frames;
@@ -67,6 +70,9 @@ static const AVOption concat_options[] = {
     { "unsafe", "enable unsafe mode",
       OFFSET(unsafe),
       AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, V|A|F},
+    { "segment_labels", "pipe-separated labels for each segment",
+      OFFSET(segment_labels),
+      AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, V|A|F},
     { NULL }
 };
 
@@ -176,6 +182,13 @@ static int config_output(AVFilterLink *outlink)
     return 0;
 }
 
+static const char *get_segment_label(ConcatContext *cat, unsigned seg_idx)
+{
+    if (cat->labels && seg_idx < cat->nb_segments && cat->labels[seg_idx])
+        return cat->labels[seg_idx];
+    return NULL;
+}
+
 static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
 {
     ConcatContext *cat = ctx->priv;
@@ -183,6 +196,19 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
     AVFilterLink * inlink = ctx-> inputs[ in_no];
     AVFilterLink *outlink = ctx->outputs[out_no];
     struct concat_in *in = &cat->in[in_no];
+    unsigned seg_idx = cat->cur_idx / ctx->nb_outputs;
+
+    /* log when segment starts (first frame) */
+    if (!cat->segment_started[seg_idx]) {
+        const char *label = get_segment_label(cat, seg_idx);
+        cat->segment_started[seg_idx] = 1;
+        if (label)
+            av_log(ctx, AV_LOG_INFO, "Segment %u '%s' started at pts=%"PRId64"\n",
+                   seg_idx, label, cat->delta_ts);
+        else
+            av_log(ctx, AV_LOG_INFO, "Segment %u started at pts=%"PRId64"\n",
+                   seg_idx, cat->delta_ts);
+    }
 
     buf->pts = av_rescale_q(buf->pts, inlink->time_base, outlink->time_base);
     buf->duration = av_rescale_q(buf->duration, inlink->time_base, outlink->time_base);
@@ -287,12 +313,18 @@ static int flush_segment(AVFilterContext *ctx)
     ConcatContext *cat = ctx->priv;
     unsigned str, str_max;
     int64_t seg_delta;
+    unsigned seg_idx = cat->cur_idx / ctx->nb_outputs;
+    const char *label = get_segment_label(cat, seg_idx);
 
     find_next_delta_ts(ctx, &seg_delta);
     cat->cur_idx += ctx->nb_outputs;
     cat->nb_in_active = ctx->nb_outputs;
-    av_log(ctx, AV_LOG_INFO, "Segment finished at pts=%"PRId64"\n",
-           cat->delta_ts);
+    if (label)
+        av_log(ctx, AV_LOG_INFO, "Segment %u '%s' finished at pts=%"PRId64"\n",
+               seg_idx, label, cat->delta_ts);
+    else
+        av_log(ctx, AV_LOG_INFO, "Segment %u finished at pts=%"PRId64"\n",
+               seg_idx, cat->delta_ts);
 
     if (cat->cur_idx < ctx->nb_inputs) {
         /* pad audio streams with silence */
@@ -347,6 +379,38 @@ static av_cold int init(AVFilterContext *ctx)
     cat->in = av_calloc(ctx->nb_inputs, sizeof(*cat->in));
     if (!cat->in)
         return AVERROR(ENOMEM);
+
+    /* allocate segment_started array */
+    cat->segment_started = av_calloc(cat->nb_segments, sizeof(*cat->segment_started));
+    if (!cat->segment_started)
+        return AVERROR(ENOMEM);
+
+    /* parse segment labels */
+    if (cat->segment_labels) {
+        char *labels_copy, *saveptr, *token;
+        unsigned i = 0;
+
+        cat->labels = av_calloc(cat->nb_segments, sizeof(*cat->labels));
+        if (!cat->labels)
+            return AVERROR(ENOMEM);
+
+        labels_copy = av_strdup(cat->segment_labels);
+        if (!labels_copy)
+            return AVERROR(ENOMEM);
+
+        token = av_strtok(labels_copy, "|", &saveptr);
+        while (token && i < cat->nb_segments) {
+            cat->labels[i] = av_strdup(token);
+            if (!cat->labels[i]) {
+                av_free(labels_copy);
+                return AVERROR(ENOMEM);
+            }
+            i++;
+            token = av_strtok(NULL, "|", &saveptr);
+        }
+        av_free(labels_copy);
+    }
+
     cat->nb_in_active = ctx->nb_outputs;
     return 0;
 }
@@ -356,6 +420,12 @@ static av_cold void uninit(AVFilterContext *ctx)
     ConcatContext *cat = ctx->priv;
 
     av_freep(&cat->in);
+    av_freep(&cat->segment_started);
+    if (cat->labels) {
+        for (unsigned i = 0; i < cat->nb_segments; i++)
+            av_freep(&cat->labels[i]);
+        av_freep(&cat->labels);
+    }
 }
 
 static int activate(AVFilterContext *ctx)
