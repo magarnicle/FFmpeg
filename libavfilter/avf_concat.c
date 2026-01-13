@@ -291,7 +291,7 @@ static int flush_segment(AVFilterContext *ctx)
     find_next_delta_ts(ctx, &seg_delta);
     cat->cur_idx += ctx->nb_outputs;
     cat->nb_in_active = ctx->nb_outputs;
-    av_log(ctx, AV_LOG_VERBOSE, "Segment finished at pts=%"PRId64"\n",
+    av_log(ctx, AV_LOG_INFO, "Segment finished at pts=%"PRId64"\n",
            cat->delta_ts);
 
     if (cat->cur_idx < ctx->nb_inputs) {
