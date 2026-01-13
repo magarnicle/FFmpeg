@@ -447,7 +447,6 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
                  pthread_cond_wait(&ctx->cond, &ctx->mutex);
         }
         pthread_mutex_unlock(&ctx->mutex);
-        if (0) {
         while (1){
             ctx->dlo->GetBufferedVideoFrameCount(&buffered);
             if (buffered == 0){
@@ -459,7 +458,6 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
             } else {
                 usleep(300);
             }
-        }
         }
         av_log(avctx, AV_LOG_INFO, "All frames returned, finishing up\n");
         av_log(avctx, AV_LOG_INFO, "Stopped at %ld, requested %ld\n", actual, ctx->last_pts * ctx->bmd_tb_num);
