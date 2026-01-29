@@ -321,7 +321,7 @@ typedef struct DrawTextContext {
     int canvas_h;                   ///< evaluated canvas height (0 = disabled)
     int canvas_x;                   ///< evaluated canvas x viewport offset
     int canvas_y;                   ///< evaluated canvas y viewport offset
-    int canvas_loop;                ///< loop/tile text when canvas extends beyond text
+    int canvas_tile;                ///< loop/tile text when canvas extends beyond text
 
     TextLine *lines;                ///< computed information about text lines
     int line_count;                 ///< the number of text lines
@@ -369,7 +369,7 @@ static const AVOption drawtext_options[]= {
     {"canvas_h",       "set canvas height expression", OFFSET(canvas_h_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_x",       "set canvas x offset expression", OFFSET(canvas_x_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_y",       "set canvas y offset expression", OFFSET(canvas_y_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
-    {"canvas_loop",    "loop text when canvas exceeds text bounds", OFFSET(canvas_loop), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
+    {"canvas_tile",    "loop text when canvas exceeds text bounds", OFFSET(canvas_tile), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
     {"shadowx",        "set shadow x offset",   OFFSET(shadowx),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"shadowy",        "set shadow y offset",   OFFSET(shadowy),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"borderw",        "set border width",      OFFSET(borderw),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
@@ -1316,7 +1316,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                        int x, int y, int borderw,
                        int canvas_x, int canvas_y,
                        int canvas_w, int canvas_h,
-                       int text_w, int text_h, int canvas_loop)
+                       int text_w, int text_h, int canvas_tile)
 {
     DrawTextContext *s = ctx->priv;
     int g, l, x1, y1, w1, h1, idx;
@@ -1360,7 +1360,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     int tile_y_start = 0, tile_y_end = 0;
     int tile_w = text_w + 1;  // add 1 pixel spacing between tiles
     int tile_h = text_h + 1;
-    if (use_canvas && canvas_loop && text_w > 0 && text_h > 0) {
+    if (use_canvas && canvas_tile && text_w > 0 && text_h > 0) {
         // Calculate which tiles we need to render to cover the canvas
         // tile offset of -1 means render text shifted left by tile_w, etc.
         tile_x_start = (canvas_x / tile_w) - 1;
@@ -1393,7 +1393,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
             if (use_canvas) {
                 x1 -= canvas_x;
                 y1 -= canvas_y;
-                if (canvas_loop) {
+                if (canvas_tile) {
                     x1 += tile_x * tile_w;
                     y1 += tile_y * tile_h;
                 }
@@ -1895,7 +1895,7 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             if ((ret = draw_glyphs(ctx, frame, &shadowcolor, &metrics,
                     s->shadowx, s->shadowy, s->borderw,
                     s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
-                    metrics.width, metrics.height, s->canvas_loop)) < 0) {
+                    metrics.width, metrics.height, s->canvas_tile)) < 0) {
                 return ret;
             }
         }
@@ -1904,14 +1904,14 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             if ((ret = draw_glyphs(ctx, frame, &bordercolor, &metrics,
                     0, 0, s->borderw,
                     s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
-                    metrics.width, metrics.height, s->canvas_loop)) < 0) {
+                    metrics.width, metrics.height, s->canvas_tile)) < 0) {
                 return ret;
             }
         }
 
         if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0, 0, 0,
                 s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
-                metrics.width, metrics.height, s->canvas_loop)) < 0) {
+                metrics.width, metrics.height, s->canvas_tile)) < 0) {
             return ret;
         }
     }

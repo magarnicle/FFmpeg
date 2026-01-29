@@ -12664,7 +12664,7 @@ For example, to scroll horizontally through text at 100 pixels per second:
 canvas_w=200:canvas_h=50:canvas_x=t*100:canvas_y=0
 @end example
 
-@item canvas_loop
+@item canvas_tile
 If set to 1, the text will loop/tile when the canvas viewport extends beyond
 the rendered text boundaries. This is useful for creating continuous scrolling
 text effects like news tickers.
@@ -13051,7 +13051,7 @@ drawtext="fontfile=FreeSerif.ttf:textfile=LONG_LINE:x=100:y=100:canvas_w=400:can
 Create a continuously looping news ticker that scrolls text and seamlessly
 repeats when reaching the end.
 @example
-drawtext="fontfile=FreeSerif.ttf:text='Breaking News * ':x=50:y=50:canvas_w=300:canvas_h=40:canvas_x=mod(t*100\,tw):canvas_y=0:canvas_loop=1"
+drawtext="fontfile=FreeSerif.ttf:text='Breaking News * ':x=50:y=50:canvas_w=300:canvas_h=40:canvas_x=mod(t*100\,tw):canvas_y=0:canvas_tile=1"
 @end example
 
 @item
