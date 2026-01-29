@@ -317,6 +317,7 @@ typedef struct DrawTextContext {
     AVExpr *canvas_y_pexpr;         ///< parsed expression for canvas y
     int canvas_x;                   ///< evaluated canvas x viewport offset
     int canvas_y;                   ///< evaluated canvas y viewport offset
+    int canvas_loop;                ///< loop/tile text when canvas extends beyond text
 
     TextLine *lines;                ///< computed information about text lines
     int line_count;                 ///< the number of text lines
@@ -364,6 +365,7 @@ static const AVOption drawtext_options[]= {
     {"canvas_h",       "set canvas height",     OFFSET(canvas_h),           AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
     {"canvas_x",       "set canvas x offset expression", OFFSET(canvas_x_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_y",       "set canvas y offset expression", OFFSET(canvas_y_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
+    {"canvas_loop",    "loop text when canvas exceeds text bounds", OFFSET(canvas_loop), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
     {"shadowx",        "set shadow x offset",   OFFSET(shadowx),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"shadowy",        "set shadow y offset",   OFFSET(shadowy),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"borderw",        "set border width",      OFFSET(borderw),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
@@ -1303,7 +1305,8 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                        TextMetrics *metrics,
                        int x, int y, int borderw,
                        int canvas_x, int canvas_y,
-                       int canvas_w, int canvas_h)
+                       int canvas_w, int canvas_h,
+                       int text_w, int text_h, int canvas_loop)
 {
     DrawTextContext *s = ctx->priv;
     int g, l, x1, y1, w1, h1, idx;
@@ -1316,6 +1319,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     int line_w, offset_y = 0;
     int clip_x = 0, clip_y = 0;
     int use_canvas = canvas_w > 0 && canvas_h > 0;
+    int tile_x, tile_y;  // for looping
 
     j_left = !!(s->text_align & TA_LEFT);
     j_right = !!(s->text_align & TA_RIGHT);
@@ -1341,6 +1345,20 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
         clip_y = FFMIN(metrics->rect_y + s->box_height + s->bb_bottom, frame->height);
     }
 
+    // Determine tile range for looping
+    int tile_x_start = 0, tile_x_end = 0;
+    int tile_y_start = 0, tile_y_end = 0;
+    if (use_canvas && canvas_loop && text_w > 0 && text_h > 0) {
+        // Calculate which tiles we need to render to cover the canvas
+        // tile offset of -1 means render text shifted left by text_w, etc.
+        tile_x_start = (canvas_x / text_w) - 1;
+        tile_x_end = ((canvas_x + canvas_w) / text_w) + 1;
+        tile_y_start = (canvas_y / text_h) - 1;
+        tile_y_end = ((canvas_y + canvas_h) / text_h) + 1;
+    }
+
+    for (tile_y = tile_y_start; tile_y <= tile_y_end; ++tile_y) {
+    for (tile_x = tile_x_start; tile_x <= tile_x_end; ++tile_x) {
     for (l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
         line_w = POS_CEIL(line->width64, 64);
@@ -1359,10 +1377,14 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
             x1 = x + info->x + b_glyph->left;
             y1 = y + info->y - b_glyph->top + offset_y;
 
-            // Apply canvas viewport offset
+            // Apply canvas viewport offset and tiling
             if (use_canvas) {
                 x1 -= canvas_x;
                 y1 -= canvas_y;
+                if (canvas_loop) {
+                    x1 += tile_x * text_w;
+                    y1 += tile_y * text_h;
+                }
             }
 
             w1 = bitmap.width;
@@ -1397,6 +1419,8 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
             ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
                 bitmap.buffer + pdx, bitmap.pitch, w1, h1, 3, 0, x1, y1);
         }
+    }
+    }
     }
 
     return 0;
@@ -1856,7 +1880,8 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         if (s->shadowx || s->shadowy) {
             if ((ret = draw_glyphs(ctx, frame, &shadowcolor, &metrics,
                     s->shadowx, s->shadowy, s->borderw,
-                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h)) < 0) {
+                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
+                    metrics.width, metrics.height, s->canvas_loop)) < 0) {
                 return ret;
             }
         }
@@ -1864,13 +1889,15 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         if (s->borderw) {
             if ((ret = draw_glyphs(ctx, frame, &bordercolor, &metrics,
                     0, 0, s->borderw,
-                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h)) < 0) {
+                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
+                    metrics.width, metrics.height, s->canvas_loop)) < 0) {
                 return ret;
             }
         }
 
         if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0, 0, 0,
-                s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h)) < 0) {
+                s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
+                metrics.width, metrics.height, s->canvas_loop)) < 0) {
             return ret;
         }
     }
