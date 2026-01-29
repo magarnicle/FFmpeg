@@ -309,12 +309,16 @@ typedef struct DrawTextContext {
     int text_align;                 ///< the horizontal and vertical text alignment
     int y_align;                    ///< the value of the y_align parameter
 
-    int canvas_w;                   ///< canvas width (0 = disabled)
-    int canvas_h;                   ///< canvas height (0 = disabled)
+    char *canvas_w_expr;            ///< expression for canvas width
+    char *canvas_h_expr;            ///< expression for canvas height
     char *canvas_x_expr;            ///< expression for canvas x viewport offset
     char *canvas_y_expr;            ///< expression for canvas y viewport offset
+    AVExpr *canvas_w_pexpr;         ///< parsed expression for canvas width
+    AVExpr *canvas_h_pexpr;         ///< parsed expression for canvas height
     AVExpr *canvas_x_pexpr;         ///< parsed expression for canvas x
     AVExpr *canvas_y_pexpr;         ///< parsed expression for canvas y
+    int canvas_w;                   ///< evaluated canvas width (0 = disabled)
+    int canvas_h;                   ///< evaluated canvas height (0 = disabled)
     int canvas_x;                   ///< evaluated canvas x viewport offset
     int canvas_y;                   ///< evaluated canvas y viewport offset
     int canvas_loop;                ///< loop/tile text when canvas extends beyond text
@@ -361,8 +365,8 @@ static const AVOption drawtext_options[]= {
     {"y",              "set y expression",      OFFSET(y_expr),             AV_OPT_TYPE_STRING, {.str="0"},   0, 0, TFLAGS},
     {"boxw",           "set box width",         OFFSET(boxw),               AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
     {"boxh",           "set box height",        OFFSET(boxh),               AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
-    {"canvas_w",       "set canvas width",      OFFSET(canvas_w),           AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
-    {"canvas_h",       "set canvas height",     OFFSET(canvas_h),           AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
+    {"canvas_w",       "set canvas width expression",  OFFSET(canvas_w_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
+    {"canvas_h",       "set canvas height expression", OFFSET(canvas_h_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_x",       "set canvas x offset expression", OFFSET(canvas_x_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_y",       "set canvas y offset expression", OFFSET(canvas_y_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_loop",    "loop text when canvas exceeds text bounds", OFFSET(canvas_loop), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
@@ -1137,11 +1141,13 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
     av_expr_free(s->fontsize_pexpr);
+    av_expr_free(s->canvas_w_pexpr);
+    av_expr_free(s->canvas_h_pexpr);
     av_expr_free(s->canvas_x_pexpr);
     av_expr_free(s->canvas_y_pexpr);
 
     s->x_pexpr = s->y_pexpr = s->a_pexpr = s->fontsize_pexpr = NULL;
-    s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
+    s->canvas_w_pexpr = s->canvas_h_pexpr = s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
     av_tree_enumerate(s->glyphs, NULL, NULL, glyph_enu_free);
     av_tree_destroy(s->glyphs);
@@ -1187,10 +1193,12 @@ static int config_input(AVFilterLink *inlink)
     av_expr_free(s->x_pexpr);
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
+    av_expr_free(s->canvas_w_pexpr);
+    av_expr_free(s->canvas_h_pexpr);
     av_expr_free(s->canvas_x_pexpr);
     av_expr_free(s->canvas_y_pexpr);
     s->x_pexpr = s->y_pexpr = s->a_pexpr = NULL;
-    s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
+    s->canvas_w_pexpr = s->canvas_h_pexpr = s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
     if ((ret = av_expr_parse(&s->x_pexpr, expr = s->x_expr, var_names,
                              NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
@@ -1202,14 +1210,16 @@ static int config_input(AVFilterLink *inlink)
         return AVERROR(EINVAL);
     }
 
-    if (s->canvas_w > 0 && s->canvas_h > 0) {
-        if ((ret = av_expr_parse(&s->canvas_x_pexpr, expr = s->canvas_x_expr, var_names,
-                                 NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
-            (ret = av_expr_parse(&s->canvas_y_pexpr, expr = s->canvas_y_expr, var_names,
-                                 NULL, NULL, fun2_names, fun2, 0, ctx)) < 0) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to parse canvas expression: %s \n", expr);
-            return AVERROR(EINVAL);
-        }
+    if ((ret = av_expr_parse(&s->canvas_w_pexpr, expr = s->canvas_w_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->canvas_h_pexpr, expr = s->canvas_h_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->canvas_x_pexpr, expr = s->canvas_x_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->canvas_y_pexpr, expr = s->canvas_y_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to parse canvas expression: %s \n", expr);
+        return AVERROR(EINVAL);
     }
 
     return 0;
@@ -1348,13 +1358,15 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     // Determine tile range for looping
     int tile_x_start = 0, tile_x_end = 0;
     int tile_y_start = 0, tile_y_end = 0;
+    int tile_w = text_w + 1;  // add 1 pixel spacing between tiles
+    int tile_h = text_h + 1;
     if (use_canvas && canvas_loop && text_w > 0 && text_h > 0) {
         // Calculate which tiles we need to render to cover the canvas
-        // tile offset of -1 means render text shifted left by text_w, etc.
-        tile_x_start = (canvas_x / text_w) - 1;
-        tile_x_end = ((canvas_x + canvas_w) / text_w) + 1;
-        tile_y_start = (canvas_y / text_h) - 1;
-        tile_y_end = ((canvas_y + canvas_h) / text_h) + 1;
+        // tile offset of -1 means render text shifted left by tile_w, etc.
+        tile_x_start = (canvas_x / tile_w) - 1;
+        tile_x_end = ((canvas_x + canvas_w) / tile_w) + 1;
+        tile_y_start = (canvas_y / tile_h) - 1;
+        tile_y_end = ((canvas_y + canvas_h) / tile_h) + 1;
     }
 
     for (tile_y = tile_y_start; tile_y <= tile_y_end; ++tile_y) {
@@ -1382,8 +1394,8 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                 x1 -= canvas_x;
                 y1 -= canvas_y;
                 if (canvas_loop) {
-                    x1 += tile_x * text_w;
-                    y1 += tile_y * text_h;
+                    x1 += tile_x * tile_w;
+                    y1 += tile_y * tile_h;
                 }
             }
 
@@ -1721,8 +1733,10 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, &s->prng);
     }
 
-    /* Evaluate canvas viewport offset expressions */
-    if (s->canvas_w > 0 && s->canvas_h > 0 && s->canvas_x_pexpr && s->canvas_y_pexpr) {
+    /* Evaluate canvas expressions (evaluated after text metrics are available) */
+    s->canvas_w = av_expr_eval(s->canvas_w_pexpr, s->var_values, &s->prng);
+    s->canvas_h = av_expr_eval(s->canvas_h_pexpr, s->var_values, &s->prng);
+    if (s->canvas_w > 0 && s->canvas_h > 0) {
         s->canvas_x = av_expr_eval(s->canvas_x_pexpr, s->var_values, &s->prng);
         s->canvas_y = av_expr_eval(s->canvas_y_pexpr, s->var_values, &s->prng);
     }

@@ -12636,11 +12636,19 @@ The default value of @var{boxh} is computed automatically to match the text heig
 
 @item canvas_w
 @item canvas_h
-Set the width and height of a canvas viewport. When both are set to non-zero
-values, only the portion of the rendered text that falls within this viewport
-is displayed. This is useful for efficiently scrolling through large amounts
-of text, as only the visible glyphs are rendered.
-The default value is 0 (disabled).
+Expressions specifying the width and height of a canvas viewport. When both
+evaluate to non-zero values, only the portion of the rendered text that falls
+within this viewport is displayed. This is useful for efficiently scrolling
+through large amounts of text, as only the visible glyphs are rendered.
+The expressions accept the same variables as @var{x} and @var{y}, including
+@var{text_w}/@var{tw} and @var{text_h}/@var{th} for dynamic sizing based on
+rendered text dimensions.
+The default value is "0" (disabled).
+
+For example, to set the canvas to half the text width:
+@example
+canvas_w=tw/2:canvas_h=th
+@end example
 
 @item canvas_x
 @item canvas_y
