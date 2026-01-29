@@ -207,7 +207,15 @@ typedef struct Glyph {
     /** Outlined glyph bitmaps with 1/4 pixel precision in both directions */
     FT_BitmapGlyph border_bglyph[16];
     FT_BBox bbox;
+    struct Glyph *next;             ///< next glyph in hash bucket
 } Glyph;
+
+#define GLYPH_HASH_SIZE 256
+
+/** Hash table for O(1) glyph lookup */
+typedef struct GlyphHash {
+    Glyph *buckets[GLYPH_HASH_SIZE];
+} GlyphHash;
 
 /** Global text metrics */
 typedef struct TextMetrics {
@@ -281,7 +289,7 @@ typedef struct DrawTextContext {
     FT_Library library;             ///< freetype font library handle
     FT_Face face;                   ///< freetype font face handle
     FT_Stroker stroker;             ///< freetype stroker handle
-    struct AVTreeNode *glyphs;      ///< rendered glyphs, stored using the UTF-32 char code
+    GlyphHash glyph_hash;           ///< hash table for O(1) glyph lookup
     char *x_expr;                   ///< expression for x position
     char *y_expr;                   ///< expression for y position
     AVExpr *x_pexpr, *y_pexpr;      ///< parsed expressions for x and y
@@ -324,6 +332,13 @@ typedef struct DrawTextContext {
     int canvas_tile;                ///< loop/tile text when canvas extends beyond text
     int canvas_tile_reload;         ///< reload text file for each tile
     time_t canvas_tile_reload_mtime; ///< cached mtime for tile reload
+
+    // Caching for static text optimization
+    char *cached_text;              ///< cached copy of last rendered text
+    TextMetrics cached_metrics;     ///< cached text metrics
+    TextLine *cached_lines;         ///< cached shaped lines
+    int cached_line_count;          ///< cached line count
+    int text_changed;               ///< flag indicating text changed since last frame
 
     TextLine *lines;                ///< computed information about text lines
     int line_count;                 ///< the number of text lines
@@ -440,6 +455,73 @@ static const struct ft_error {
 #include FT_ERRORS_H
 
 #define FT_ERRMSG(e) ft_errors[e].err_msg
+
+/* Hash table functions for O(1) glyph lookup */
+static inline uint32_t glyph_hash_func(uint32_t code, unsigned int fontsize)
+{
+    return (code * 31 + fontsize) % GLYPH_HASH_SIZE;
+}
+
+static Glyph *glyph_hash_find(GlyphHash *hash, uint32_t code, unsigned int fontsize)
+{
+    uint32_t idx = glyph_hash_func(code, fontsize);
+    Glyph *g = hash->buckets[idx];
+    while (g) {
+        if (g->code == code && g->fontsize == fontsize)
+            return g;
+        g = g->next;
+    }
+    return NULL;
+}
+
+static void glyph_hash_insert(GlyphHash *hash, Glyph *glyph)
+{
+    uint32_t idx = glyph_hash_func(glyph->code, glyph->fontsize);
+    glyph->next = hash->buckets[idx];
+    hash->buckets[idx] = glyph;
+}
+
+static void glyph_hash_free(GlyphHash *hash)
+{
+    for (int i = 0; i < GLYPH_HASH_SIZE; i++) {
+        Glyph *g = hash->buckets[i];
+        while (g) {
+            Glyph *next = g->next;
+            FT_Done_Glyph(g->glyph);
+            if (g->border_glyph)
+                FT_Done_Glyph(g->border_glyph);
+            for (int t = 0; t < 16; t++) {
+                if (g->bglyph[t])
+                    FT_Done_Glyph((FT_Glyph)g->bglyph[t]);
+                if (g->border_bglyph[t])
+                    FT_Done_Glyph((FT_Glyph)g->border_bglyph[t]);
+            }
+            av_free(g);
+            g = next;
+        }
+        hash->buckets[i] = NULL;
+    }
+}
+
+static void glyph_hash_free_borders(GlyphHash *hash)
+{
+    for (int i = 0; i < GLYPH_HASH_SIZE; i++) {
+        Glyph *g = hash->buckets[i];
+        while (g) {
+            if (g->border_glyph) {
+                for (int t = 0; t < 16; t++) {
+                    if (g->border_bglyph[t]) {
+                        FT_Done_Glyph((FT_Glyph)g->border_bglyph[t]);
+                        g->border_bglyph[t] = NULL;
+                    }
+                }
+                FT_Done_Glyph(g->border_glyph);
+                g->border_glyph = NULL;
+            }
+            g = g->next;
+        }
+    }
+}
 
 static int glyph_cmp(const void *key, const void *b)
 {
@@ -752,16 +834,12 @@ static inline int get_subpixel_idx(int shift_x64, int shift_y64)
 static int load_glyph(AVFilterContext *ctx, Glyph **glyph_ptr, uint32_t code, int8_t shift_x64, int8_t shift_y64)
 {
     DrawTextContext *s = ctx->priv;
-    Glyph dummy = { 0 };
     Glyph *glyph;
     FT_Vector shift;
-    struct AVTreeNode *node = NULL;
     int ret = 0;
 
-    /* get glyph */
-    dummy.code = code;
-    dummy.fontsize = s->fontsize;
-    glyph = av_tree_find(s->glyphs, &dummy, glyph_cmp, NULL);
+    /* get glyph from hash table - O(1) lookup */
+    glyph = glyph_hash_find(&s->glyph_hash, code, s->fontsize);
     if (!glyph) {
         if (FT_Load_Glyph(s->face, code, s->ft_load_flags)) {
             return AVERROR(EINVAL);
@@ -787,12 +865,8 @@ static int load_glyph(AVFilterContext *ctx, Glyph **glyph_ptr, uint32_t code, in
         /* measure text height to calculate text_height (or the maximum text height) */
         FT_Glyph_Get_CBox(glyph->glyph, FT_GLYPH_BBOX_SUBPIXELS, &glyph->bbox);
 
-        /* cache the newly created glyph */
-        if (!(node = av_tree_node_alloc())) {
-            ret = AVERROR(ENOMEM);
-            goto error;
-        }
-        av_tree_insert(&s->glyphs, glyph, glyph_cmp, &node);
+        /* cache the newly created glyph in hash table */
+        glyph_hash_insert(&s->glyph_hash, glyph);
     } else {
         if (s->borderw && !glyph->border_glyph) {
             glyph->border_glyph = glyph->glyph;
@@ -842,7 +916,6 @@ error:
         FT_Done_Glyph(glyph->glyph);
 
     av_freep(&glyph);
-    av_freep(&node);
     return ret;
 }
 
@@ -1152,9 +1225,15 @@ static av_cold void uninit(AVFilterContext *ctx)
     s->x_pexpr = s->y_pexpr = s->a_pexpr = s->fontsize_pexpr = NULL;
     s->canvas_w_pexpr = s->canvas_h_pexpr = s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
-    av_tree_enumerate(s->glyphs, NULL, NULL, glyph_enu_free);
-    av_tree_destroy(s->glyphs);
-    s->glyphs = NULL;
+    glyph_hash_free(&s->glyph_hash);
+
+    av_freep(&s->cached_text);
+    if (s->cached_lines) {
+        for (int l = 0; l < s->cached_line_count; l++) {
+            av_freep(&s->cached_lines[l].glyphs);
+        }
+        av_freep(&s->cached_lines);
+    }
 
     FT_Done_Face(s->face);
     FT_Stroker_Done(s->stroker);
@@ -1276,7 +1355,7 @@ static int command(AVFilterContext *ctx, const char *cmd, const char *arg, char 
             FT_Stroker_Set(old->stroker, old->borderw << 6, FT_STROKER_LINECAP_ROUND,
                         FT_STROKER_LINEJOIN_ROUND, 0);
             // Dispose the old border glyphs
-            av_tree_enumerate(old->glyphs, NULL, NULL, glyph_enu_border_free);
+            glyph_hash_free_borders(&old->glyph_hash);
         } else if (strcmp(cmd, "fontsize") == 0) {
             av_expr_free(old->fontsize_pexpr);
             old->fontsize_pexpr = NULL;
@@ -1379,9 +1458,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
         line_w = POS_CEIL(line->width64, 64);
         for (g = 0; g < line->hb_data.glyph_count; ++g) {
             info = &line->glyphs[g];
-            dummy.fontsize = s->fontsize;
-            dummy.code = info->code;
-            glyph = av_tree_find(s->glyphs, &dummy, glyph_cmp, NULL);
+            glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
             if (!glyph) {
                 return AVERROR(EINVAL);
             }
