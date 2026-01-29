@@ -322,6 +322,7 @@ typedef struct DrawTextContext {
     int canvas_x;                   ///< evaluated canvas x viewport offset
     int canvas_y;                   ///< evaluated canvas y viewport offset
     int canvas_tile;                ///< loop/tile text when canvas extends beyond text
+    int canvas_tile_reload;         ///< reload text file for each tile
 
     TextLine *lines;                ///< computed information about text lines
     int line_count;                 ///< the number of text lines
@@ -369,7 +370,8 @@ static const AVOption drawtext_options[]= {
     {"canvas_h",       "set canvas height expression", OFFSET(canvas_h_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_x",       "set canvas x offset expression", OFFSET(canvas_x_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"canvas_y",       "set canvas y offset expression", OFFSET(canvas_y_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
-    {"canvas_tile",    "loop text when canvas exceeds text bounds", OFFSET(canvas_tile), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
+    {"canvas_tile",    "tile text when canvas exceeds text bounds", OFFSET(canvas_tile), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
+    {"canvas_tile_reload", "reload text file for each tile", OFFSET(canvas_tile_reload), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
     {"shadowx",        "set shadow x offset",   OFFSET(shadowx),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"shadowy",        "set shadow y offset",   OFFSET(shadowy),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"borderw",        "set border width",      OFFSET(borderw),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
@@ -1316,7 +1318,8 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                        int x, int y, int borderw,
                        int canvas_x, int canvas_y,
                        int canvas_w, int canvas_h,
-                       int text_w, int text_h, int canvas_tile)
+                       int text_w, int text_h, int canvas_tile,
+                       int single_tile, int single_tile_x, int single_tile_y)
 {
     DrawTextContext *s = ctx->priv;
     int g, l, x1, y1, w1, h1, idx;
@@ -1361,12 +1364,18 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     int tile_w = text_w + 1;  // add 1 pixel spacing between tiles
     int tile_h = text_h + 1;
     if (use_canvas && canvas_tile && text_w > 0 && text_h > 0) {
-        // Calculate which tiles we need to render to cover the canvas
-        // tile offset of -1 means render text shifted left by tile_w, etc.
-        tile_x_start = (canvas_x / tile_w) - 1;
-        tile_x_end = ((canvas_x + canvas_w) / tile_w) + 1;
-        tile_y_start = (canvas_y / tile_h) - 1;
-        tile_y_end = ((canvas_y + canvas_h) / tile_h) + 1;
+        if (single_tile) {
+            // Render only the specified tile
+            tile_x_start = tile_x_end = single_tile_x;
+            tile_y_start = tile_y_end = single_tile_y;
+        } else {
+            // Calculate which tiles we need to render to cover the canvas
+            // tile offset of -1 means render text shifted left by tile_w, etc.
+            tile_x_start = (canvas_x / tile_w) - 1;
+            tile_x_end = ((canvas_x + canvas_w) / tile_w) + 1;
+            tile_y_start = (canvas_y / tile_h) - 1;
+            tile_y_end = ((canvas_y + canvas_h) / tile_h) + 1;
+        }
     }
 
     for (tile_y = tile_y_start; tile_y <= tile_y_end; ++tile_y) {
@@ -1628,7 +1637,8 @@ done:
     return ret;
 }
 
-static int draw_text(AVFilterContext *ctx, AVFrame *frame)
+static int draw_text(AVFilterContext *ctx, AVFrame *frame,
+                     int single_tile, int single_tile_x, int single_tile_y)
 {
     DrawTextContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
@@ -1895,7 +1905,8 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             if ((ret = draw_glyphs(ctx, frame, &shadowcolor, &metrics,
                     s->shadowx, s->shadowy, s->borderw,
                     s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
-                    metrics.width, metrics.height, s->canvas_tile)) < 0) {
+                    metrics.width, metrics.height, s->canvas_tile,
+                    single_tile, single_tile_x, single_tile_y)) < 0) {
                 return ret;
             }
         }
@@ -1904,14 +1915,16 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             if ((ret = draw_glyphs(ctx, frame, &bordercolor, &metrics,
                     0, 0, s->borderw,
                     s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
-                    metrics.width, metrics.height, s->canvas_tile)) < 0) {
+                    metrics.width, metrics.height, s->canvas_tile,
+                    single_tile, single_tile_x, single_tile_y)) < 0) {
                 return ret;
             }
         }
 
         if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0, 0, 0,
                 s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
-                metrics.width, metrics.height, s->canvas_tile)) < 0) {
+                metrics.width, metrics.height, s->canvas_tile,
+                single_tile, single_tile_x, single_tile_y)) < 0) {
             return ret;
         }
     }
@@ -1985,7 +1998,50 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             s->x = bbox->x;
             s->y = bbox->y - s->fontsize;
         }
-        draw_text(ctx, frame);
+
+        if (s->canvas_tile && s->canvas_tile_reload && s->textfile) {
+            // Per-tile reload mode: calculate tile range and reload file for each tile
+            // First, do an initial draw to get text metrics for tile calculation
+            int tile_x, tile_y;
+            int tile_x_start, tile_x_end, tile_y_start, tile_y_end;
+            int text_w, text_h, tile_w, tile_h;
+
+            // Initial draw to compute metrics (will be redrawn per-tile)
+            draw_text(ctx, frame, 1, 0, 0);
+
+            // Now compute tile range based on evaluated canvas values
+            text_w = s->var_values[VAR_TEXT_W];
+            text_h = s->var_values[VAR_TEXT_H];
+            tile_w = text_w + 1;
+            tile_h = text_h + 1;
+
+            if (tile_w > 0 && tile_h > 0) {
+                tile_x_start = (s->canvas_x / tile_w) - 1;
+                tile_x_end = ((s->canvas_x + s->canvas_w) / tile_w) + 1;
+                tile_y_start = (s->canvas_y / tile_h) - 1;
+                tile_y_end = ((s->canvas_y + s->canvas_h) / tile_h) + 1;
+
+                for (tile_y = tile_y_start; tile_y <= tile_y_end; ++tile_y) {
+                    for (tile_x = tile_x_start; tile_x <= tile_x_end; ++tile_x) {
+                        // Reload text file for each tile
+                        if ((ret = ff_load_textfile(ctx, (const char *)s->textfile, &s->text, NULL)) < 0) {
+                            av_frame_free(&frame);
+                            return ret;
+                        }
+#if CONFIG_LIBFRIBIDI
+                        if (s->text_shaping)
+                            if ((ret = shape_text(ctx)) < 0) {
+                                av_frame_free(&frame);
+                                return ret;
+                            }
+#endif
+                        draw_text(ctx, frame, 1, tile_x, tile_y);
+                    }
+                }
+            }
+        } else {
+            draw_text(ctx, frame, 0, 0, 0);
+        }
     }
 
     return ff_filter_frame(outlink, frame);

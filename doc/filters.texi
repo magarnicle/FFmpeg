@@ -12665,9 +12665,15 @@ canvas_w=200:canvas_h=50:canvas_x=t*100:canvas_y=0
 @end example
 
 @item canvas_tile
-If set to 1, the text will loop/tile when the canvas viewport extends beyond
+If set to 1, the text will tile when the canvas viewport extends beyond
 the rendered text boundaries. This is useful for creating continuous scrolling
-text effects like news tickers.
+text effects like news tickers. A 1 pixel gap is added between each tile.
+The default value is 0 (disabled).
+
+@item canvas_tile_reload
+If set to 1, and @var{textfile} is specified, the text file will be re-read
+from disk for each tile. This allows each tile repetition to display different
+or updated content if the file changes. Requires @var{canvas_tile} to be enabled.
 The default value is 0 (disabled).
 
 @item shadowx
