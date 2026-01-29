@@ -309,6 +309,15 @@ typedef struct DrawTextContext {
     int text_align;                 ///< the horizontal and vertical text alignment
     int y_align;                    ///< the value of the y_align parameter
 
+    int canvas_w;                   ///< canvas width (0 = disabled)
+    int canvas_h;                   ///< canvas height (0 = disabled)
+    char *canvas_x_expr;            ///< expression for canvas x viewport offset
+    char *canvas_y_expr;            ///< expression for canvas y viewport offset
+    AVExpr *canvas_x_pexpr;         ///< parsed expression for canvas x
+    AVExpr *canvas_y_pexpr;         ///< parsed expression for canvas y
+    int canvas_x;                   ///< evaluated canvas x viewport offset
+    int canvas_y;                   ///< evaluated canvas y viewport offset
+
     TextLine *lines;                ///< computed information about text lines
     int line_count;                 ///< the number of text lines
     uint32_t *tab_clusters;         ///< the position of tab characters in the text
@@ -351,6 +360,10 @@ static const AVOption drawtext_options[]= {
     {"y",              "set y expression",      OFFSET(y_expr),             AV_OPT_TYPE_STRING, {.str="0"},   0, 0, TFLAGS},
     {"boxw",           "set box width",         OFFSET(boxw),               AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
     {"boxh",           "set box height",        OFFSET(boxh),               AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
+    {"canvas_w",       "set canvas width",      OFFSET(canvas_w),           AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
+    {"canvas_h",       "set canvas height",     OFFSET(canvas_h),           AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
+    {"canvas_x",       "set canvas x offset expression", OFFSET(canvas_x_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
+    {"canvas_y",       "set canvas y offset expression", OFFSET(canvas_y_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"shadowx",        "set shadow x offset",   OFFSET(shadowx),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"shadowy",        "set shadow y offset",   OFFSET(shadowy),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"borderw",        "set border width",      OFFSET(borderw),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
@@ -1122,8 +1135,11 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
     av_expr_free(s->fontsize_pexpr);
+    av_expr_free(s->canvas_x_pexpr);
+    av_expr_free(s->canvas_y_pexpr);
 
     s->x_pexpr = s->y_pexpr = s->a_pexpr = s->fontsize_pexpr = NULL;
+    s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
     av_tree_enumerate(s->glyphs, NULL, NULL, glyph_enu_free);
     av_tree_destroy(s->glyphs);
@@ -1169,7 +1185,10 @@ static int config_input(AVFilterLink *inlink)
     av_expr_free(s->x_pexpr);
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
+    av_expr_free(s->canvas_x_pexpr);
+    av_expr_free(s->canvas_y_pexpr);
     s->x_pexpr = s->y_pexpr = s->a_pexpr = NULL;
+    s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
     if ((ret = av_expr_parse(&s->x_pexpr, expr = s->x_expr, var_names,
                              NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
@@ -1179,6 +1198,16 @@ static int config_input(AVFilterLink *inlink)
                              NULL, NULL, fun2_names, fun2, 0, ctx)) < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to parse expression: %s \n", expr);
         return AVERROR(EINVAL);
+    }
+
+    if (s->canvas_w > 0 && s->canvas_h > 0) {
+        if ((ret = av_expr_parse(&s->canvas_x_pexpr, expr = s->canvas_x_expr, var_names,
+                                 NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+            (ret = av_expr_parse(&s->canvas_y_pexpr, expr = s->canvas_y_expr, var_names,
+                                 NULL, NULL, fun2_names, fun2, 0, ctx)) < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to parse canvas expression: %s \n", expr);
+            return AVERROR(EINVAL);
+        }
     }
 
     return 0;
@@ -1272,7 +1301,9 @@ static void update_alpha(DrawTextContext *s)
 static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                        FFDrawColor *color,
                        TextMetrics *metrics,
-                       int x, int y, int borderw)
+                       int x, int y, int borderw,
+                       int canvas_x, int canvas_y,
+                       int canvas_w, int canvas_h)
 {
     DrawTextContext *s = ctx->priv;
     int g, l, x1, y1, w1, h1, idx;
@@ -1284,6 +1315,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     uint8_t j_left = 0, j_right = 0, j_top = 0, j_bottom = 0;
     int line_w, offset_y = 0;
     int clip_x = 0, clip_y = 0;
+    int use_canvas = canvas_w > 0 && canvas_h > 0;
 
     j_left = !!(s->text_align & TA_LEFT);
     j_right = !!(s->text_align & TA_RIGHT);
@@ -1301,8 +1333,13 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
         av_log(ctx, AV_LOG_WARNING, "Tab characters are only supported with left horizontal alignment\n");
     }
 
-    clip_x = FFMIN(metrics->rect_x + s->box_width + s->bb_right, frame->width);
-    clip_y = FFMIN(metrics->rect_y + s->box_height + s->bb_bottom, frame->height);
+    if (use_canvas) {
+        clip_x = FFMIN(metrics->rect_x + canvas_w + s->bb_right, frame->width);
+        clip_y = FFMIN(metrics->rect_y + canvas_h + s->bb_bottom, frame->height);
+    } else {
+        clip_x = FFMIN(metrics->rect_x + s->box_width + s->bb_right, frame->width);
+        clip_y = FFMIN(metrics->rect_y + s->box_height + s->bb_bottom, frame->height);
+    }
 
     for (l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
@@ -1321,6 +1358,13 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
             bitmap = b_glyph->bitmap;
             x1 = x + info->x + b_glyph->left;
             y1 = y + info->y - b_glyph->top + offset_y;
+
+            // Apply canvas viewport offset
+            if (use_canvas) {
+                x1 -= canvas_x;
+                y1 -= canvas_y;
+            }
+
             w1 = bitmap.width;
             h1 = bitmap.rows;
 
@@ -1653,6 +1697,12 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, &s->prng);
     }
 
+    /* Evaluate canvas viewport offset expressions */
+    if (s->canvas_w > 0 && s->canvas_h > 0 && s->canvas_x_pexpr && s->canvas_y_pexpr) {
+        s->canvas_x = av_expr_eval(s->canvas_x_pexpr, s->var_values, &s->prng);
+        s->canvas_y = av_expr_eval(s->canvas_y_pexpr, s->var_values, &s->prng);
+    }
+
     update_alpha(s);
     update_color_with_alpha(s, &fontcolor  , s->fontcolor  );
     update_color_with_alpha(s, &shadowcolor, s->shadowcolor);
@@ -1777,18 +1827,27 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     }
 
     /* Check if the whole box is out of the frame */
-    is_outside = metrics.rect_x - s->bb_left >= width ||
-                    metrics.rect_y - s->bb_top >= height ||
-                    metrics.rect_x + s->box_width + s->bb_right <= 0 ||
-                    metrics.rect_y + s->box_height + s->bb_bottom <= 0;
+    {
+        int check_width = (s->canvas_w > 0 && s->canvas_h > 0) ? s->canvas_w : s->box_width;
+        int check_height = (s->canvas_w > 0 && s->canvas_h > 0) ? s->canvas_h : s->box_height;
+        is_outside = metrics.rect_x - s->bb_left >= width ||
+                        metrics.rect_y - s->bb_top >= height ||
+                        metrics.rect_x + check_width + s->bb_right <= 0 ||
+                        metrics.rect_y + check_height + s->bb_bottom <= 0;
+    }
 
     if (!is_outside) {
         /* draw box */
         if (s->draw_box) {
             rec_x = metrics.rect_x - s->bb_left;
             rec_y = metrics.rect_y - s->bb_top;
-            rec_width = s->box_width + s->bb_right + s->bb_left;
-            rec_height = s->box_height + s->bb_bottom + s->bb_top;
+            if (s->canvas_w > 0 && s->canvas_h > 0) {
+                rec_width = s->canvas_w + s->bb_right + s->bb_left;
+                rec_height = s->canvas_h + s->bb_bottom + s->bb_top;
+            } else {
+                rec_width = s->box_width + s->bb_right + s->bb_left;
+                rec_height = s->box_height + s->bb_bottom + s->bb_top;
+            }
             ff_blend_rectangle(&s->dc, &boxcolor,
                 frame->data, frame->linesize, width, height,
                 rec_x, rec_y, rec_width, rec_height);
@@ -1796,20 +1855,22 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
 
         if (s->shadowx || s->shadowy) {
             if ((ret = draw_glyphs(ctx, frame, &shadowcolor, &metrics,
-                    s->shadowx, s->shadowy, s->borderw)) < 0) {
+                    s->shadowx, s->shadowy, s->borderw,
+                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h)) < 0) {
                 return ret;
             }
         }
 
         if (s->borderw) {
             if ((ret = draw_glyphs(ctx, frame, &bordercolor, &metrics,
-                    0, 0, s->borderw)) < 0) {
+                    0, 0, s->borderw,
+                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h)) < 0) {
                 return ret;
             }
         }
 
-        if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0,
-                0, 0)) < 0) {
+        if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0, 0, 0,
+                s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h)) < 0) {
             return ret;
         }
     }
