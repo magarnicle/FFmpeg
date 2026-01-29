@@ -12671,9 +12671,10 @@ text effects like news tickers. A 1 pixel gap is added between each tile.
 The default value is 0 (disabled).
 
 @item canvas_tile_reload
-If set to 1, and @var{textfile} is specified, the text file will be re-read
-from disk for each tile. This allows each tile repetition to display different
-or updated content if the file changes. Requires @var{canvas_tile} to be enabled.
+If set to 1 and @var{textfile} is specified, the text file will be re-read
+from disk when its modification time changes. This allows the tiled text to
+update dynamically if the file is modified by an external process, while
+avoiding unnecessary file reads when the file hasn't changed.
 The default value is 0 (disabled).
 
 @item shadowx
