@@ -146,6 +146,11 @@ struct decklink_ctx {
     /* Output VANC queue */
     DecklinkPacketQueue vanc_queue;
 
+    /* Teletext output queue and state */
+    DecklinkPacketQueue teletext_queue;
+    int teletext_page;
+    int teletext_magazine;
+
     /* Streams present */
     int audio;
     int video;

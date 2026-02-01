@@ -504,12 +504,21 @@ static int create_s337_payload(AVPacket *pkt, uint8_t **outbuf, int *outsize)
 
 static int decklink_setup_subtitle(AVFormatContext *avctx, AVStream *st)
 {
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     int ret = -1;
 
     switch(st->codecpar->codec_id) {
 #if CONFIG_LIBKLVANC
     case AV_CODEC_ID_EIA_608:
         /* No special setup required */
+        ret = 0;
+        break;
+    case AV_CODEC_ID_DVB_TELETEXT:
+        /* Teletext for VANC output */
+        ctx->teletext_st = st;
+        ff_decklink_packet_queue_init(avctx, &ctx->teletext_queue, 1024 * 1024);
+        av_log(avctx, AV_LOG_INFO, "Teletext stream configured for VANC output\n");
         ret = 0;
         break;
 #endif
@@ -614,6 +623,10 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     klvanc_context_destroy(ctx->vanc_ctx);
 #endif
     ff_decklink_packet_queue_end(&ctx->vanc_queue);
+
+    /* Clean up teletext queue if it was used */
+    if (ctx->teletext_st)
+        ff_decklink_packet_queue_end(&ctx->teletext_queue);
 
     /* Clean up async output queue if it was used */
     if (cctx->output_buffer_size > 0) {
@@ -772,6 +785,112 @@ out:
         free(afd_words);
 }
 
+/* Build OP47 VANC packet from teletext data units
+ * OP47 is SMPTE RDD-8 which wraps EBU teletext for SDI VANC transport
+ * DID = 0x43, SDID = 0x02 (field 1) or 0x03 (field 2)
+ */
+static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                               struct klvanc_line_set_s *vanc_lines)
+{
+    AVPacket teletext_pkt;
+    int ret;
+
+    /* Process pending teletext packets */
+    while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
+        int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
+        if (pts > ctx->last_pts) {
+            /* Packet is for a future frame */
+            break;
+        }
+
+        ret = ff_decklink_packet_queue_get(&ctx->teletext_queue, &teletext_pkt, 0);
+        if (ret <= 0)
+            break;
+
+        if (teletext_pkt.pts + 1 < ctx->last_pts) {
+            av_log(avctx, AV_LOG_WARNING, "Teletext packet too old, discarding\n");
+            av_packet_unref(&teletext_pkt);
+            continue;
+        }
+
+        /* The teletext encoder outputs data units (46 bytes each)
+         * We need to build an OP47 VANC packet from these.
+         * OP47 structure:
+         *   [0-1]: Identifier (0x0151, 0x0115)
+         *   [2]: Format code (0x0102 = WST teletext)
+         *   [3-7]: 5 line descriptors
+         *   [8+]: Up to 5 x 45-byte VBI packets
+         *
+         * For simplicity, we insert raw VANC data using libklvanc.
+         * OP47 DID=0x43, SDID=0x02 (field 1) or 0x03 (field 2)
+         */
+        if (teletext_pkt.size >= 46) {
+            /* Build OP47/SDP VANC packet */
+            int num_data_units = teletext_pkt.size / 46;
+            if (num_data_units > 5)
+                num_data_units = 5;  /* OP47 supports max 5 data units */
+
+            /* OP47 packet structure for VANC:
+             * - 2 bytes: identifier (0x0151, 0x0115 in 10-bit)
+             * - 1 byte: format code
+             * - 5 x 2 bytes: line descriptors
+             * - N x 45 bytes: teletext data (without data unit header byte 0)
+             */
+            int op47_size = 2 + 1 + 10 + (num_data_units * 45);
+            uint16_t *op47_words = (uint16_t *)av_malloc(op47_size * sizeof(uint16_t));
+            if (!op47_words) {
+                av_packet_unref(&teletext_pkt);
+                continue;
+            }
+
+            int word_idx = 0;
+
+            /* Identifier */
+            op47_words[word_idx++] = 0x151;  /* ID word 1 */
+            op47_words[word_idx++] = 0x115;  /* ID word 2 */
+
+            /* Format code: 0x102 = WST teletext */
+            op47_words[word_idx++] = 0x102;
+
+            /* Line descriptors (5 entries, 2 words each) */
+            for (int i = 0; i < 5; i++) {
+                if (i < num_data_units) {
+                    uint8_t *du = teletext_pkt.data + (i * 46);
+                    /* Line number from data unit byte 2 */
+                    int line_offset = du[2] & 0x1F;
+                    int field_parity = (du[2] >> 5) & 1;
+                    /* Construct line descriptor */
+                    op47_words[word_idx++] = (field_parity << 7) | line_offset;
+                    op47_words[word_idx++] = 0x00;  /* Reserved */
+                } else {
+                    op47_words[word_idx++] = 0xFF;  /* Not used */
+                    op47_words[word_idx++] = 0xFF;
+                }
+            }
+
+            /* Teletext data (45 bytes per data unit, skipping byte 0 which is data_unit_id) */
+            for (int i = 0; i < num_data_units; i++) {
+                uint8_t *du = teletext_pkt.data + (i * 46);
+                /* Skip byte 0 (data_unit_id) and byte 1 (length), copy bytes 2-45 */
+                for (int j = 1; j < 46; j++) {
+                    op47_words[word_idx++] = du[j];
+                }
+            }
+
+            /* Insert into VANC using klvanc - line 10 is typical for teletext */
+            ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, op47_words,
+                                     word_idx, 10, 0);
+            av_free(op47_words);
+
+            if (ret != 0) {
+                av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line\n");
+            }
+        }
+
+        av_packet_unref(&teletext_pkt);
+    }
+}
+
 /* Parse any EIA-608 subtitles sitting on the queue, and write packet side data
    that will later be handled by construct_cc... */
 static void parse_608subs(AVFormatContext *avctx, struct decklink_ctx *ctx, AVPacket *pkt)
@@ -800,6 +919,10 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
     parse_608subs(avctx, ctx, pkt);
     construct_cc(avctx, ctx, pkt, &vanc_lines);
     construct_afd(avctx, ctx, pkt, &vanc_lines, st);
+
+    /* Process any pending teletext packets */
+    if (ctx->teletext_st)
+        construct_teletext(avctx, ctx, &vanc_lines);
 
     /* See if there any pending data packets to process */
     while (ff_decklink_packet_queue_size(&ctx->vanc_queue) > 0) {
@@ -1179,8 +1302,22 @@ static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    AVStream *st = avctx->streams[pkt->stream_index];
 
-    ff_ccfifo_extractbytes(&ctx->cc_fifo, pkt->data, pkt->size);
+    switch (st->codecpar->codec_id) {
+    case AV_CODEC_ID_EIA_608:
+        ff_ccfifo_extractbytes(&ctx->cc_fifo, pkt->data, pkt->size);
+        break;
+    case AV_CODEC_ID_DVB_TELETEXT:
+        /* Queue teletext packets for VANC insertion */
+        if (ff_decklink_packet_queue_put(&ctx->teletext_queue, pkt) < 0) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to queue teletext packet\n");
+        }
+        break;
+    default:
+        av_log(avctx, AV_LOG_WARNING, "Unsupported subtitle codec in packet\n");
+        break;
+    }
 
     return 0;
 }
