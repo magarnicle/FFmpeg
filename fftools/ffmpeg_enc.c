@@ -304,13 +304,12 @@ int enc_open(void *opaque, const AVFrame *frame)
     case AVMEDIA_TYPE_SUBTITLE:
         enc_ctx->time_base = AV_TIME_BASE_Q;
 
-        if (!enc_ctx->width) {
-            enc_ctx->width     = ost->ist->par->width;
-            enc_ctx->height    = ost->ist->par->height;
+        if (!enc_ctx->width && ist) {
+            enc_ctx->width     = ist->par->width;
+            enc_ctx->height    = ist->par->height;
         }
 
-        av_assert0(dec);
-        if (dec->subtitle_header) {
+        if (dec && dec->subtitle_header) {
             /* ASS code assumes this buffer is null terminated so add extra byte. */
             enc_ctx->subtitle_header = av_mallocz(dec->subtitle_header_size + 1);
             if (!enc_ctx->subtitle_header)

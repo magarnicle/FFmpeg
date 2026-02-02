@@ -241,6 +241,9 @@ int attribute_align_arg av_buffersrc_add_frame_flags(AVFilterContext *ctx, AVFra
             CHECK_AUDIO_PARAM_CHANGE(ctx, s, frame->sample_rate, frame->ch_layout,
                                      frame->format, frame->pts);
             break;
+        case AVMEDIA_TYPE_SUBTITLE:
+            /* Subtitles don't need format checking */
+            break;
         default:
             return AVERROR(EINVAL);
         }

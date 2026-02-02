@@ -864,7 +864,7 @@ static int new_stream_subtitle(Muxer *mux, const OptionsContext *o,
         AVCodecContext *subtitle_enc = ost->enc->enc_ctx;
 
         AVCodecDescriptor const *input_descriptor =
-            avcodec_descriptor_get(ost->ist->par->codec_id);
+            ost->ist ? avcodec_descriptor_get(ost->ist->par->codec_id) : NULL;
         AVCodecDescriptor const *output_descriptor =
             avcodec_descriptor_get(subtitle_enc->codec_id);
         int input_props = 0, output_props = 0;
@@ -911,8 +911,9 @@ ost_bind_filter(const Muxer *mux, MuxStream *ms, OutputFilter *ofilter,
     OutputFilterOptions opts = {
         .enc              = enc_ctx->codec,
         .name             = name,
-        .format           = (ost->type == AVMEDIA_TYPE_VIDEO) ?
-                            enc_ctx->pix_fmt : enc_ctx->sample_fmt,
+        .format           = (ost->type == AVMEDIA_TYPE_VIDEO)    ? enc_ctx->pix_fmt :
+                            (ost->type == AVMEDIA_TYPE_AUDIO)    ? enc_ctx->sample_fmt :
+                            0,  /* subtitles don't use format */
         .width            = enc_ctx->width,
         .height           = enc_ctx->height,
         .color_space      = enc_ctx->colorspace,
@@ -970,7 +971,7 @@ ost_bind_filter(const Muxer *mux, MuxStream *ms, OutputFilter *ofilter,
                                            (const void **) &opts.alpha_modes, NULL);
         if (ret < 0)
             return ret;
-    } else {
+    } else if (ost->type == AVMEDIA_TYPE_AUDIO) {
         ret = avcodec_get_supported_config(enc_ctx, NULL,
                                            AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
                                            (const void **) &opts.formats, NULL);
@@ -987,6 +988,7 @@ ost_bind_filter(const Muxer *mux, MuxStream *ms, OutputFilter *ofilter,
         if (ret < 0)
             return ret;
     }
+    /* Subtitles don't need format/config negotiation */
 
     if (threads_manual) {
         ret = av_opt_get_int(enc_ctx, "threads", 0, &opts.nb_threads);
@@ -1538,7 +1540,7 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
         goto fail;
 
     if (ost->enc &&
-        (type == AVMEDIA_TYPE_VIDEO || type == AVMEDIA_TYPE_AUDIO)) {
+        (type == AVMEDIA_TYPE_VIDEO || type == AVMEDIA_TYPE_AUDIO || type == AVMEDIA_TYPE_SUBTITLE)) {
         ret = ost_bind_filter(mux, ms, ofilter, o, enc_tb, vsync_method,
                               keep_pix_fmt, autoscale, threads_manual, vs, &src);
         if (ret < 0)

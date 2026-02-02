@@ -610,6 +610,12 @@ AVFilterFormats *ff_all_formats(enum AVMediaType type)
                 return NULL;
             fmt++;
         }
+    } else if (type == AVMEDIA_TYPE_SUBTITLE) {
+        /* Subtitles don't have formats like video/audio, but filters need
+         * a non-NULL format list for format negotiation to succeed.
+         * Use format 0 as a placeholder. */
+        if (ff_add_format(&ret, 0) < 0)
+            return NULL;
     }
 
     return ret;

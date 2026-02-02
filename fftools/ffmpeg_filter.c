@@ -713,7 +713,8 @@ static int ifilter_bind_ist(InputFilter *ifilter, InputStream *ist,
     if (ret < 0)
         return ret;
 
-    if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
+    /* Sub2video mode: subtitle stream connected to video filter */
+    if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE && ifilter->type == AVMEDIA_TYPE_VIDEO) {
         ifp->sub2video.frame = av_frame_alloc();
         if (!ifp->sub2video.frame)
             return AVERROR(ENOMEM);
@@ -2242,7 +2243,8 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
         InputFilterPriv *ifp = ifp_from_ifilter(fg->inputs[i]);
         AVFrame *tmp;
         while (av_fifo_read(ifp->frame_queue, &tmp, 1) >= 0) {
-            if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
+            /* Sub2video mode: subtitle stream connected to video filter */
+            if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE && ifilter->type == AVMEDIA_TYPE_VIDEO) {
                 sub2video_frame(&ifp->ifilter, tmp, !fgt->graph);
             } else {
                 if (ifp->type_src == AVMEDIA_TYPE_VIDEO) {
@@ -3149,6 +3151,11 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             ifp->alpha_mode != frame->alpha_mode)
             need_reinit |= VIDEO_CHANGED;
         break;
+    case AVMEDIA_TYPE_SUBTITLE:
+        /* For subtitles, reinit if this is the first frame (format unset) */
+        if (ifp->format < 0)
+            need_reinit = 1;
+        break;
     }
 
     if (sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX)) {
@@ -3404,7 +3411,8 @@ static int filter_thread(void *arg)
         ifilter   = fg->inputs[input_idx];
         ifp       = ifp_from_ifilter(ifilter);
 
-        if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
+        /* Sub2video mode: subtitle stream connected to video filter */
+        if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE && ifilter->type == AVMEDIA_TYPE_VIDEO) {
             int hb_frame = input_status >= 0 && o == FRAME_OPAQUE_SUB_HEARTBEAT;
             ret = sub2video_frame(ifilter, (fgt.frame->buf[0] || hb_frame) ? fgt.frame : NULL,
                                   !fgt.graph);
