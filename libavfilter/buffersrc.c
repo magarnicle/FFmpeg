@@ -552,6 +552,9 @@ static int config_props(AVFilterLink *link)
                 return ret;
         }
         break;
+    case AVMEDIA_TYPE_SUBTITLE:
+        /* Subtitles don't need special config */
+        break;
     default:
         return AVERROR(EINVAL);
     }
