@@ -20,7 +20,7 @@
 
 /**
  * @file
- * concat audio-video filter
+ * concat audio-video-subtitle filter
  */
 
 #include "libavutil/avstring.h"
@@ -33,7 +33,23 @@
 #include "video.h"
 #include "audio.h"
 
-#define TYPE_ALL 2
+/* Array size must accommodate AVMEDIA_TYPE_SUBTITLE which is 3 */
+#define TYPE_ALL 4
+
+/* Supported media types for concatenation */
+static const enum AVMediaType supported_types[] = {
+    AVMEDIA_TYPE_VIDEO,
+    AVMEDIA_TYPE_AUDIO,
+    AVMEDIA_TYPE_SUBTITLE,
+};
+#define NB_SUPPORTED_TYPES FF_ARRAY_ELEMS(supported_types)
+
+/* Map type to pad name character */
+static const char type_to_char[] = {
+    [AVMEDIA_TYPE_VIDEO]    = 'v',
+    [AVMEDIA_TYPE_AUDIO]    = 'a',
+    [AVMEDIA_TYPE_SUBTITLE] = 's',
+};
 
 typedef struct ConcatContext {
     const AVClass *class;
@@ -54,19 +70,23 @@ typedef struct ConcatContext {
 #define A AV_OPT_FLAG_AUDIO_PARAM
 #define F AV_OPT_FLAG_FILTERING_PARAM
 #define V AV_OPT_FLAG_VIDEO_PARAM
+#define S AV_OPT_FLAG_SUBTITLE_PARAM
 
 static const AVOption concat_options[] = {
     { "n", "specify the number of segments", OFFSET(nb_segments),
-      AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, V|A|F},
+      AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, V|A|S|F},
     { "v", "specify the number of video streams",
       OFFSET(nb_streams[AVMEDIA_TYPE_VIDEO]),
       AV_OPT_TYPE_INT, { .i64 = 1 }, 0, INT_MAX, V|F },
     { "a", "specify the number of audio streams",
       OFFSET(nb_streams[AVMEDIA_TYPE_AUDIO]),
       AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, A|F},
+    { "s", "specify the number of subtitle streams",
+      OFFSET(nb_streams[AVMEDIA_TYPE_SUBTITLE]),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, S|F},
     { "unsafe", "enable unsafe mode",
       OFFSET(unsafe),
-      AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, V|A|F},
+      AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, V|A|S|F},
     { NULL }
 };
 
@@ -77,12 +97,13 @@ static int query_formats(const AVFilterContext *ctx,
                          AVFilterFormatsConfig **cfg_out)
 {
     const ConcatContext *cat = ctx->priv;
-    unsigned type, nb_str, idx0 = 0, idx, str, seg;
+    unsigned type_idx, type, nb_str, idx0 = 0, idx, str, seg;
     AVFilterFormats *formats, *rates = NULL;
     AVFilterChannelLayouts *layouts = NULL;
     int ret;
 
-    for (type = 0; type < TYPE_ALL; type++) {
+    for (type_idx = 0; type_idx < NB_SUPPORTED_TYPES; type_idx++) {
+        type = supported_types[type_idx];
         nb_str = cat->nb_streams[type];
         for (str = 0; str < nb_str; str++) {
             idx = idx0;
@@ -131,45 +152,49 @@ static int config_output(AVFilterLink *outlink)
 
     /* enhancement: find a common one */
     outlink->time_base           = AV_TIME_BASE_Q;
-    outlink->w                   = inlink->w;
-    outlink->h                   = inlink->h;
-    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
     outlink->format              = inlink->format;
-    outl->frame_rate             = inl->frame_rate;
 
-    for (seg = 1; seg < cat->nb_segments; seg++) {
-        inlink = ctx->inputs[in_no + seg * ctx->nb_outputs];
-        inl    = ff_filter_link(inlink);
-        if (outl->frame_rate.num != inl->frame_rate.num ||
-            outl->frame_rate.den != inl->frame_rate.den) {
-            av_log(ctx, AV_LOG_VERBOSE,
-                    "Video inputs have different frame rates, output will be VFR\n");
-            outl->frame_rate = av_make_q(1, 0);
-            break;
+    /* Video-specific properties */
+    if (outlink->type == AVMEDIA_TYPE_VIDEO) {
+        outlink->w                   = inlink->w;
+        outlink->h                   = inlink->h;
+        outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
+        outl->frame_rate             = inl->frame_rate;
+
+        for (seg = 1; seg < cat->nb_segments; seg++) {
+            inlink = ctx->inputs[in_no + seg * ctx->nb_outputs];
+            inl    = ff_filter_link(inlink);
+            if (outl->frame_rate.num != inl->frame_rate.num ||
+                outl->frame_rate.den != inl->frame_rate.den) {
+                av_log(ctx, AV_LOG_VERBOSE,
+                        "Video inputs have different frame rates, output will be VFR\n");
+                outl->frame_rate = av_make_q(1, 0);
+                break;
+            }
         }
-    }
 
-    for (seg = 1; seg < cat->nb_segments; seg++) {
-        inlink = ctx->inputs[in_no + seg * ctx->nb_outputs];
-        if (!outlink->sample_aspect_ratio.num)
-            outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
-        /* possible enhancement: unsafe mode, do not check */
-        if (outlink->w                       != inlink->w                       ||
-            outlink->h                       != inlink->h                       ||
-            outlink->sample_aspect_ratio.num != inlink->sample_aspect_ratio.num &&
-                                                inlink->sample_aspect_ratio.num ||
-            outlink->sample_aspect_ratio.den != inlink->sample_aspect_ratio.den) {
-            av_log(ctx, AV_LOG_ERROR, "Input link %s parameters "
-                   "(size %dx%d, SAR %d:%d) do not match the corresponding "
-                   "output link %s parameters (%dx%d, SAR %d:%d)\n",
-                   ctx->input_pads[in_no].name, inlink->w, inlink->h,
-                   inlink->sample_aspect_ratio.num,
-                   inlink->sample_aspect_ratio.den,
-                   ctx->input_pads[out_no].name, outlink->w, outlink->h,
-                   outlink->sample_aspect_ratio.num,
-                   outlink->sample_aspect_ratio.den);
-            if (!cat->unsafe)
-                return AVERROR(EINVAL);
+        for (seg = 1; seg < cat->nb_segments; seg++) {
+            inlink = ctx->inputs[in_no + seg * ctx->nb_outputs];
+            if (!outlink->sample_aspect_ratio.num)
+                outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
+            /* possible enhancement: unsafe mode, do not check */
+            if (outlink->w                       != inlink->w                       ||
+                outlink->h                       != inlink->h                       ||
+                outlink->sample_aspect_ratio.num != inlink->sample_aspect_ratio.num &&
+                                                    inlink->sample_aspect_ratio.num ||
+                outlink->sample_aspect_ratio.den != inlink->sample_aspect_ratio.den) {
+                av_log(ctx, AV_LOG_ERROR, "Input link %s parameters "
+                       "(size %dx%d, SAR %d:%d) do not match the corresponding "
+                       "output link %s parameters (%dx%d, SAR %d:%d)\n",
+                       ctx->input_pads[in_no].name, inlink->w, inlink->h,
+                       inlink->sample_aspect_ratio.num,
+                       inlink->sample_aspect_ratio.den,
+                       ctx->input_pads[out_no].name, outlink->w, outlink->h,
+                       outlink->sample_aspect_ratio.num,
+                       outlink->sample_aspect_ratio.den);
+                if (!cat->unsafe)
+                    return AVERROR(EINVAL);
+            }
         }
     }
 
@@ -194,6 +219,9 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
         in->pts += av_rescale_q(buf->nb_samples,
                                 av_make_q(1, inlink->sample_rate),
                                 outlink->time_base);
+    else if (inlink->type == AVMEDIA_TYPE_SUBTITLE && buf->duration > 0)
+        /* use subtitle duration */
+        in->pts += buf->duration;
     else if (in->nb_frames >= 2)
         /* use mean duration */
         in->pts = av_rescale(in->pts, in->nb_frames, in->nb_frames - 1);
@@ -311,34 +339,37 @@ static int flush_segment(AVFilterContext *ctx)
 static av_cold int init(AVFilterContext *ctx)
 {
     ConcatContext *cat = ctx->priv;
-    unsigned seg, type, str;
+    unsigned seg, type_idx, type, str;
     int ret;
 
     /* create input pads */
     for (seg = 0; seg < cat->nb_segments; seg++) {
-        for (type = 0; type < TYPE_ALL; type++) {
+        for (type_idx = 0; type_idx < NB_SUPPORTED_TYPES; type_idx++) {
+            type = supported_types[type_idx];
             for (str = 0; str < cat->nb_streams[type]; str++) {
                 AVFilterPad pad = {
                     .type             = type,
                 };
                 if (type == AVMEDIA_TYPE_VIDEO)
                     pad.get_buffer.video = get_video_buffer;
-                else
+                else if (type == AVMEDIA_TYPE_AUDIO)
                     pad.get_buffer.audio = get_audio_buffer;
-                pad.name = av_asprintf("in%d:%c%d", seg, "va"[type], str);
+                /* Subtitles don't need a custom buffer getter */
+                pad.name = av_asprintf("in%d:%c%d", seg, type_to_char[type], str);
                 if ((ret = ff_append_inpad_free_name(ctx, &pad)) < 0)
                     return ret;
             }
         }
     }
     /* create output pads */
-    for (type = 0; type < TYPE_ALL; type++) {
+    for (type_idx = 0; type_idx < NB_SUPPORTED_TYPES; type_idx++) {
+        type = supported_types[type_idx];
         for (str = 0; str < cat->nb_streams[type]; str++) {
             AVFilterPad pad = {
                 .type          = type,
                 .config_props  = config_output,
             };
-            pad.name = av_asprintf("out:%c%d", "va"[type], str);
+            pad.name = av_asprintf("out:%c%d", type_to_char[type], str);
             if ((ret = ff_append_outpad_free_name(ctx, &pad)) < 0)
                 return ret;
         }
@@ -453,7 +484,7 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
 
 const FFFilter ff_avf_concat = {
     .p.name        = "concat",
-    .p.description = NULL_IF_CONFIG_SMALL("Concatenate audio and video streams."),
+    .p.description = NULL_IF_CONFIG_SMALL("Concatenate audio, video and subtitle streams."),
     .p.inputs      = NULL,
     .p.outputs     = NULL,
     .p.priv_class  = &concat_class,

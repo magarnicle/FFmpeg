@@ -1164,8 +1164,10 @@ int fg_create(FilterGraph **pfg, char **graph_desc, Scheduler *sch,
         ifilter->type  = avfilter_pad_get_type(cur->filter_ctx->input_pads,
                                                cur->pad_idx);
 
-        if (ifilter->type != AVMEDIA_TYPE_VIDEO && ifilter->type != AVMEDIA_TYPE_AUDIO) {
-            av_log(fg, AV_LOG_FATAL, "Only video and audio filters supported "
+        if (ifilter->type != AVMEDIA_TYPE_VIDEO &&
+            ifilter->type != AVMEDIA_TYPE_AUDIO &&
+            ifilter->type != AVMEDIA_TYPE_SUBTITLE) {
+            av_log(fg, AV_LOG_FATAL, "Only video, audio and subtitle filters supported "
                    "currently.\n");
             ret = AVERROR(ENOSYS);
             goto fail;
@@ -1822,12 +1824,34 @@ fail:
     return ret;
 }
 
+static int configure_output_subtitle_filter(FilterGraphPriv *fgp, AVFilterGraph *graph,
+                                            OutputFilter *ofilter, AVFilterInOut *out)
+{
+    AVFilterContext *last_filter = out->filter_ctx;
+    int pad_idx = out->pad_idx;
+    char name[255];
+    int ret;
+
+    snprintf(name, sizeof(name), "out_%s", ofilter->output_name);
+    ret = avfilter_graph_create_filter(&ofilter->filter,
+                                       avfilter_get_by_name("sbuffersink"),
+                                       name, NULL, NULL, graph);
+    if (ret < 0)
+        return ret;
+
+    if ((ret = avfilter_link(last_filter, pad_idx, ofilter->filter, 0)) < 0)
+        return ret;
+
+    return 0;
+}
+
 static int configure_output_filter(FilterGraphPriv *fgp, AVFilterGraph *graph,
                                    OutputFilter *ofilter, AVFilterInOut *out)
 {
     switch (ofilter->type) {
     case AVMEDIA_TYPE_VIDEO: return configure_output_video_filter(fgp, graph, ofilter, out);
     case AVMEDIA_TYPE_AUDIO: return configure_output_audio_filter(fgp, graph, ofilter, out);
+    case AVMEDIA_TYPE_SUBTITLE: return configure_output_subtitle_filter(fgp, graph, ofilter, out);
     default: av_assert0(0); return 0;
     }
 }
@@ -2013,12 +2037,38 @@ static int configure_input_audio_filter(FilterGraph *fg, AVFilterGraph *graph,
     return 0;
 }
 
+static int configure_input_subtitle_filter(FilterGraph *fg, AVFilterGraph *graph,
+                                           InputFilter *ifilter, AVFilterInOut *in)
+{
+    InputFilterPriv *ifp = ifp_from_ifilter(ifilter);
+    const AVFilter *sbuffer_filt = avfilter_get_by_name("sbuffer");
+    AVBPrint args;
+    char name[255];
+    int ret;
+
+    av_bprint_init(&args, 0, AV_BPRINT_SIZE_AUTOMATIC);
+    av_bprintf(&args, "time_base=%d/%d",
+               ifp->time_base.num, ifp->time_base.den);
+    snprintf(name, sizeof(name), "graph_%d_in_%s", fg->index, ifp->opts.name);
+
+    if ((ret = avfilter_graph_create_filter(&ifilter->filter, sbuffer_filt,
+                                            name, args.str, NULL,
+                                            graph)) < 0)
+        return ret;
+
+    if ((ret = avfilter_link(ifilter->filter, 0, in->filter_ctx, in->pad_idx)) < 0)
+        return ret;
+
+    return 0;
+}
+
 static int configure_input_filter(FilterGraph *fg, AVFilterGraph *graph,
                                   InputFilter *ifilter, AVFilterInOut *in)
 {
     switch (ifilter->type) {
     case AVMEDIA_TYPE_VIDEO: return configure_input_video_filter(fg, graph, ifilter, in);
     case AVMEDIA_TYPE_AUDIO: return configure_input_audio_filter(fg, graph, ifilter, in);
+    case AVMEDIA_TYPE_SUBTITLE: return configure_input_subtitle_filter(fg, graph, ifilter, in);
     default: av_assert0(0); return 0;
     }
 }
@@ -2241,8 +2291,9 @@ static int ifilter_parameters_from_frame(InputFilter *ifilter, const AVFrame *fr
     if (ret < 0)
         return ret;
 
-    ifp->time_base = (ifilter->type == AVMEDIA_TYPE_AUDIO)    ? (AVRational){ 1, frame->sample_rate } :
-                     (ifp->opts.flags & IFILTER_FLAG_CFR) ? av_inv_q(ifp->opts.framerate)         :
+    ifp->time_base = (ifilter->type == AVMEDIA_TYPE_AUDIO)      ? (AVRational){ 1, frame->sample_rate } :
+                     (ifilter->type == AVMEDIA_TYPE_SUBTITLE)  ? frame->time_base                      :
+                     (ifp->opts.flags & IFILTER_FLAG_CFR)      ? av_inv_q(ifp->opts.framerate)         :
                      frame->time_base;
 
     ifp->format              = frame->format;
