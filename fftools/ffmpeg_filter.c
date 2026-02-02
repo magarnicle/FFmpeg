@@ -2298,7 +2298,8 @@ static int ifilter_parameters_from_frame(InputFilter *ifilter, const AVFrame *fr
                      (ifp->opts.flags & IFILTER_FLAG_CFR)      ? av_inv_q(ifp->opts.framerate)         :
                      frame->time_base;
 
-    ifp->format              = frame->format;
+    /* Subtitles don't have a format like video/audio, use 0 as placeholder */
+    ifp->format              = (ifilter->type == AVMEDIA_TYPE_SUBTITLE) ? 0 : frame->format;
 
     ifp->width               = frame->width;
     ifp->height              = frame->height;
@@ -3102,10 +3103,24 @@ static int send_eof(FilterGraphThread *fgt, InputFilter *ifilter,
         }
 
         if (ifp->format < 0) {
-            av_log(ifilter->graph, AV_LOG_ERROR,
-                   "Cannot determine format of input %s after EOF\n",
-                   ifp->opts.name);
-            return AVERROR_INVALIDDATA;
+            /* Subtitles don't have a format - use 0 as placeholder */
+            if (ifilter->type == AVMEDIA_TYPE_SUBTITLE) {
+                ifp->format = 0;
+                ifp->time_base = AV_TIME_BASE_Q;
+                /* Try to configure graph now that this input has a format */
+                if (ifilter_has_all_input_formats(ifilter->graph)) {
+                    ret = configure_filtergraph(ifilter->graph, fgt);
+                    if (ret < 0) {
+                        av_log(ifilter->graph, AV_LOG_ERROR, "Error initializing filters!\n");
+                        return ret;
+                    }
+                }
+            } else {
+                av_log(ifilter->graph, AV_LOG_ERROR,
+                       "Cannot determine format of input %s after EOF\n",
+                       ifp->opts.name);
+                return AVERROR_INVALIDDATA;
+            }
         }
     }
 
