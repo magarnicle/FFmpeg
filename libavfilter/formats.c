@@ -459,11 +459,19 @@ static const AVFilterNegotiation negotiate_audio = {
     .mergers = mergers_audio,
 };
 
+/* Subtitles don't have format negotiation like video/audio,
+ * so we use an empty negotiation table with no mergers. */
+static const AVFilterNegotiation negotiate_subtitle = {
+    .nb_mergers = 0,
+    .mergers = NULL,
+};
+
 const AVFilterNegotiation *ff_filter_get_negotiation(const AVFilterLink *link)
 {
     switch (link->type) {
     case AVMEDIA_TYPE_VIDEO: return &negotiate_video;
     case AVMEDIA_TYPE_AUDIO: return &negotiate_audio;
+    case AVMEDIA_TYPE_SUBTITLE: return &negotiate_subtitle;
     default: return NULL;
     }
 }
@@ -610,6 +618,11 @@ AVFilterFormats *ff_all_formats(enum AVMediaType type)
                 return NULL;
             fmt++;
         }
+    } else if (type == AVMEDIA_TYPE_SUBTITLE) {
+        /* Subtitles don't have format enumeration like video/audio.
+         * Return a single-element list with format 0 as a placeholder. */
+        if (ff_add_format(&ret, 0) < 0)
+            return NULL;
     }
 
     return ret;

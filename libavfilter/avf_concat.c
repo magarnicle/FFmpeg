@@ -121,24 +121,10 @@ static int query_formats(const AVFilterContext *ctx,
         }
     }
 
-    /* Handle subtitle streams - no format negotiation needed */
-    for (str = 0; str < cat->nb_subtitle_streams; str++) {
-        idx = idx0;
-
-        /* Set the output formats for subtitles */
-        formats = ff_all_formats(AVMEDIA_TYPE_SUBTITLE);
-        if ((ret = ff_formats_ref(formats, &cfg_out[idx]->formats)) < 0)
-            return ret;
-
-        /* Set the same formats for each corresponding input */
-        for (seg = 0; seg < cat->nb_segments; seg++) {
-            if ((ret = ff_formats_ref(formats, &cfg_in[idx]->formats)) < 0)
-                return ret;
-            idx += ctx->nb_outputs;
-        }
-
-        idx0++;
-    }
+    /* Subtitle streams don't have format negotiation like video/audio.
+     * There's no pixel format or sample format for subtitles, so we
+     * simply skip format setup for subtitle pads. */
+    (void)cat->nb_subtitle_streams; /* silence unused warning */
 
     return 0;
 }

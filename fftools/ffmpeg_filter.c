@@ -713,7 +713,9 @@ static int ifilter_bind_ist(InputFilter *ifilter, InputStream *ist,
     if (ret < 0)
         return ret;
 
-    if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
+    /* sub2video: convert subtitle to video if filter expects video input */
+    if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE &&
+        ifilter->type == AVMEDIA_TYPE_VIDEO) {
         ifp->sub2video.frame = av_frame_alloc();
         if (!ifp->sub2video.frame)
             return AVERROR(ENOMEM);
@@ -2044,12 +2046,17 @@ static int configure_input_subtitle_filter(FilterGraph *fg, AVFilterGraph *graph
     char name[255];
     char args[255];
     int ret;
+    AVRational time_base = ifp->time_base;
+
+    /* Use AV_TIME_BASE_Q if time_base not set yet */
+    if (!time_base.num || !time_base.den)
+        time_base = AV_TIME_BASE_Q;
 
     snprintf(name, sizeof(name), "graph %d input from stream %s", fg->index,
              ifp->opts.name);
 
     snprintf(args, sizeof(args), "time_base=%d/%d",
-             ifp->time_base.num, ifp->time_base.den);
+             time_base.num, time_base.den);
 
     ret = avfilter_graph_create_filter(&ifilter->filter, buffer_filt,
                                        name, args, NULL, graph);
@@ -2242,7 +2249,9 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
         InputFilterPriv *ifp = ifp_from_ifilter(fg->inputs[i]);
         AVFrame *tmp;
         while (av_fifo_read(ifp->frame_queue, &tmp, 1) >= 0) {
-            if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
+            if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE &&
+                ifilter->type == AVMEDIA_TYPE_VIDEO) {
+                /* sub2video: convert subtitle to video */
                 sub2video_frame(&ifp->ifilter, tmp, !fgt->graph);
             } else {
                 if (ifp->type_src == AVMEDIA_TYPE_VIDEO) {
@@ -2295,7 +2304,9 @@ static int ifilter_parameters_from_frame(InputFilter *ifilter, const AVFrame *fr
                      (ifp->opts.flags & IFILTER_FLAG_CFR) ? av_inv_q(ifp->opts.framerate)         :
                      frame->time_base;
 
-    ifp->format              = frame->format;
+    /* Subtitle frames don't have a format field like video/audio do,
+     * so use 0 as a sentinel to indicate "format is known" */
+    ifp->format              = (ifilter->type == AVMEDIA_TYPE_SUBTITLE) ? 0 : frame->format;
 
     ifp->width               = frame->width;
     ifp->height              = frame->height;
@@ -3067,7 +3078,10 @@ static int send_eof(FilterGraphThread *fgt, InputFilter *ifilter,
     } else {
         if (ifp->format < 0) {
             // the filtergraph was never configured, use the fallback parameters
-            ifp->format                 = ifp->opts.fallback->format;
+            /* Subtitle inputs don't have a format field like video/audio,
+             * so use 0 as a sentinel to indicate "format is known" */
+            ifp->format                 = (ifilter->type == AVMEDIA_TYPE_SUBTITLE) ? 0 :
+                                          ifp->opts.fallback->format;
             ifp->sample_rate            = ifp->opts.fallback->sample_rate;
             ifp->width                  = ifp->opts.fallback->width;
             ifp->height                 = ifp->opts.fallback->height;
@@ -3147,6 +3161,13 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             ifp->color_range != frame->color_range ||
             ifp->alpha_mode != frame->alpha_mode)
             need_reinit |= VIDEO_CHANGED;
+        break;
+    case AVMEDIA_TYPE_SUBTITLE:
+        /* Subtitles don't have format negotiation like video/audio,
+         * but we need to set ifp->format on the first frame so that
+         * ifilter_has_all_input_formats() returns true */
+        if (ifp->format < 0)
+            need_reinit = 1;
         break;
     }
 
@@ -3403,7 +3424,9 @@ static int filter_thread(void *arg)
         ifilter   = fg->inputs[input_idx];
         ifp       = ifp_from_ifilter(ifilter);
 
-        if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
+        if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE &&
+            ifilter->type == AVMEDIA_TYPE_VIDEO) {
+            /* sub2video: convert subtitle to video for video filter input */
             int hb_frame = input_status >= 0 && o == FRAME_OPAQUE_SUB_HEARTBEAT;
             ret = sub2video_frame(ifilter, (fgt.frame->buf[0] || hb_frame) ? fgt.frame : NULL,
                                   !fgt.graph);

@@ -241,6 +241,9 @@ int attribute_align_arg av_buffersrc_add_frame_flags(AVFilterContext *ctx, AVFra
             CHECK_AUDIO_PARAM_CHANGE(ctx, s, frame->sample_rate, frame->ch_layout,
                                      frame->format, frame->pts);
             break;
+        case AVMEDIA_TYPE_SUBTITLE:
+            /* No format checking needed for subtitles */
+            break;
         default:
             return AVERROR(EINVAL);
         }
@@ -551,6 +554,9 @@ static int config_props(AVFilterLink *link)
             if (ret < 0)
                 return ret;
         }
+        break;
+    case AVMEDIA_TYPE_SUBTITLE:
+        /* Subtitles don't have video dimensions or audio channel layout */
         break;
     default:
         return AVERROR(EINVAL);
