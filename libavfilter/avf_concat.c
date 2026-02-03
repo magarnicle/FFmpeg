@@ -210,11 +210,16 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
         in->pts += av_rescale_q(buf->nb_samples,
                                 av_make_q(1, inlink->sample_rate),
                                 outlink->time_base);
+    else if (inlink->type == AVMEDIA_TYPE_SUBTITLE && buf->duration > 0)
+        /* use subtitle end time (pts + duration) for segment boundary calculation */
+        in->pts = buf->pts + buf->duration;
     else if (in->nb_frames >= 2)
         /* use mean duration */
         in->pts = av_rescale(in->pts, in->nb_frames, in->nb_frames - 1);
 
     buf->pts += cat->delta_ts;
+    av_log(ctx, AV_LOG_DEBUG, "push_frame: output pts=%"PRId64" (delta=%"PRId64")\n",
+           buf->pts, cat->delta_ts);
     return ff_filter_frame(outlink, buf);
 }
 

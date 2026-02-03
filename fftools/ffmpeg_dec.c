@@ -682,14 +682,21 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
     // on AVFrames, so we wrap AVSubtitle in an AVBufferRef and put that
     // inside the frame
     // eventually, subtitles should be switched to use AVFrames natively
+
+    // Save pts/duration before subtitle_wrap_frame clears the subtitle struct
+    frame->pts       = subtitle.pts;
+    frame->time_base = AV_TIME_BASE_Q;
+    frame->duration  = av_rescale_q(subtitle.end_display_time - subtitle.start_display_time,
+                                    (AVRational){1, 1000}, AV_TIME_BASE_Q);
+
     ret = subtitle_wrap_frame(frame, &subtitle, 0);
     if (ret < 0) {
         avsubtitle_free(&subtitle);
         return ret;
     }
 
-    frame->width  = dp->dec_ctx->width;
-    frame->height = dp->dec_ctx->height;
+    frame->width     = dp->dec_ctx->width;
+    frame->height    = dp->dec_ctx->height;
 
     return process_subtitle(dp, frame);
 }

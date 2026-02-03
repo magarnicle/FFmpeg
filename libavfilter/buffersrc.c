@@ -163,6 +163,9 @@ int av_buffersrc_parameters_set(AVFilterContext *ctx, AVBufferSrcParameters *par
                 return ret;
         }
         break;
+    case AVMEDIA_TYPE_SUBTITLE:
+        /* Subtitles don't have format-specific parameters like video/audio */
+        break;
     default:
         return AVERROR_BUG;
     }
@@ -218,6 +221,9 @@ int attribute_align_arg av_buffersrc_add_frame_flags(AVFilterContext *ctx, AVFra
         return av_buffersrc_close(ctx, s->last_pts, flags);
     if (s->eof)
         return AVERROR_EOF;
+
+    av_log(ctx, AV_LOG_DEBUG, "buffersrc: adding frame type=%d pts=%"PRId64" duration=%"PRId64"\n",
+           ctx->outputs[0]->type, frame->pts, frame->duration);
 
     s->last_pts = frame->pts + frame->duration;
 

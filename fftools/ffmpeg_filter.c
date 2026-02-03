@@ -2093,7 +2093,8 @@ static int filter_is_buffersrc(const AVFilterContext *f)
 {
     return f->nb_inputs == 0 &&
            (!strcmp(f->filter->name, "buffer") ||
-            !strcmp(f->filter->name, "abuffer"));
+            !strcmp(f->filter->name, "abuffer") ||
+            !strcmp(f->filter->name, "sbuffer"));
 }
 
 static int graph_is_meta(AVFilterGraph *graph)
@@ -3221,6 +3222,8 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
             return AVERROR(ENOMEM);
 
         if (!ifilter_has_all_input_formats(fg)) {
+            av_log(fg, AV_LOG_DEBUG, "send_frame: queuing frame for input %s pts=%"PRId64"\n",
+                   ifilter->name, frame->pts);
             av_frame_move_ref(tmp, frame);
 
             ret = av_fifo_write(ifp->frame_queue, &tmp, 1);
@@ -3393,6 +3396,8 @@ static int filter_thread(void *arg)
 
         input_status = sch_filter_receive(fgp->sch, fgp->sch_idx,
                                           &input_idx, fgt.frame);
+        av_log(fg, AV_LOG_DEBUG, "sch_filter_receive: status=%d input_idx=%u nb_inputs=%d\n",
+               input_status, input_idx, fg->nb_inputs);
         if (input_status == AVERROR_EOF) {
             av_log(fg, AV_LOG_VERBOSE, "Filtering thread received EOF\n");
             break;
@@ -3424,6 +3429,8 @@ static int filter_thread(void *arg)
         ifilter   = fg->inputs[input_idx];
         ifp       = ifp_from_ifilter(ifilter);
 
+        av_log(fg, AV_LOG_DEBUG, "filter_thread: input_idx=%u type_src=%d ifilter_type=%d buf[0]=%p opaque=%d\n",
+               input_idx, ifp->type_src, ifilter->type, (void*)fgt.frame->buf[0], (int)(intptr_t)fgt.frame->opaque);
         if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE &&
             ifilter->type == AVMEDIA_TYPE_VIDEO) {
             /* sub2video: convert subtitle to video for video filter input */
@@ -3431,7 +3438,11 @@ static int filter_thread(void *arg)
             ret = sub2video_frame(ifilter, (fgt.frame->buf[0] || hb_frame) ? fgt.frame : NULL,
                                   !fgt.graph);
         } else if (fgt.frame->buf[0]) {
+            av_log(fg, AV_LOG_VERBOSE, "filter_thread: calling send_frame for input %u\n", input_idx);
             ret = send_frame(fg, &fgt, ifilter, fgt.frame);
+        } else if (o == FRAME_OPAQUE_SUB_HEARTBEAT) {
+            /* Heartbeat frames are only needed for sub2video, skip for native subtitle filters */
+            ret = 0;
         } else {
             av_assert1(o == FRAME_OPAQUE_EOF);
             ret = send_eof(&fgt, ifilter, fgt.frame->pts, fgt.frame->time_base);
