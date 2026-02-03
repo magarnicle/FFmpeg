@@ -27,6 +27,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavcodec/avcodec.h"
 #include "avfilter.h"
 #include "filters.h"
 #include "formats.h"
@@ -218,8 +219,15 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
         in->pts = av_rescale(in->pts, in->nb_frames, in->nb_frames - 1);
 
     buf->pts += cat->delta_ts;
-    av_log(ctx, AV_LOG_DEBUG, "push_frame: output pts=%"PRId64" (delta=%"PRId64")\n",
-           buf->pts, cat->delta_ts);
+
+    /* For subtitle frames, also update the embedded AVSubtitle.pts */
+    if (inlink->type == AVMEDIA_TYPE_SUBTITLE && buf->buf[0]) {
+        AVSubtitle *sub = (AVSubtitle *)buf->buf[0]->data;
+        if (sub) {
+            int64_t delta_us = av_rescale_q(cat->delta_ts, outlink->time_base, AV_TIME_BASE_Q);
+            sub->pts += delta_us;
+        }
+    }
     return ff_filter_frame(outlink, buf);
 }
 
