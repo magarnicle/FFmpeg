@@ -1561,7 +1561,9 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
 
         ret = pthread_create(&ctx->output_thread, NULL, decklink_output_thread, ctx);
         if (ret != 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to create async output thread: %s\n", av_err2str(AVERROR(ret)));
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, AVERROR(ret));
+            av_log(avctx, AV_LOG_ERROR, "Failed to create async output thread: %s\n", errbuf);
             ff_decklink_packet_queue_end(&ctx->output_queue);
             goto error;
         }
