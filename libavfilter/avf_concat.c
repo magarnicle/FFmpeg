@@ -120,6 +120,26 @@ static int query_formats(const AVFilterContext *ctx,
             idx0++;
         }
     }
+
+    /* Handle subtitle streams - no format negotiation needed */
+    for (str = 0; str < cat->nb_subtitle_streams; str++) {
+        idx = idx0;
+
+        /* Set the output formats for subtitles */
+        formats = ff_all_formats(AVMEDIA_TYPE_SUBTITLE);
+        if ((ret = ff_formats_ref(formats, &cfg_out[idx]->formats)) < 0)
+            return ret;
+
+        /* Set the same formats for each corresponding input */
+        for (seg = 0; seg < cat->nb_segments; seg++) {
+            if ((ret = ff_formats_ref(formats, &cfg_in[idx]->formats)) < 0)
+                return ret;
+            idx += ctx->nb_outputs;
+        }
+
+        idx0++;
+    }
+
     return 0;
 }
 
@@ -135,10 +155,16 @@ static int config_output(AVFilterLink *outlink)
 
     /* enhancement: find a common one */
     outlink->time_base           = AV_TIME_BASE_Q;
+    outlink->format              = inlink->format;
+
+    /* Subtitle streams don't have video-specific properties */
+    if (outlink->type == AVMEDIA_TYPE_SUBTITLE) {
+        return 0;
+    }
+
     outlink->w                   = inlink->w;
     outlink->h                   = inlink->h;
     outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
-    outlink->format              = inlink->format;
     outl->frame_rate             = inl->frame_rate;
 
     for (seg = 1; seg < cat->nb_segments; seg++) {
