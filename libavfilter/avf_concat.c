@@ -38,6 +38,7 @@
 typedef struct ConcatContext {
     const AVClass *class;
     unsigned nb_streams[TYPE_ALL]; /**< number of out streams of each type */
+    unsigned nb_subtitle_streams;  /**< number of subtitle streams (placeholder, not yet implemented) */
     unsigned nb_segments;
     unsigned cur_idx; /**< index of the first input of current segment */
     int64_t delta_ts; /**< timestamp to add to produce output timestamps */
@@ -64,6 +65,9 @@ static const AVOption concat_options[] = {
     { "a", "specify the number of audio streams",
       OFFSET(nb_streams[AVMEDIA_TYPE_AUDIO]),
       AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, A|F},
+    { "s", "specify the number of subtitle streams (not yet implemented)",
+      OFFSET(nb_subtitle_streams),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, V|A|F},
     { "unsafe", "enable unsafe mode",
       OFFSET(unsafe),
       AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, V|A|F},
