@@ -458,8 +458,14 @@ static int ost_get_filters(const OptionsContext *o, AVFormatContext *oc,
 #endif
     if (filters)
         *dst = av_strdup(filters);
+    else if (ost->type == AVMEDIA_TYPE_VIDEO)
+        *dst = av_strdup("null");
+    else if (ost->type == AVMEDIA_TYPE_AUDIO)
+        *dst = av_strdup("anull");
+    else if (ost->type == AVMEDIA_TYPE_SUBTITLE)
+        *dst = av_strdup("snull");
     else
-        *dst = av_strdup(ost->type == AVMEDIA_TYPE_VIDEO ? "null" : "anull");
+        return AVERROR(EINVAL);
     return *dst ? 0 : AVERROR(ENOMEM);
 }
 
