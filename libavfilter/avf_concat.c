@@ -334,6 +334,15 @@ static av_cold int init(AVFilterContext *ctx)
                     return ret;
             }
         }
+        /* create subtitle input pads for this segment */
+        for (str = 0; str < cat->nb_subtitle_streams; str++) {
+            AVFilterPad pad = {
+                .type             = AVMEDIA_TYPE_SUBTITLE,
+            };
+            pad.name = av_asprintf("in%d:s%d", seg, str);
+            if ((ret = ff_append_inpad_free_name(ctx, &pad)) < 0)
+                return ret;
+        }
     }
     /* create output pads */
     for (type = 0; type < TYPE_ALL; type++) {
@@ -346,6 +355,16 @@ static av_cold int init(AVFilterContext *ctx)
             if ((ret = ff_append_outpad_free_name(ctx, &pad)) < 0)
                 return ret;
         }
+    }
+    /* create subtitle output pads */
+    for (str = 0; str < cat->nb_subtitle_streams; str++) {
+        AVFilterPad pad = {
+            .type          = AVMEDIA_TYPE_SUBTITLE,
+            .config_props  = config_output,
+        };
+        pad.name = av_asprintf("out:s%d", str);
+        if ((ret = ff_append_outpad_free_name(ctx, &pad)) < 0)
+            return ret;
     }
 
     cat->in = av_calloc(ctx->nb_inputs, sizeof(*cat->in));
