@@ -631,3 +631,45 @@ const FFFilter ff_asrc_abuffer = {
     FILTER_OUTPUTS(avfilter_asrc_abuffer_outputs),
     FILTER_QUERY_FUNC2(query_formats),
 };
+
+static const AVFilterPad avfilter_ssrc_sbuffer_outputs[] = {
+    {
+        .name          = "default",
+        .type          = AVMEDIA_TYPE_SUBTITLE,
+        .config_props  = config_props,
+    },
+};
+
+static av_cold int init_subtitle(AVFilterContext *ctx)
+{
+    BufferSourceContext *c = ctx->priv;
+
+    if (av_q2d(c->time_base) <= 0) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid time base %d/%d\n", c->time_base.num, c->time_base.den);
+        return AVERROR(EINVAL);
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE, "tb:%d/%d\n",
+           c->time_base.num, c->time_base.den);
+
+    return 0;
+}
+
+static const AVOption sbuffer_options[] = {
+    { "time_base",     NULL,                     OFFSET(time_base),        AV_OPT_TYPE_RATIONAL, { .dbl = 0 }, 0, DBL_MAX, AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_SUBTITLE_PARAM },
+    { NULL },
+};
+
+AVFILTER_DEFINE_CLASS(sbuffer);
+
+const FFFilter ff_ssrc_sbuffer = {
+    .p.name        = "sbuffer",
+    .p.description = NULL_IF_CONFIG_SMALL("Buffer subtitle frames, and make them accessible to the filterchain."),
+    .p.priv_class  = &sbuffer_class,
+    .priv_size     = sizeof(BufferSourceContext),
+    .activate  = activate,
+    .init      = init_subtitle,
+    .uninit    = uninit,
+
+    FILTER_OUTPUTS(avfilter_ssrc_sbuffer_outputs),
+};

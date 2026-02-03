@@ -598,3 +598,21 @@ const FFFilter ff_asink_abuffer = {
     FILTER_INPUTS(inputs_audio),
     FILTER_QUERY_FUNC2(asink_query_formats),
 };
+
+static const AVFilterPad inputs_subtitle[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_SUBTITLE,
+    },
+};
+
+const FFFilter ff_ssink_sbuffer = {
+    .p.name        = "sbuffersink",
+    .p.description = NULL_IF_CONFIG_SMALL("Buffer subtitle frames, and make them available to the end of the filter graph."),
+    .p.outputs     = NULL,
+    .priv_size     = sizeof(BufferSinkContext),
+    .init          = common_init,
+    .uninit        = uninit,
+    .activate      = activate,
+    FILTER_INPUTS(inputs_subtitle),
+};
