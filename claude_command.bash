@@ -1,1 +1,1 @@
-./ffmpeg -loglevel debug -y -i AU109958-M.mov -i AU109958-M.srt -i AU109958-M.mov -i AU109958-M.srt -filter_complex "[0:v][0:a][1:s][2:v][2:a][3:s]concat=n=2:v=1:a=1:s=1[vid][aud][sub]" -map "[vid]" -map "[aud]" -map "[sub]" -c:s mov_text test.mov 2>&1
+./ffmpeg -loglevel info -y -i AU109958-M.mov -i AU109958-M.srt -i AU109958-M.mov -i AU109958-M.srt -filter_complex "[0:v][0:a][1:s][2:v][2:a][3:s]concat=n=2:v=1:a=1:s=1[vid][aud][sub]" -map "[vid]" -map "[aud]" -map "[sub]" -c:s teletext -c:v v210 -f decklink "DeckLink SDI 4K" 2>&1

@@ -896,7 +896,7 @@ static void log_teletext_packet(AVFormatContext *avctx, AVPacket *pkt)
             text_buf[--len] = '\0';
 
         /* Log all rows, even empty ones, for debugging */
-        av_log(avctx, AV_LOG_DEBUG, "  Row %2d: \"%s\"%s\n",
+        av_log(avctx, AV_LOG_INFO, "  Row %2d: \"%s\"%s\n",
                row, len > 0 ? text_buf : "(empty)",
                row == 0 ? " [header]" : "");
     }
