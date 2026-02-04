@@ -387,6 +387,7 @@ extern const FFFilter ff_vf_noformat;
 extern const FFFilter ff_vf_noise;
 extern const FFFilter ff_vf_normalize;
 extern const FFFilter ff_vf_null;
+extern const FFFilter ff_sf_snull;
 extern const FFFilter ff_vf_ocr;
 extern const FFFilter ff_vf_ocv;
 extern const FFFilter ff_vf_oscilloscope;
@@ -627,8 +628,10 @@ extern const FFFilter ff_avsrc_movie;
  * being the same while having different 'types'). */
 extern  const FFFilter ff_asrc_abuffer;
 extern  const FFFilter ff_vsrc_buffer;
+extern  const FFFilter ff_ssrc_sbuffer;
 extern  const FFFilter ff_asink_abuffer;
 extern  const FFFilter ff_vsink_buffer;
+extern  const FFFilter ff_ssink_sbuffer;
 
 #include "libavfilter/filter_list.c"
 

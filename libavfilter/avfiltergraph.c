@@ -315,6 +315,10 @@ static int filter_link_check_formats(void *log, AVFilterLink *link, AVFilterForm
             return ret;
         break;
 
+    case AVMEDIA_TYPE_SUBTITLE:
+        /* Subtitles don't have format negotiation like video/audio */
+        break;
+
     default:
         av_assert0(!"reached");
     }

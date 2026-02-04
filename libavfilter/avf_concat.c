@@ -27,6 +27,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavcodec/avcodec.h"
 #include "avfilter.h"
 #include "filters.h"
 #include "formats.h"
@@ -38,6 +39,7 @@
 typedef struct ConcatContext {
     const AVClass *class;
     unsigned nb_streams[TYPE_ALL]; /**< number of out streams of each type */
+    unsigned nb_subtitle_streams;  /**< number of subtitle streams (placeholder, not yet implemented) */
     unsigned nb_segments;
     unsigned cur_idx; /**< index of the first input of current segment */
     int64_t delta_ts; /**< timestamp to add to produce output timestamps */
@@ -67,6 +69,9 @@ static const AVOption concat_options[] = {
     { "a", "specify the number of audio streams",
       OFFSET(nb_streams[AVMEDIA_TYPE_AUDIO]),
       AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, A|F},
+    { "s", "specify the number of subtitle streams (not yet implemented)",
+      OFFSET(nb_subtitle_streams),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, V|A|F},
     { "unsafe", "enable unsafe mode",
       OFFSET(unsafe),
       AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, V|A|F},
@@ -122,6 +127,12 @@ static int query_formats(const AVFilterContext *ctx,
             idx0++;
         }
     }
+
+    /* Subtitle streams don't have format negotiation like video/audio.
+     * There's no pixel format or sample format for subtitles, so we
+     * simply skip format setup for subtitle pads. */
+    (void)cat->nb_subtitle_streams; /* silence unused warning */
+
     return 0;
 }
 
@@ -137,10 +148,16 @@ static int config_output(AVFilterLink *outlink)
 
     /* enhancement: find a common one */
     outlink->time_base           = AV_TIME_BASE_Q;
+    outlink->format              = inlink->format;
+
+    /* Subtitle streams don't have video-specific properties */
+    if (outlink->type == AVMEDIA_TYPE_SUBTITLE) {
+        return 0;
+    }
+
     outlink->w                   = inlink->w;
     outlink->h                   = inlink->h;
     outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
-    outlink->format              = inlink->format;
     outl->frame_rate             = inl->frame_rate;
 
     for (seg = 1; seg < cat->nb_segments; seg++) {
@@ -220,11 +237,23 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
         in->pts += av_rescale_q(buf->nb_samples,
                                 av_make_q(1, inlink->sample_rate),
                                 outlink->time_base);
+    else if (inlink->type == AVMEDIA_TYPE_SUBTITLE && buf->duration > 0)
+        /* use subtitle end time (pts + duration) for segment boundary calculation */
+        in->pts = buf->pts + buf->duration;
     else if (in->nb_frames >= 2)
         /* use mean duration */
         in->pts = av_rescale(in->pts, in->nb_frames, in->nb_frames - 1);
 
     buf->pts += cat->delta_ts;
+
+    /* For subtitle frames, also update the embedded AVSubtitle.pts */
+    if (inlink->type == AVMEDIA_TYPE_SUBTITLE && buf->buf[0]) {
+        AVSubtitle *sub = (AVSubtitle *)buf->buf[0]->data;
+        if (sub) {
+            int64_t delta_us = av_rescale_q(cat->delta_ts, outlink->time_base, AV_TIME_BASE_Q);
+            sub->pts += delta_us;
+        }
+    }
     return ff_filter_frame(outlink, buf);
 }
 
@@ -362,6 +391,15 @@ static av_cold int init(AVFilterContext *ctx)
                     return ret;
             }
         }
+        /* create subtitle input pads for this segment */
+        for (str = 0; str < cat->nb_subtitle_streams; str++) {
+            AVFilterPad pad = {
+                .type             = AVMEDIA_TYPE_SUBTITLE,
+            };
+            pad.name = av_asprintf("in%d:s%d", seg, str);
+            if ((ret = ff_append_inpad_free_name(ctx, &pad)) < 0)
+                return ret;
+        }
     }
     /* create output pads */
     for (type = 0; type < TYPE_ALL; type++) {
@@ -374,6 +412,16 @@ static av_cold int init(AVFilterContext *ctx)
             if ((ret = ff_append_outpad_free_name(ctx, &pad)) < 0)
                 return ret;
         }
+    }
+    /* create subtitle output pads */
+    for (str = 0; str < cat->nb_subtitle_streams; str++) {
+        AVFilterPad pad = {
+            .type          = AVMEDIA_TYPE_SUBTITLE,
+            .config_props  = config_output,
+        };
+        pad.name = av_asprintf("out:s%d", str);
+        if ((ret = ff_append_outpad_free_name(ctx, &pad)) < 0)
+            return ret;
     }
 
     cat->in = av_calloc(ctx->nb_inputs, sizeof(*cat->in));

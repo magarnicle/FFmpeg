@@ -304,13 +304,12 @@ int enc_open(void *opaque, const AVFrame *frame)
     case AVMEDIA_TYPE_SUBTITLE:
         enc_ctx->time_base = AV_TIME_BASE_Q;
 
-        if (!enc_ctx->width) {
+        if (!enc_ctx->width && ost->ist) {
             enc_ctx->width     = ost->ist->par->width;
             enc_ctx->height    = ost->ist->par->height;
         }
 
-        av_assert0(dec);
-        if (dec->subtitle_header) {
+        if (dec && dec->subtitle_header) {
             /* ASS code assumes this buffer is null terminated so add extra byte. */
             enc_ctx->subtitle_header = av_mallocz(dec->subtitle_header_size + 1);
             if (!enc_ctx->subtitle_header)
@@ -318,6 +317,46 @@ int enc_open(void *opaque, const AVFrame *frame)
             memcpy(enc_ctx->subtitle_header, dec->subtitle_header,
                    dec->subtitle_header_size);
             enc_ctx->subtitle_header_size = dec->subtitle_header_size;
+        } else if (!enc_ctx->subtitle_header) {
+            /* Create a default ASS header for subtitle encoders that need it
+             * (e.g. when subtitles come from filter graphs without a decoder) */
+            static const char default_ass_header[] =
+                "[Script Info]\n"
+                "ScriptType: v4.00+\n"
+                "PlayResX: 384\n"
+                "PlayResY: 288\n"
+                "ScaledBorderAndShadow: yes\n"
+                "YCbCr Matrix: None\n"
+                "\n"
+                "[V4+ Styles]\n"
+                "Format: Name, "
+                "Fontname, Fontsize, "
+                "PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+                "Bold, Italic, Underline, StrikeOut, "
+                "ScaleX, ScaleY, "
+                "Spacing, Angle, "
+                "BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, "
+                "Encoding\n"
+                "Style: "
+                "Default,"             /* Name */
+                "Arial,16,"            /* Font{name,size} */
+                "&Hffffff,&Hffffff,&H0,&H0," /* {Primary,Secondary,Outline,Back}Colour */
+                "0,0,0,0,"             /* Bold, Italic, Underline, StrikeOut */
+                "100,100,"             /* Scale{X,Y} */
+                "0,0,"                 /* Spacing, Angle */
+                "1,1,0,"               /* BorderStyle, Outline, Shadow */
+                "2,10,10,10,"          /* Alignment, Margin[LRV] */
+                "1\n"                  /* Encoding */
+                "\n"
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+
+            enc_ctx->subtitle_header = av_mallocz(sizeof(default_ass_header));
+            if (!enc_ctx->subtitle_header)
+                return AVERROR(ENOMEM);
+            memcpy(enc_ctx->subtitle_header, default_ass_header, sizeof(default_ass_header) - 1);
+            enc_ctx->subtitle_header_size = sizeof(default_ass_header) - 1;
         }
 
         break;

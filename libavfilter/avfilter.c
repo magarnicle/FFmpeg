@@ -1086,7 +1086,7 @@ int ff_filter_frame(AVFilterLink *link, AVFrame *frame)
         }
 
         frame->sample_aspect_ratio = link->sample_aspect_ratio;
-    } else {
+    } else if (link->type == AVMEDIA_TYPE_AUDIO) {
         if (frame->format != link->format) {
             av_log(link->dst, AV_LOG_ERROR, "Format change is not supported\n");
             goto error;
@@ -1103,6 +1103,7 @@ int ff_filter_frame(AVFilterLink *link, AVFrame *frame)
         frame->duration = av_rescale_q(frame->nb_samples, (AVRational){ 1, frame->sample_rate },
                                        link->time_base);
     }
+    /* Subtitles don't have video dimensions or audio sample rates to check */
 
     li->frame_blocked_in = li->frame_wanted_out = 0;
     li->l.frame_count_in++;

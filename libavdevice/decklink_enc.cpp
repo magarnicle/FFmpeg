@@ -504,12 +504,21 @@ static int create_s337_payload(AVPacket *pkt, uint8_t **outbuf, int *outsize)
 
 static int decklink_setup_subtitle(AVFormatContext *avctx, AVStream *st)
 {
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     int ret = -1;
 
     switch(st->codecpar->codec_id) {
 #if CONFIG_LIBKLVANC
     case AV_CODEC_ID_EIA_608:
         /* No special setup required */
+        ret = 0;
+        break;
+    case AV_CODEC_ID_DVB_TELETEXT:
+        /* Teletext for VANC output */
+        ctx->teletext_st = st;
+        ff_decklink_packet_queue_init(avctx, &ctx->teletext_queue, 1024 * 1024);
+        av_log(avctx, AV_LOG_INFO, "Teletext stream configured for VANC output\n");
         ret = 0;
         break;
 #endif
@@ -614,6 +623,10 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     klvanc_context_destroy(ctx->vanc_ctx);
 #endif
     ff_decklink_packet_queue_end(&ctx->vanc_queue);
+
+    /* Clean up teletext queue if it was used */
+    if (ctx->teletext_st)
+        ff_decklink_packet_queue_end(&ctx->teletext_queue);
 
     /* Clean up async output queue if it was used */
     if (cctx->output_buffer_size > 0) {
@@ -775,6 +788,236 @@ out:
         free(afd_words);
 }
 
+/* Convert 8-bit byte to 10-bit VANC word with proper parity
+ * Bit 8 = even parity of bits 0-7
+ * Bit 9 = NOT bit 8
+ */
+static inline uint16_t vanc_parity(uint8_t byte)
+{
+    int p = byte;
+    p ^= p >> 4;
+    p ^= p >> 2;
+    p ^= p >> 1;
+    int b8 = (~p) & 1;  /* even parity */
+    int b9 = !b8;
+    return (b9 << 9) | (b8 << 8) | byte;
+}
+
+/* Hamming 8/4 decode table: maps encoded byte to 4-bit value (0xFF = invalid) */
+static const uint8_t ham84_decode[256] = {
+    0x01, 0xFF, 0x01, 0x01, 0xFF, 0x00, 0x01, 0xFF,
+    0xFF, 0x02, 0x01, 0xFF, 0x0A, 0xFF, 0xFF, 0x07,
+    0xFF, 0x00, 0x01, 0xFF, 0x00, 0x00, 0xFF, 0x00,
+    0x06, 0xFF, 0xFF, 0x0B, 0xFF, 0x00, 0x03, 0xFF,
+    0xFF, 0x0C, 0x01, 0xFF, 0x04, 0xFF, 0xFF, 0x07,
+    0x06, 0xFF, 0xFF, 0x07, 0xFF, 0x07, 0x07, 0x07,
+    0x06, 0xFF, 0xFF, 0x05, 0xFF, 0x00, 0x0D, 0xFF,
+    0x06, 0x06, 0x06, 0xFF, 0x06, 0xFF, 0xFF, 0x07,
+    0xFF, 0x02, 0x01, 0xFF, 0x04, 0xFF, 0xFF, 0x09,
+    0x02, 0x02, 0xFF, 0x02, 0xFF, 0x02, 0x03, 0xFF,
+    0x08, 0xFF, 0xFF, 0x05, 0xFF, 0x00, 0x03, 0xFF,
+    0xFF, 0x02, 0x03, 0xFF, 0x03, 0xFF, 0x03, 0x03,
+    0x04, 0xFF, 0xFF, 0x05, 0x04, 0x04, 0x04, 0xFF,
+    0xFF, 0x02, 0x0F, 0xFF, 0x04, 0xFF, 0xFF, 0x07,
+    0xFF, 0x05, 0x05, 0x05, 0x04, 0xFF, 0xFF, 0x05,
+    0x06, 0xFF, 0xFF, 0x05, 0xFF, 0x0E, 0x03, 0xFF,
+    0xFF, 0x0C, 0x01, 0xFF, 0x0A, 0xFF, 0xFF, 0x09,
+    0x0A, 0xFF, 0xFF, 0x0B, 0x0A, 0x0A, 0x0A, 0xFF,
+    0x08, 0xFF, 0xFF, 0x0B, 0xFF, 0x00, 0x0D, 0xFF,
+    0xFF, 0x0B, 0x0B, 0x0B, 0x0A, 0xFF, 0xFF, 0x0B,
+    0x0C, 0x0C, 0xFF, 0x0C, 0xFF, 0x0C, 0x0D, 0xFF,
+    0xFF, 0x0C, 0x0F, 0xFF, 0x0A, 0xFF, 0xFF, 0x07,
+    0xFF, 0x0C, 0x0D, 0xFF, 0x0D, 0xFF, 0x0D, 0x0D,
+    0x06, 0xFF, 0xFF, 0x0B, 0xFF, 0x0E, 0x0D, 0xFF,
+    0x08, 0xFF, 0xFF, 0x09, 0xFF, 0x09, 0x09, 0x09,
+    0xFF, 0x02, 0x0F, 0xFF, 0x0A, 0xFF, 0xFF, 0x09,
+    0x08, 0x08, 0x08, 0xFF, 0x08, 0xFF, 0xFF, 0x09,
+    0x08, 0xFF, 0xFF, 0x0B, 0xFF, 0x0E, 0x03, 0xFF,
+    0xFF, 0x0C, 0x0F, 0xFF, 0x04, 0xFF, 0xFF, 0x09,
+    0x0F, 0xFF, 0x0F, 0x0F, 0xFF, 0x0E, 0x0F, 0xFF,
+    0x08, 0xFF, 0xFF, 0x05, 0xFF, 0x0E, 0x0D, 0xFF,
+    0xFF, 0x0E, 0x0F, 0xFF, 0x0E, 0x0E, 0xFF, 0x0E,
+};
+
+/* Extract and log text content from teletext data units for debugging.
+ * Teletext data unit structure (46 bytes):
+ *   [0]: data_unit_id
+ *   [1]: data_unit_length
+ *   [2]: field_parity + line_offset
+ *   [3]: framing_code
+ *   [4-5]: magazine/row address (Hamming 8/4 encoded)
+ *   [6-45]: 40 characters with odd parity
+ *
+ * Row encoding in teletext:
+ *   byte 4: magazine (bits 0-2) + row bit 0 (bit 3)
+ *   byte 5: row bits 1-4
+ *   Full row = (decoded_byte5 << 1) | ((decoded_byte4 >> 3) & 1)
+ */
+static void log_teletext_packet(AVFormatContext *avctx, AVPacket *pkt)
+{
+    int num_data_units = pkt->size / 46;
+    char text_buf[41];  /* 40 chars + null terminator */
+
+    av_log(avctx, AV_LOG_DEBUG, "Teletext packet: %d data units, %d bytes\n",
+           num_data_units, pkt->size);
+
+    for (int i = 0; i < num_data_units; i++) {
+        uint8_t *du = pkt->data + (i * 46);
+
+        /* Decode Hamming 8/4 encoded magazine/row bytes */
+        uint8_t byte4_decoded = ham84_decode[du[4]];
+        uint8_t byte5_decoded = ham84_decode[du[5]];
+
+        int row;
+        if (byte4_decoded == 0xFF || byte5_decoded == 0xFF) {
+            /* Hamming decode error - show raw values */
+            row = -1;
+            av_log(avctx, AV_LOG_DEBUG, "  Data unit %d: Hamming error (raw: %02X %02X)\n",
+                   i, du[4], du[5]);
+        } else {
+            /* Row = (row bits 1-4 from byte5) << 1 | (row bit 0 from byte4 bit 3) */
+            int row_bit0 = (byte4_decoded >> 3) & 1;
+            row = (byte5_decoded << 1) | row_bit0;
+        }
+
+        /* Extract 40 characters, stripping odd parity (bit 7) */
+        for (int j = 0; j < 40; j++) {
+            uint8_t c = du[6 + j] & 0x7F;  /* Strip parity bit */
+            /* Convert control codes and non-printable to spaces */
+            if (c < 0x20 || c > 0x7E)
+                c = ' ';
+            text_buf[j] = c;
+        }
+        text_buf[40] = '\0';
+
+        /* Trim trailing spaces for cleaner output */
+        int len = 40;
+        while (len > 0 && text_buf[len - 1] == ' ')
+            text_buf[--len] = '\0';
+
+        /* Log all rows, even empty ones, for debugging */
+        av_log(avctx, AV_LOG_DEBUG, "  Row %2d: \"%s\"%s\n",
+               row, len > 0 ? text_buf : "(empty)",
+               row == 0 ? " [header]" : "");
+    }
+}
+
+/* Build OP47 VANC packet from teletext data units
+ * OP47 is SMPTE RDD-8 which wraps EBU teletext for SDI VANC transport
+ * VANC packet format: DID=0x43, SDID=0x02 (field 1) or 0x03 (field 2)
+ */
+static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                               struct klvanc_line_set_s *vanc_lines)
+{
+    AVPacket teletext_pkt;
+    int ret;
+
+    /* Process pending teletext packets */
+    while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
+        int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
+        if (pts > ctx->last_pts) {
+            /* Packet is for a future frame */
+            break;
+        }
+
+        ret = ff_decklink_packet_queue_get(&ctx->teletext_queue, &teletext_pkt, 0);
+        if (ret <= 0)
+            break;
+
+        if (teletext_pkt.pts + 1 < ctx->last_pts) {
+            av_log(avctx, AV_LOG_WARNING, "Teletext packet too old, discarding\n");
+            av_packet_unref(&teletext_pkt);
+            continue;
+        }
+
+        /* Log teletext content at debug level */
+        log_teletext_packet(avctx, &teletext_pkt);
+
+        /* The teletext encoder outputs data units (46 bytes each)
+         * We build an OP47/SDP VANC packet per SMPTE RDD-8.
+         *
+         * VANC packet structure (10-bit words with parity):
+         *   DID = 0x43
+         *   SDID = 0x02 (field 1)
+         *   DC = data count
+         *   Payload = OP47 structure
+         *
+         * OP47 payload structure:
+         *   [0-1]: Identifier (0x51, 0x15)
+         *   [2]: Format code (0x02 = WST teletext)
+         *   [3-12]: 5 line descriptors (2 bytes each)
+         *   [13+]: Up to 5 x 45-byte teletext packets
+         */
+        if (teletext_pkt.size >= 46) {
+            int num_data_units = teletext_pkt.size / 46;
+            if (num_data_units > 5)
+                num_data_units = 5;  /* OP47 supports max 5 data units */
+
+            /* Calculate payload size:
+             * 2 (identifier) + 1 (format) + 10 (5 line descriptors) + N*45 (teletext data)
+             */
+            int payload_size = 2 + 1 + 10 + (num_data_units * 45);
+
+            /* VANC words: DID + SDID + DC + payload */
+            int vanc_word_count = 3 + payload_size;
+            uint16_t *vanc_words = (uint16_t *)av_malloc(vanc_word_count * sizeof(uint16_t));
+            if (!vanc_words) {
+                av_packet_unref(&teletext_pkt);
+                continue;
+            }
+
+            int idx = 0;
+
+            /* VANC header - DID, SDID, DC with parity */
+            vanc_words[idx++] = vanc_parity(0x43);       /* DID for OP47 */
+            vanc_words[idx++] = vanc_parity(0x02);       /* SDID for field 1 */
+            vanc_words[idx++] = vanc_parity(payload_size & 0xFF);  /* DC */
+
+            /* OP47 identifier */
+            vanc_words[idx++] = vanc_parity(0x51);
+            vanc_words[idx++] = vanc_parity(0x15);
+
+            /* Format code: 0x02 = WST teletext */
+            vanc_words[idx++] = vanc_parity(0x02);
+
+            /* 5 line descriptors (2 bytes each) */
+            for (int i = 0; i < 5; i++) {
+                if (i < num_data_units) {
+                    uint8_t *du = teletext_pkt.data + (i * 46);
+                    /* First byte: field_parity (bit 7) + line_offset (bits 0-4) */
+                    uint8_t field_line = du[2];  /* Already has field/line info */
+                    vanc_words[idx++] = vanc_parity(field_line);
+                    /* Second byte: wrapping/framing info */
+                    vanc_words[idx++] = vanc_parity(du[3]);  /* Framing code */
+                } else {
+                    vanc_words[idx++] = vanc_parity(0xFF);  /* Not used */
+                    vanc_words[idx++] = vanc_parity(0xFF);
+                }
+            }
+
+            /* Teletext data - 45 bytes per data unit (skip data_unit_id byte) */
+            for (int i = 0; i < num_data_units; i++) {
+                uint8_t *du = teletext_pkt.data + (i * 46);
+                /* Copy bytes 1-45 (skip byte 0 which is data_unit_id) */
+                for (int j = 1; j < 46; j++) {
+                    vanc_words[idx++] = vanc_parity(du[j]);
+                }
+            }
+
+            /* Insert into VANC line 12 (typical for OP47 teletext in PAL) */
+            ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                     idx, 12, 0);
+            av_free(vanc_words);
+
+            if (ret != 0) {
+                av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line: %d\n", ret);
+            }
+        }
+
+        av_packet_unref(&teletext_pkt);
+    }
+}
+
 /* Parse any EIA-608 subtitles sitting on the queue, and write packet side data
    that will later be handled by construct_cc... */
 static void parse_608subs(AVFormatContext *avctx, struct decklink_ctx *ctx, AVPacket *pkt)
@@ -803,6 +1046,10 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
     parse_608subs(avctx, ctx, pkt);
     construct_cc(avctx, ctx, pkt, &vanc_lines);
     construct_afd(avctx, ctx, pkt, &vanc_lines, st);
+
+    /* Process any pending teletext packets */
+    if (ctx->teletext_st)
+        construct_teletext(avctx, ctx, &vanc_lines);
 
     /* See if there any pending data packets to process */
     while (ff_decklink_packet_queue_size(&ctx->vanc_queue) > 0) {
@@ -1225,8 +1472,22 @@ static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    AVStream *st = avctx->streams[pkt->stream_index];
 
-    ff_ccfifo_extractbytes(&ctx->cc_fifo, pkt->data, pkt->size);
+    switch (st->codecpar->codec_id) {
+    case AV_CODEC_ID_EIA_608:
+        ff_ccfifo_extractbytes(&ctx->cc_fifo, pkt->data, pkt->size);
+        break;
+    case AV_CODEC_ID_DVB_TELETEXT:
+        /* Queue teletext packets for VANC insertion */
+        if (ff_decklink_packet_queue_put(&ctx->teletext_queue, pkt) < 0) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to queue teletext packet\n");
+        }
+        break;
+    default:
+        av_log(avctx, AV_LOG_WARNING, "Unsupported subtitle codec in packet\n");
+        break;
+    }
 
     return 0;
 }
@@ -1346,7 +1607,9 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
 
         ret = pthread_create(&ctx->output_thread, NULL, decklink_output_thread, ctx);
         if (ret != 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to create async output thread: %s\n", av_err2str(AVERROR(ret)));
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, AVERROR(ret));
+            av_log(avctx, AV_LOG_ERROR, "Failed to create async output thread: %s\n", errbuf);
             ff_decklink_packet_queue_end(&ctx->output_queue);
             goto error;
         }

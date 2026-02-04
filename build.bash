@@ -22,6 +22,7 @@ PATH="$HOME/bin:$PATH" PKG_CONFIG_PATH="$HOME/ffmpeg_build/lib/pkgconfig:/usr/bi
 --enable-libvpx \
 --enable-libx264 \
 --enable-libx265 \
+--enable-libklvanc \
 --enable-nonfree \
 --enable-decklink
 #--enable-swscale-alpha
