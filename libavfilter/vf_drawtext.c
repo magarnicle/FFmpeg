@@ -194,6 +194,9 @@ typedef struct TextLine {
     HarfbuzzData hb_data;           ///< libharfbuzz data of this text line
     GlyphInfo* glyphs;              ///< array of glyphs in this text line
     int cluster_offset;             ///< the offset at which this line begins
+    int is_shaped;                  ///< 1 if shaped, 0 if skipped for viewport optimization
+    const char *text_start;         ///< pointer to start of line in text buffer
+    int text_len;                   ///< byte length of this line
 } TextLine;
 
 /** A glyph as loaded and rendered using libfreetype */
@@ -207,7 +210,15 @@ typedef struct Glyph {
     /** Outlined glyph bitmaps with 1/4 pixel precision in both directions */
     FT_BitmapGlyph border_bglyph[16];
     FT_BBox bbox;
+    struct Glyph *next;             ///< next glyph in hash bucket
 } Glyph;
+
+#define GLYPH_HASH_SIZE 256
+
+/** Hash table for O(1) glyph lookup */
+typedef struct GlyphHash {
+    Glyph *buckets[GLYPH_HASH_SIZE];
+} GlyphHash;
 
 /** Global text metrics */
 typedef struct TextMetrics {
@@ -281,7 +292,7 @@ typedef struct DrawTextContext {
     FT_Library library;             ///< freetype font library handle
     FT_Face face;                   ///< freetype font face handle
     FT_Stroker stroker;             ///< freetype stroker handle
-    struct AVTreeNode *glyphs;      ///< rendered glyphs, stored using the UTF-32 char code
+    GlyphHash glyph_hash;           ///< hash table for O(1) glyph lookup
     char *x_expr;                   ///< expression for x position
     char *y_expr;                   ///< expression for y position
     AVExpr *x_pexpr, *y_pexpr;      ///< parsed expressions for x and y
@@ -308,6 +319,29 @@ typedef struct DrawTextContext {
     int boxh;                       ///< the value of the boxh parameter
     int text_align;                 ///< the horizontal and vertical text alignment
     int y_align;                    ///< the value of the y_align parameter
+
+    char *canvas_w_expr;            ///< expression for canvas width
+    char *canvas_h_expr;            ///< expression for canvas height
+    char *canvas_x_expr;            ///< expression for canvas x viewport offset
+    char *canvas_y_expr;            ///< expression for canvas y viewport offset
+    AVExpr *canvas_w_pexpr;         ///< parsed expression for canvas width
+    AVExpr *canvas_h_pexpr;         ///< parsed expression for canvas height
+    AVExpr *canvas_x_pexpr;         ///< parsed expression for canvas x
+    AVExpr *canvas_y_pexpr;         ///< parsed expression for canvas y
+    int canvas_w;                   ///< evaluated canvas width (0 = disabled)
+    int canvas_h;                   ///< evaluated canvas height (0 = disabled)
+    int canvas_x;                   ///< evaluated canvas x viewport offset
+    int canvas_y;                   ///< evaluated canvas y viewport offset
+    int canvas_tile;                ///< loop/tile text when canvas extends beyond text
+    int canvas_tile_reload;         ///< reload text file for each tile
+    time_t canvas_tile_reload_mtime; ///< cached mtime for tile reload
+
+    // Caching for static text optimization
+    char *cached_text;              ///< cached copy of last rendered text
+    TextMetrics cached_metrics;     ///< cached text metrics
+    TextLine *cached_lines;         ///< cached shaped lines
+    int cached_line_count;          ///< cached line count
+    int text_changed;               ///< flag indicating text changed since last frame
 
     TextLine *lines;                ///< computed information about text lines
     int line_count;                 ///< the number of text lines
@@ -351,6 +385,12 @@ static const AVOption drawtext_options[]= {
     {"y",              "set y expression",      OFFSET(y_expr),             AV_OPT_TYPE_STRING, {.str="0"},   0, 0, TFLAGS},
     {"boxw",           "set box width",         OFFSET(boxw),               AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
     {"boxh",           "set box height",        OFFSET(boxh),               AV_OPT_TYPE_INT,    {.i64=0},     0, INT_MAX, TFLAGS},
+    {"canvas_w",       "set canvas width expression",  OFFSET(canvas_w_expr), AV_OPT_TYPE_STRING, {.str="w"}, 0, 0, TFLAGS},
+    {"canvas_h",       "set canvas height expression", OFFSET(canvas_h_expr), AV_OPT_TYPE_STRING, {.str="h"}, 0, 0, TFLAGS},
+    {"canvas_x",       "set canvas x offset expression", OFFSET(canvas_x_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
+    {"canvas_y",       "set canvas y offset expression", OFFSET(canvas_y_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
+    {"canvas_tile",    "tile text when canvas exceeds text bounds", OFFSET(canvas_tile), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
+    {"canvas_tile_reload", "reload text file for each tile", OFFSET(canvas_tile_reload), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, TFLAGS},
     {"shadowx",        "set shadow x offset",   OFFSET(shadowx),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"shadowy",        "set shadow y offset",   OFFSET(shadowy),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"borderw",        "set border width",      OFFSET(borderw),            AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
@@ -418,6 +458,73 @@ static const struct ft_error {
 #include FT_ERRORS_H
 
 #define FT_ERRMSG(e) ft_errors[e].err_msg
+
+/* Hash table functions for O(1) glyph lookup */
+static inline uint32_t glyph_hash_func(uint32_t code, unsigned int fontsize)
+{
+    return (code * 31 + fontsize) % GLYPH_HASH_SIZE;
+}
+
+static Glyph *glyph_hash_find(GlyphHash *hash, uint32_t code, unsigned int fontsize)
+{
+    uint32_t idx = glyph_hash_func(code, fontsize);
+    Glyph *g = hash->buckets[idx];
+    while (g) {
+        if (g->code == code && g->fontsize == fontsize)
+            return g;
+        g = g->next;
+    }
+    return NULL;
+}
+
+static void glyph_hash_insert(GlyphHash *hash, Glyph *glyph)
+{
+    uint32_t idx = glyph_hash_func(glyph->code, glyph->fontsize);
+    glyph->next = hash->buckets[idx];
+    hash->buckets[idx] = glyph;
+}
+
+static void glyph_hash_free(GlyphHash *hash)
+{
+    for (int i = 0; i < GLYPH_HASH_SIZE; i++) {
+        Glyph *g = hash->buckets[i];
+        while (g) {
+            Glyph *next = g->next;
+            FT_Done_Glyph(g->glyph);
+            if (g->border_glyph)
+                FT_Done_Glyph(g->border_glyph);
+            for (int t = 0; t < 16; t++) {
+                if (g->bglyph[t])
+                    FT_Done_Glyph((FT_Glyph)g->bglyph[t]);
+                if (g->border_bglyph[t])
+                    FT_Done_Glyph((FT_Glyph)g->border_bglyph[t]);
+            }
+            av_free(g);
+            g = next;
+        }
+        hash->buckets[i] = NULL;
+    }
+}
+
+static void glyph_hash_free_borders(GlyphHash *hash)
+{
+    for (int i = 0; i < GLYPH_HASH_SIZE; i++) {
+        Glyph *g = hash->buckets[i];
+        while (g) {
+            if (g->border_glyph) {
+                for (int t = 0; t < 16; t++) {
+                    if (g->border_bglyph[t]) {
+                        FT_Done_Glyph((FT_Glyph)g->border_bglyph[t]);
+                        g->border_bglyph[t] = NULL;
+                    }
+                }
+                FT_Done_Glyph(g->border_glyph);
+                g->border_glyph = NULL;
+            }
+            g = g->next;
+        }
+    }
+}
 
 static int glyph_cmp(const void *key, const void *b)
 {
@@ -730,16 +837,12 @@ static inline int get_subpixel_idx(int shift_x64, int shift_y64)
 static int load_glyph(AVFilterContext *ctx, Glyph **glyph_ptr, uint32_t code, int8_t shift_x64, int8_t shift_y64)
 {
     DrawTextContext *s = ctx->priv;
-    Glyph dummy = { 0 };
     Glyph *glyph;
     FT_Vector shift;
-    struct AVTreeNode *node = NULL;
     int ret = 0;
 
-    /* get glyph */
-    dummy.code = code;
-    dummy.fontsize = s->fontsize;
-    glyph = av_tree_find(s->glyphs, &dummy, glyph_cmp, NULL);
+    /* get glyph from hash table - O(1) lookup */
+    glyph = glyph_hash_find(&s->glyph_hash, code, s->fontsize);
     if (!glyph) {
         if (FT_Load_Glyph(s->face, code, s->ft_load_flags)) {
             return AVERROR(EINVAL);
@@ -765,12 +868,8 @@ static int load_glyph(AVFilterContext *ctx, Glyph **glyph_ptr, uint32_t code, in
         /* measure text height to calculate text_height (or the maximum text height) */
         FT_Glyph_Get_CBox(glyph->glyph, FT_GLYPH_BBOX_SUBPIXELS, &glyph->bbox);
 
-        /* cache the newly created glyph */
-        if (!(node = av_tree_node_alloc())) {
-            ret = AVERROR(ENOMEM);
-            goto error;
-        }
-        av_tree_insert(&s->glyphs, glyph, glyph_cmp, &node);
+        /* cache the newly created glyph in hash table */
+        glyph_hash_insert(&s->glyph_hash, glyph);
     } else {
         if (s->borderw && !glyph->border_glyph) {
             glyph->border_glyph = glyph->glyph;
@@ -820,7 +919,6 @@ error:
         FT_Done_Glyph(glyph->glyph);
 
     av_freep(&glyph);
-    av_freep(&node);
     return ret;
 }
 
@@ -1122,12 +1220,23 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
     av_expr_free(s->fontsize_pexpr);
+    av_expr_free(s->canvas_w_pexpr);
+    av_expr_free(s->canvas_h_pexpr);
+    av_expr_free(s->canvas_x_pexpr);
+    av_expr_free(s->canvas_y_pexpr);
 
     s->x_pexpr = s->y_pexpr = s->a_pexpr = s->fontsize_pexpr = NULL;
+    s->canvas_w_pexpr = s->canvas_h_pexpr = s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
-    av_tree_enumerate(s->glyphs, NULL, NULL, glyph_enu_free);
-    av_tree_destroy(s->glyphs);
-    s->glyphs = NULL;
+    glyph_hash_free(&s->glyph_hash);
+
+    av_freep(&s->cached_text);
+    if (s->cached_lines) {
+        for (int l = 0; l < s->cached_line_count; l++) {
+            av_freep(&s->cached_lines[l].glyphs);
+        }
+        av_freep(&s->cached_lines);
+    }
 
     FT_Done_Face(s->face);
     FT_Stroker_Done(s->stroker);
@@ -1169,7 +1278,12 @@ static int config_input(AVFilterLink *inlink)
     av_expr_free(s->x_pexpr);
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
+    av_expr_free(s->canvas_w_pexpr);
+    av_expr_free(s->canvas_h_pexpr);
+    av_expr_free(s->canvas_x_pexpr);
+    av_expr_free(s->canvas_y_pexpr);
     s->x_pexpr = s->y_pexpr = s->a_pexpr = NULL;
+    s->canvas_w_pexpr = s->canvas_h_pexpr = s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
     if ((ret = av_expr_parse(&s->x_pexpr, expr = s->x_expr, var_names,
                              NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
@@ -1178,6 +1292,18 @@ static int config_input(AVFilterLink *inlink)
         (ret = av_expr_parse(&s->a_pexpr, expr = s->a_expr, var_names,
                              NULL, NULL, fun2_names, fun2, 0, ctx)) < 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to parse expression: %s \n", expr);
+        return AVERROR(EINVAL);
+    }
+
+    if ((ret = av_expr_parse(&s->canvas_w_pexpr, expr = s->canvas_w_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->canvas_h_pexpr, expr = s->canvas_h_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->canvas_x_pexpr, expr = s->canvas_x_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->canvas_y_pexpr, expr = s->canvas_y_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to parse canvas expression: %s \n", expr);
         return AVERROR(EINVAL);
     }
 
@@ -1232,7 +1358,7 @@ static int command(AVFilterContext *ctx, const char *cmd, const char *arg, char 
             FT_Stroker_Set(old->stroker, old->borderw << 6, FT_STROKER_LINECAP_ROUND,
                         FT_STROKER_LINEJOIN_ROUND, 0);
             // Dispose the old border glyphs
-            av_tree_enumerate(old->glyphs, NULL, NULL, glyph_enu_border_free);
+            glyph_hash_free_borders(&old->glyph_hash);
         } else if (strcmp(cmd, "fontsize") == 0) {
             av_expr_free(old->fontsize_pexpr);
             old->fontsize_pexpr = NULL;
@@ -1272,7 +1398,10 @@ static void update_alpha(DrawTextContext *s)
 static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                        FFDrawColor *color,
                        TextMetrics *metrics,
-                       int x, int y, int borderw)
+                       int x, int y, int borderw,
+                       int canvas_x, int canvas_y,
+                       int canvas_w, int canvas_h,
+                       int text_w, int text_h, int canvas_tile)
 {
     DrawTextContext *s = ctx->priv;
     int g, l, x1, y1, w1, h1, idx;
@@ -1284,6 +1413,8 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     uint8_t j_left = 0, j_right = 0, j_top = 0, j_bottom = 0;
     int line_w, offset_y = 0;
     int clip_x = 0, clip_y = 0;
+    int use_canvas = canvas_w > 0 && canvas_h > 0;
+    int tile_x, tile_y;  // for looping
 
     j_left = !!(s->text_align & TA_LEFT);
     j_right = !!(s->text_align & TA_RIGHT);
@@ -1301,17 +1432,42 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
         av_log(ctx, AV_LOG_WARNING, "Tab characters are only supported with left horizontal alignment\n");
     }
 
-    clip_x = FFMIN(metrics->rect_x + s->box_width + s->bb_right, frame->width);
-    clip_y = FFMIN(metrics->rect_y + s->box_height + s->bb_bottom, frame->height);
+    if (use_canvas) {
+        clip_x = FFMIN(metrics->rect_x + canvas_w + s->bb_right, frame->width);
+        clip_y = FFMIN(metrics->rect_y + canvas_h + s->bb_bottom, frame->height);
+    } else {
+        clip_x = FFMIN(metrics->rect_x + s->box_width + s->bb_right, frame->width);
+        clip_y = FFMIN(metrics->rect_y + s->box_height + s->bb_bottom, frame->height);
+    }
 
+    // Determine tile range for looping
+    int tile_x_start = 0, tile_x_end = 0;
+    int tile_y_start = 0, tile_y_end = 0;
+    int tile_w = text_w + 1;  // add 1 pixel spacing between tiles
+    int tile_h = text_h + 1;
+    if (use_canvas && canvas_tile && text_w > 0 && text_h > 0) {
+        // Calculate which tiles we need to render to cover the canvas
+        // tile offset of -1 means render text shifted left by tile_w, etc.
+        tile_x_start = (canvas_x / tile_w) - 1;
+        tile_x_end = ((canvas_x + canvas_w) / tile_w) + 1;
+        tile_y_start = (canvas_y / tile_h) - 1;
+        tile_y_end = ((canvas_y + canvas_h) / tile_h) + 1;
+    }
+
+    for (tile_y = tile_y_start; tile_y <= tile_y_end; ++tile_y) {
+    for (tile_x = tile_x_start; tile_x <= tile_x_end; ++tile_x) {
     for (l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
+
+        /* Skip lines that weren't shaped (viewport optimization) */
+        if (!line->is_shaped || line->glyphs == NULL) {
+            continue;
+        }
+
         line_w = POS_CEIL(line->width64, 64);
         for (g = 0; g < line->hb_data.glyph_count; ++g) {
             info = &line->glyphs[g];
-            dummy.fontsize = s->fontsize;
-            dummy.code = info->code;
-            glyph = av_tree_find(s->glyphs, &dummy, glyph_cmp, NULL);
+            glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
             if (!glyph) {
                 return AVERROR(EINVAL);
             }
@@ -1321,6 +1477,17 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
             bitmap = b_glyph->bitmap;
             x1 = x + info->x + b_glyph->left;
             y1 = y + info->y - b_glyph->top + offset_y;
+
+            // Apply canvas viewport offset and tiling
+            if (use_canvas) {
+                x1 -= canvas_x;
+                y1 -= canvas_y;
+                if (canvas_tile) {
+                    x1 += tile_x * tile_w;
+                    y1 += tile_y * tile_h;
+                }
+            }
+
             w1 = bitmap.width;
             h1 = bitmap.rows;
 
@@ -1353,6 +1520,8 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
             ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
                 bitmap.buffer + pdx, bitmap.pitch, w1, h1, 3, 0, x1, y1);
         }
+    }
+    }
     }
 
     return 0;
@@ -1391,147 +1560,241 @@ static void hb_destroy(HarfbuzzData *hb)
     hb->glyph_pos = NULL;
 }
 
-static int measure_text(AVFilterContext *ctx, TextMetrics *metrics)
+/**
+ * Calculate which lines are visible in the canvas viewport.
+ * This allows skipping expensive shaping operations for off-screen lines.
+ */
+static void calculate_visible_lines(int line_count, int line_height64,
+                                    int line_spacing, int canvas_y, int canvas_h,
+                                    int buffer_lines,
+                                    int *first_line, int *last_line)
+{
+    int effective_line_height;
+
+    if (canvas_h <= 0) {
+        *first_line = 0;
+        *last_line = line_count - 1;
+        return;
+    }
+
+    effective_line_height = (line_height64 >> 6) + line_spacing;
+    if (effective_line_height <= 0) effective_line_height = 1;
+
+    *first_line = FFMAX(0, canvas_y / effective_line_height - buffer_lines);
+    *last_line = FFMIN(line_count - 1,
+                       (canvas_y + canvas_h) / effective_line_height + buffer_lines);
+}
+
+/**
+ * Count lines and tabs in text without doing expensive shaping.
+ * Stores line boundaries (text_start, text_len) in pre-allocated lines array.
+ * Returns line count and tab count for preliminary height calculation.
+ */
+static int count_text_lines(AVFilterContext *ctx, const char *text,
+                            TextLine *lines, int max_lines,
+                            int *line_count_out, int *tab_count_out,
+                            uint32_t *tab_clusters, int max_tabs)
+{
+    int line_count = 0;
+    int tab_count = 0;
+    uint32_t code = 0;
+    const uint8_t *p = (const uint8_t *)text;
+    const uint8_t *line_start = p;
+    int char_idx = 0;
+
+    for (;;) {
+        const uint8_t *char_start = p;
+        GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; goto continue_count;);
+continue_count:
+        if (code == '\t') {
+            if (tab_count < max_tabs) {
+                tab_clusters[tab_count] = char_idx;
+            }
+            ++tab_count;
+        }
+        if (ff_is_newline(code) || code == 0) {
+            if (line_count < max_lines && lines) {
+                lines[line_count].text_start = (const char *)line_start;
+                lines[line_count].text_len = char_start - line_start;
+                lines[line_count].cluster_offset = (line_count > 0) ?
+                    (lines[line_count - 1].cluster_offset + lines[line_count - 1].text_len + 1) : 0;
+                lines[line_count].is_shaped = 0;
+                lines[line_count].glyphs = NULL;
+            }
+            ++line_count;
+            line_start = p;
+            if (code == 0) break;
+        }
+        ++char_idx;
+    }
+
+    *line_count_out = line_count;
+    *tab_count_out = tab_count;
+    return 0;
+}
+
+/**
+ * Measure and shape text lines within the visible range.
+ * Lines outside the visible range are skipped (is_shaped=0).
+ * Requires that s->lines, s->line_count, s->tab_clusters, s->tab_count
+ * have already been set up by count_text_lines().
+ */
+static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
+                        int first_visible_line, int last_visible_line)
 {
     DrawTextContext *s = ctx->priv;
-    char *text = s->expanded_text.str;
-    char *textdup = NULL;
     int width64 = 0, w64 = 0;
     int cur_min_y64 = 0, first_max_y64 = -32000;
     int first_min_x64 = 32000, last_max_x64 = -32000;
     int min_y64 = 32000, max_y64 = -32000, min_x64 = 32000, max_x64 = -32000;
-    int line_count = 0;
-    uint32_t code = 0;
     Glyph *glyph = NULL;
-
-    int i, tab_idx = 0, last_tab_idx = 0, line_offset = 0;
-    uint8_t *start, *p;
+    int last_tab_idx = 0;
     int ret = 0;
-
-    // Count the lines and the tab characters
-    s->tab_count = 0;
-    for (i = 0, p = text; 1; i++) {
-        GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; goto continue_on_failed;);
-continue_on_failed:
-        if (ff_is_newline(code) || code == 0) {
-            ++line_count;
-            if (code == 0) {
-                break;
-            }
-        } else if (code == '\t') {
-            ++s->tab_count;
-        }
-    }
+    char *line_buf = NULL;
+    int line_buf_size = 0;
 
     // Evaluate the width of the space character if needed to replace tabs
     if (s->tab_count > 0 && !s->blank_advance64) {
         HarfbuzzData hb_data;
         ret = shape_text_hb(s, &hb_data, " ", 1);
-        if(ret != 0) {
-            goto done;
+        if (ret != 0) {
+            return ret;
         }
         s->blank_advance64 = hb_data.glyph_pos[0].x_advance;
         hb_destroy(&hb_data);
     }
 
-    s->line_count = line_count;
-    s->lines = av_mallocz(line_count * sizeof(TextLine));
-    s->tab_clusters = av_mallocz(s->tab_count * sizeof(uint32_t));
-    for (i = 0; i < s->tab_count; ++i) {
-        s->tab_clusters[i] = -1;
-    }
+    // Process each line, shaping only visible lines
+    for (int line_idx = 0; line_idx < s->line_count; ++line_idx) {
+        TextLine *cur_line = &s->lines[line_idx];
+        int is_visible = (line_idx >= first_visible_line && line_idx <= last_visible_line);
 
-    start = textdup = av_strdup(text);
-    if (textdup == NULL) {
-        ret = AVERROR(ENOMEM);
-        goto done;
-    }
-    line_count = 0;
-    for (i = 0, p = textdup; 1; i++) {
-        if (*p == '\t') {
-            s->tab_clusters[tab_idx++] = i;
-            *p = ' ';
+        // Skip shaping for non-visible lines
+        if (!is_visible) {
+            cur_line->is_shaped = 0;
+            cur_line->hb_data.glyph_count = 0;
+            cur_line->hb_data.buf = NULL;
+            cur_line->hb_data.font = NULL;
+            cur_line->width64 = 0;
+            // Skip tabs in this line for proper tab index tracking
+            for (int t = last_tab_idx; t < s->tab_count; ++t) {
+                if (s->tab_clusters[t] >= cur_line->cluster_offset &&
+                    s->tab_clusters[t] < cur_line->cluster_offset + cur_line->text_len) {
+                    ++last_tab_idx;
+                } else if (s->tab_clusters[t] >= cur_line->cluster_offset + cur_line->text_len) {
+                    break;
+                }
+            }
+            continue;
         }
-        GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; goto continue_on_failed2;);
-continue_on_failed2:
-        if (ff_is_newline(code) || code == 0) {
-            TextLine *cur_line = &s->lines[line_count];
-            HarfbuzzData *hb = &cur_line->hb_data;
-            cur_line->cluster_offset = line_offset;
-            ret = shape_text_hb(s, hb, start, p - start);
+
+        // Prepare line buffer with tabs replaced by spaces
+        if (cur_line->text_len + 1 > line_buf_size) {
+            av_free(line_buf);
+            line_buf_size = cur_line->text_len + 1;
+            line_buf = av_malloc(line_buf_size);
+            if (!line_buf) {
+                ret = AVERROR(ENOMEM);
+                goto done;
+            }
+        }
+        memcpy(line_buf, cur_line->text_start, cur_line->text_len);
+        line_buf[cur_line->text_len] = '\0';
+
+        // Replace tabs with spaces in the line buffer
+        for (int t = last_tab_idx; t < s->tab_count; ++t) {
+            int tab_pos = s->tab_clusters[t] - cur_line->cluster_offset;
+            if (tab_pos >= 0 && tab_pos < cur_line->text_len) {
+                // Find byte position for this character position
+                const uint8_t *p = (const uint8_t *)line_buf;
+                int char_idx = 0;
+                while (char_idx < tab_pos && *p) {
+                    uint32_t code;
+                    GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; p++;);
+                    ++char_idx;
+                }
+                if (*p == '\t') {
+                    *(char *)p = ' ';
+                }
+                ++last_tab_idx;
+            } else if (s->tab_clusters[t] >= cur_line->cluster_offset + cur_line->text_len) {
+                break;
+            }
+        }
+
+        // Shape the line
+        HarfbuzzData *hb = &cur_line->hb_data;
+        ret = shape_text_hb(s, hb, line_buf, cur_line->text_len);
+        if (ret != 0) {
+            goto done;
+        }
+        cur_line->is_shaped = 1;
+
+        w64 = 0;
+        cur_min_y64 = 32000;
+        int line_tab_idx = 0;
+        for (int t = 0; t < hb->glyph_count; ++t) {
+            uint8_t is_tab = 0;
+            // Check if this glyph is a tab
+            for (int ti = last_tab_idx - 1; ti >= 0 && s->tab_clusters[ti] >= cur_line->cluster_offset; --ti) {
+                if (hb->glyph_info[t].cluster == s->tab_clusters[ti] - cur_line->cluster_offset) {
+                    is_tab = 1;
+                    break;
+                }
+            }
+
+            ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, -1, -1);
             if (ret != 0) {
                 goto done;
             }
-            w64 = 0;
-            cur_min_y64 = 32000;
-            for (int t = 0; t < hb->glyph_count; ++t) {
-                uint8_t is_tab = last_tab_idx < s->tab_count &&
-                    hb->glyph_info[t].cluster == s->tab_clusters[last_tab_idx] - line_offset;
-                if (is_tab) {
-                    ++last_tab_idx;
-                }
-                ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, -1, -1);
-                if (ret != 0) {
-                    goto done;
-                }
-                if (line_count == 0) {
-                    first_max_y64 = FFMAX(glyph->bbox.yMax, first_max_y64);
-                }
-                if (t == 0) {
-                    cur_line->offset_left64 = glyph->bbox.xMin;
+
+            if (line_idx == 0 || first_max_y64 == -32000) {
+                first_max_y64 = FFMAX(glyph->bbox.yMax, first_max_y64);
+            }
+            if (t == 0) {
+                cur_line->offset_left64 = glyph->bbox.xMin;
+                if (line_idx == 0 || first_min_x64 == 32000) {
                     first_min_x64 = FFMIN(glyph->bbox.xMin, first_min_x64);
                 }
-                if (t == hb->glyph_count - 1) {
-                    // The following code measures the width of the line up to the last
-                    // character's horizontal advance
-                    int last_char_width = hb->glyph_pos[t].x_advance;
-
-                    // The following code measures the width of the line up to the rightmost
-                    // visible pixel of the last character
-                    // int last_char_width = glyph->bbox.xMax;
-
-                    w64 += last_char_width;
-                    last_max_x64 = FFMAX(last_char_width, last_max_x64);
-                    cur_line->offset_right64 = last_char_width;
+            }
+            if (t == hb->glyph_count - 1) {
+                int last_char_width = hb->glyph_pos[t].x_advance;
+                w64 += last_char_width;
+                last_max_x64 = FFMAX(last_char_width, last_max_x64);
+                cur_line->offset_right64 = last_char_width;
+            } else {
+                if (is_tab) {
+                    int size = s->blank_advance64 * s->tabsize;
+                    w64 = (w64 / size + 1) * size;
                 } else {
-                    if (is_tab) {
-                        int size = s->blank_advance64 * s->tabsize;
-                        w64 = (w64 / size + 1) * size;
-                    } else {
-                        w64 += hb->glyph_pos[t].x_advance;
-                    }
+                    w64 += hb->glyph_pos[t].x_advance;
                 }
-                cur_min_y64 = FFMIN(glyph->bbox.yMin, cur_min_y64);
-                min_y64 = FFMIN(glyph->bbox.yMin, min_y64);
-                max_y64 = FFMAX(glyph->bbox.yMax, max_y64);
-                min_x64 = FFMIN(glyph->bbox.xMin, min_x64);
-                max_x64 = FFMAX(glyph->bbox.xMax, max_x64);
             }
-
-            cur_line->width64 = w64;
-
-            av_log(ctx, AV_LOG_DEBUG, "  Line: %d -- glyphs count: %d - width64: %d - offset_left64: %d - offset_right64: %d)\n",
-                line_count, hb->glyph_count, cur_line->width64, cur_line->offset_left64, cur_line->offset_right64);
-
-            if (w64 > width64) {
-                width64 = w64;
-            }
-            start = p;
-            ++line_count;
-            line_offset = i + 1;
+            cur_min_y64 = FFMIN(glyph->bbox.yMin, cur_min_y64);
+            min_y64 = FFMIN(glyph->bbox.yMin, min_y64);
+            max_y64 = FFMAX(glyph->bbox.yMax, max_y64);
+            min_x64 = FFMIN(glyph->bbox.xMin, min_x64);
+            max_x64 = FFMAX(glyph->bbox.xMax, max_x64);
         }
 
-        if (code == 0) break;
+        cur_line->width64 = w64;
+
+        av_log(ctx, AV_LOG_DEBUG, "  Line: %d -- glyphs count: %d - width64: %d - offset_left64: %d - offset_right64: %d)\n",
+            line_idx, hb->glyph_count, cur_line->width64, cur_line->offset_left64, cur_line->offset_right64);
+
+        if (w64 > width64) {
+            width64 = w64;
+        }
     }
 
     metrics->line_height64 = s->face->size->metrics.height;
 
     metrics->width = POS_CEIL(width64, 64);
     if (s->y_align == YA_FONT) {
-        metrics->height = POS_CEIL(metrics->line_height64 * line_count, 64);
+        metrics->height = POS_CEIL(metrics->line_height64 * s->line_count, 64);
     } else {
         int height64 = (metrics->line_height64 + s->line_spacing * 64) *
-            (FFMAX(0, line_count - 1)) + first_max_y64 - cur_min_y64;
+            (FFMAX(0, s->line_count - 1)) + first_max_y64 - cur_min_y64;
         metrics->height = POS_CEIL(height64, 64);
     }
     metrics->offset_top64 = first_max_y64;
@@ -1544,7 +1807,7 @@ continue_on_failed2:
     metrics->max_y64 = max_y64;
 
 done:
-    av_free(textdup);
+    av_free(line_buf);
     return ret;
 }
 
@@ -1574,6 +1837,9 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     int last_tab_idx = 0;
 
     TextMetrics metrics;
+    int line_height64;
+    int preliminary_height;
+    int first_visible_line, last_visible_line;
 
     av_bprint_clear(bp);
 
@@ -1622,7 +1888,87 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         return ret;
     }
 
-    if ((ret = measure_text(ctx, &metrics)) < 0) {
+    /* Phase 1: Count lines without shaping (fast) */
+    line_height64 = s->face->size->metrics.height;
+
+    /* First pass: just count lines and tabs */
+    {
+        const char *text = s->expanded_text.str;
+        const uint8_t *p = (const uint8_t *)text;
+        uint32_t code;
+        int line_count = 0;
+        int tab_count = 0;
+
+        for (;;) {
+            GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; goto continue_count1;);
+continue_count1:
+            if (ff_is_newline(code) || code == 0) {
+                ++line_count;
+                if (code == 0) break;
+            } else if (code == '\t') {
+                ++tab_count;
+            }
+        }
+
+        s->line_count = line_count;
+        s->tab_count = tab_count;
+    }
+
+    /* Allocate lines and tab_clusters arrays */
+    s->lines = av_mallocz(s->line_count * sizeof(TextLine));
+    if (!s->lines)
+        return AVERROR(ENOMEM);
+
+    s->tab_clusters = av_mallocz(FFMAX(s->tab_count, 1) * sizeof(uint32_t));
+    if (!s->tab_clusters) {
+        av_freep(&s->lines);
+        return AVERROR(ENOMEM);
+    }
+
+    /* Second pass: record line boundaries and tab positions */
+    ret = count_text_lines(ctx, s->expanded_text.str, s->lines, s->line_count,
+                           &s->line_count, &s->tab_count,
+                           s->tab_clusters, s->tab_count);
+    if (ret < 0) {
+        av_freep(&s->lines);
+        av_freep(&s->tab_clusters);
+        return ret;
+    }
+
+    /* Calculate preliminary text height based on line count and font metrics */
+    preliminary_height = POS_CEIL(line_height64 * s->line_count, 64);
+
+    /* Set preliminary VAR_TH for canvas expression evaluation */
+    s->var_values[VAR_TH] = s->var_values[VAR_TEXT_H] = preliminary_height;
+    s->var_values[VAR_LINE_H] = s->var_values[VAR_LH] = line_height64 / 64.;
+    s->var_values[VAR_FONT_A] = s->face->size->metrics.ascender / 64;
+    s->var_values[VAR_FONT_D] = -s->face->size->metrics.descender / 64;
+
+    /* Evaluate canvas expressions EARLY (before expensive shaping) */
+    s->canvas_w = av_expr_eval(s->canvas_w_pexpr, s->var_values, &s->prng);
+    s->canvas_h = av_expr_eval(s->canvas_h_pexpr, s->var_values, &s->prng);
+    if (s->canvas_w > 0 && s->canvas_h > 0) {
+        s->canvas_x = av_expr_eval(s->canvas_x_pexpr, s->var_values, &s->prng);
+        s->canvas_y = av_expr_eval(s->canvas_y_pexpr, s->var_values, &s->prng);
+    }
+
+    /* Calculate visible lines for viewport optimization */
+    /* Disable optimization for canvas_tile mode (all lines needed for tiling) */
+    if (s->canvas_tile || s->canvas_h <= 0) {
+        first_visible_line = 0;
+        last_visible_line = s->line_count - 1;
+    } else {
+        calculate_visible_lines(s->line_count, line_height64,
+                               s->line_spacing, s->canvas_y, s->canvas_h,
+                               2, /* buffer_lines */
+                               &first_visible_line, &last_visible_line);
+    }
+
+    av_log(ctx, AV_LOG_DEBUG, "Viewport optimization: lines %d-%d of %d visible (canvas_y=%d, canvas_h=%d)\n",
+           first_visible_line, last_visible_line, s->line_count, s->canvas_y, s->canvas_h);
+
+    /* Phase 2: Shape only visible lines */
+    if ((ret = measure_text(ctx, &metrics, first_visible_line, last_visible_line)) < 0) {
         return ret;
     }
 
@@ -1651,6 +1997,16 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         s->y = s->var_values[VAR_Y] = av_expr_eval(s->y_pexpr, s->var_values, &s->prng);
         /* It is necessary if x is expressed from y  */
         s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, &s->prng);
+    }
+
+    /* Re-evaluate canvas expressions with final metrics if needed */
+    if (s->canvas_w <= 0 || s->canvas_h <= 0) {
+        s->canvas_w = av_expr_eval(s->canvas_w_pexpr, s->var_values, &s->prng);
+        s->canvas_h = av_expr_eval(s->canvas_h_pexpr, s->var_values, &s->prng);
+        if (s->canvas_w > 0 && s->canvas_h > 0) {
+            s->canvas_x = av_expr_eval(s->canvas_x_pexpr, s->var_values, &s->prng);
+            s->canvas_y = av_expr_eval(s->canvas_y_pexpr, s->var_values, &s->prng);
+        }
     }
 
     update_alpha(s);
@@ -1718,6 +2074,14 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     for (int l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
         HarfbuzzData *hb = &line->hb_data;
+
+        /* Skip lines that weren't shaped (viewport optimization) */
+        if (!line->is_shaped) {
+            line->glyphs = NULL;
+            y += metrics.line_height64 + s->line_spacing * 64;
+            continue;
+        }
+
         line->glyphs = av_mallocz(hb->glyph_count * sizeof(GlyphInfo));
 
         for (int t = 0; t < hb->glyph_count; ++t) {
@@ -1777,18 +2141,27 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     }
 
     /* Check if the whole box is out of the frame */
-    is_outside = metrics.rect_x - s->bb_left >= width ||
-                    metrics.rect_y - s->bb_top >= height ||
-                    metrics.rect_x + s->box_width + s->bb_right <= 0 ||
-                    metrics.rect_y + s->box_height + s->bb_bottom <= 0;
+    {
+        int check_width = (s->canvas_w > 0 && s->canvas_h > 0) ? s->canvas_w : s->box_width;
+        int check_height = (s->canvas_w > 0 && s->canvas_h > 0) ? s->canvas_h : s->box_height;
+        is_outside = metrics.rect_x - s->bb_left >= width ||
+                        metrics.rect_y - s->bb_top >= height ||
+                        metrics.rect_x + check_width + s->bb_right <= 0 ||
+                        metrics.rect_y + check_height + s->bb_bottom <= 0;
+    }
 
     if (!is_outside) {
         /* draw box */
         if (s->draw_box) {
             rec_x = metrics.rect_x - s->bb_left;
             rec_y = metrics.rect_y - s->bb_top;
-            rec_width = s->box_width + s->bb_right + s->bb_left;
-            rec_height = s->box_height + s->bb_bottom + s->bb_top;
+            if (s->canvas_w > 0 && s->canvas_h > 0) {
+                rec_width = s->canvas_w + s->bb_right + s->bb_left;
+                rec_height = s->canvas_h + s->bb_bottom + s->bb_top;
+            } else {
+                rec_width = s->box_width + s->bb_right + s->bb_left;
+                rec_height = s->box_height + s->bb_bottom + s->bb_top;
+            }
             ff_blend_rectangle(&s->dc, &boxcolor,
                 frame->data, frame->linesize, width, height,
                 rec_x, rec_y, rec_width, rec_height);
@@ -1796,20 +2169,25 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
 
         if (s->shadowx || s->shadowy) {
             if ((ret = draw_glyphs(ctx, frame, &shadowcolor, &metrics,
-                    s->shadowx, s->shadowy, s->borderw)) < 0) {
+                    s->shadowx, s->shadowy, s->borderw,
+                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
+                    metrics.width, metrics.height, s->canvas_tile)) < 0) {
                 return ret;
             }
         }
 
         if (s->borderw) {
             if ((ret = draw_glyphs(ctx, frame, &bordercolor, &metrics,
-                    0, 0, s->borderw)) < 0) {
+                    0, 0, s->borderw,
+                    s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
+                    metrics.width, metrics.height, s->canvas_tile)) < 0) {
                 return ret;
             }
         }
 
-        if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0,
-                0, 0)) < 0) {
+        if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0, 0, 0,
+                s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
+                metrics.width, metrics.height, s->canvas_tile)) < 0) {
             return ret;
         }
     }
@@ -1883,6 +2261,27 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             s->x = bbox->x;
             s->y = bbox->y - s->fontsize;
         }
+
+        // Reload text file when canvas_tile_reload is enabled and file has changed
+        if (s->canvas_tile_reload && s->textfile) {
+            struct stat file_stat;
+            if (stat(s->textfile, &file_stat) == 0 &&
+                file_stat.st_mtime != s->canvas_tile_reload_mtime) {
+                s->canvas_tile_reload_mtime = file_stat.st_mtime;
+                if ((ret = ff_load_textfile(ctx, (const char *)s->textfile, &s->text, NULL)) < 0) {
+                    av_frame_free(&frame);
+                    return ret;
+                }
+#if CONFIG_LIBFRIBIDI
+                if (s->text_shaping)
+                    if ((ret = shape_text(ctx)) < 0) {
+                        av_frame_free(&frame);
+                        return ret;
+                    }
+#endif
+            }
+        }
+
         draw_text(ctx, frame);
     }
 

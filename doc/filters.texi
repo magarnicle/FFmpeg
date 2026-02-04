@@ -12634,6 +12634,49 @@ The default value of @var{boxw} is computed automatically to match the text widt
 Set the height of the box to be drawn around text.
 The default value of @var{boxh} is computed automatically to match the text height
 
+@item canvas_w
+@item canvas_h
+Expressions specifying the width and height of a canvas viewport. When both
+evaluate to non-zero values, only the portion of the rendered text that falls
+within this viewport is displayed. This is useful for efficiently scrolling
+through large amounts of text, as only the visible glyphs are rendered.
+The expressions accept the same variables as @var{x} and @var{y}, including
+@var{text_w}/@var{tw} and @var{text_h}/@var{th} for dynamic sizing based on
+rendered text dimensions.
+The default value is "0" (disabled).
+
+For example, to set the canvas to half the text width:
+@example
+canvas_w=tw/2:canvas_h=th
+@end example
+
+@item canvas_x
+@item canvas_y
+Expressions specifying the x and y offset into the rendered text for the
+canvas viewport. These control which portion of the text is visible within
+the canvas. The expressions are evaluated per-frame and accept the same
+variables as @var{x} and @var{y}, including @var{t} for time-based animation
+and @var{text_w}/@var{tw} for the total rendered text width.
+The default value is "0".
+
+For example, to scroll horizontally through text at 100 pixels per second:
+@example
+canvas_w=200:canvas_h=50:canvas_x=t*100:canvas_y=0
+@end example
+
+@item canvas_tile
+If set to 1, the text will tile when the canvas viewport extends beyond
+the rendered text boundaries. This is useful for creating continuous scrolling
+text effects like news tickers. A 1 pixel gap is added between each tile.
+The default value is 0 (disabled).
+
+@item canvas_tile_reload
+If set to 1 and @var{textfile} is specified, the text file will be re-read
+from disk when its modification time changes. This allows the tiled text to
+update dynamically if the file is modified by an external process, while
+avoiding unnecessary file reads when the file hasn't changed.
+The default value is 0 (disabled).
+
 @item shadowx
 @item shadowy
 The x and y offsets for the text shadow position with respect to the
@@ -12994,6 +13037,28 @@ frame. The file @file{LONG_LINE} is assumed to contain a single line
 with no newlines.
 @example
 drawtext="fontsize=15:fontfile=FreeSerif.ttf:text=LONG_LINE:y=h-line_h:x=-50*t"
+@end example
+
+@item
+Efficiently scroll through a long text using a canvas viewport.
+Only the visible portion of the text is rendered, improving performance
+for very long text. This scrolls at 100 pixels per second through a 300x40
+viewport positioned at (50,50).
+@example
+drawtext="fontfile=FreeSerif.ttf:text='This is a very long line of scrolling text...':x=50:y=50:canvas_w=300:canvas_h=40:canvas_x=t*100:canvas_y=0"
+@end example
+
+@item
+Scroll through the entire width of text in exactly 10 seconds using canvas.
+@example
+drawtext="fontfile=FreeSerif.ttf:textfile=LONG_LINE:x=100:y=100:canvas_w=400:canvas_h=50:canvas_x=(t/10)*(tw-400):canvas_y=0"
+@end example
+
+@item
+Create a continuously looping news ticker that scrolls text and seamlessly
+repeats when reaching the end.
+@example
+drawtext="fontfile=FreeSerif.ttf:text='Breaking News * ':x=50:y=50:canvas_w=300:canvas_h=40:canvas_x=mod(t*100\,tw):canvas_y=0:canvas_tile=1"
 @end example
 
 @item
