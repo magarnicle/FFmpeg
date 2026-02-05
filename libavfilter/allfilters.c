@@ -207,6 +207,7 @@ extern const FFFilter ff_vf_bwdif_cuda;
 extern const FFFilter ff_vf_bwdif_vulkan;
 extern const FFFilter ff_vf_cas;
 extern const FFFilter ff_vf_ccrepack;
+extern const FFFilter ff_vf_cea608embed;
 extern const FFFilter ff_vf_chromaber_vulkan;
 extern const FFFilter ff_vf_chromahold;
 extern const FFFilter ff_vf_chromakey;
