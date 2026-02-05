@@ -21,6 +21,9 @@
 
 #include <atomic>
 #include <unistd.h>
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+#define DECKLINK_CAN_GET_TOTAL_RAM 1
+#endif
 
 using std::atomic;
 
@@ -53,6 +56,20 @@ extern "C" {
 #include "libklvanc/vanc-lines.h"
 #include "libklvanc/pixels.h"
 #endif
+
+/* Get total system RAM in bytes, returns 0 if unable to determine */
+static int64_t get_total_system_ram(void)
+{
+#ifdef DECKLINK_CAN_GET_TOTAL_RAM
+    av_log(NULL, AV_LOG_DEBUG, "YESSSSSSSSSSSSSSSS\n");
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0)
+        return (int64_t)pages * page_size;
+#endif
+    av_log(NULL, AV_LOG_WARNING, "NOOOOOOOOOOOOOOOOO\n");
+    return 0;
+}
 
 extern bool operator==(const REFIID& me, const REFIID& other){
     return me.byte0 == other.byte0 &&
@@ -1600,10 +1617,26 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
 
     /* Initialize async output buffer if requested */
     if (cctx->output_buffer_size > 0) {
+        int64_t total_ram = get_total_system_ram();
+        av_log(avctx, AV_LOG_DEBUG, "Total RAM: %"PRId64" bytes\n", total_ram);
+        int64_t max_buffer_size = cctx->output_buffer_size;
+
+        /* Limit buffer size to 80% of total system RAM */
+        if (total_ram > 0) {
+            int64_t ram_limit = (int64_t)(total_ram * 0.8);
+            if (cctx->output_buffer_size > ram_limit) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "Requested output_buffer_size %"PRId64" exceeds 80%% of system RAM (%"PRId64"), "
+                       "clamping to %"PRId64" bytes\n",
+                       cctx->output_buffer_size, total_ram, ram_limit);
+                max_buffer_size = ram_limit;
+            }
+        }
+
         ctx->avctx = avctx;  /* Store for consumer thread access */
         ctx->output_thread_stop = 0;
         ctx->output_thread_error = 0;
-        ff_decklink_packet_queue_init(avctx, &ctx->output_queue, cctx->output_buffer_size);
+        ff_decklink_packet_queue_init(avctx, &ctx->output_queue, max_buffer_size);
 
         ret = pthread_create(&ctx->output_thread, NULL, decklink_output_thread, ctx);
         if (ret != 0) {
@@ -1614,7 +1647,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
             goto error;
         }
         ctx->output_thread_started = 1;
-        av_log(avctx, AV_LOG_INFO, "Async output buffer enabled: %"PRId64" bytes\n", cctx->output_buffer_size);
+        av_log(avctx, AV_LOG_INFO, "Async output buffer enabled: %"PRId64" bytes\n", max_buffer_size);
     }
 
     return 0;
