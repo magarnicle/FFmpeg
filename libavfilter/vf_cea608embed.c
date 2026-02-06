@@ -45,6 +45,7 @@
 #define CC_RU4  0x27  /* Roll-Up 4 rows */
 #define CC_EDM  0x2C  /* Erase Displayed Memory */
 #define CC_CR   0x2D  /* Carriage Return */
+#define CC_ENM  0x2E  /* Erase Non-Displayed Memory */
 #define CC_EOC  0x2F  /* End of Caption */
 
 /* Maximum CC output per frame */
@@ -54,8 +55,10 @@ typedef struct SubtitleEvent {
     int64_t start_pts;    /* Start time in AV_TIME_BASE units */
     int64_t end_pts;      /* End time in AV_TIME_BASE units */
     char *text;           /* Plain text (stripped of formatting) */
-    int sent;             /* Whether start has been sent */
-    int cleared;          /* Whether end/clear has been sent */
+    uint8_t *cc_data;     /* Pre-encoded CC triplets */
+    int cc_data_size;     /* Size of cc_data in bytes */
+    int sent;             /* Whether caption has been fully sent (EOC delivered) */
+    int cleared;          /* Whether erase has been sent or skipped */
 } SubtitleEvent;
 
 typedef struct CEA608EmbedContext {
@@ -69,11 +72,19 @@ typedef struct CEA608EmbedContext {
     SubtitleEvent *events;
     int nb_events;
     int events_capacity;
-    int current_event;      /* Index of current event being displayed */
 
-    /* State tracking */
-    int64_t last_sub_pts;   /* PTS of last subtitle action */
-    int have_active_sub;    /* Whether a subtitle is currently displayed */
+    /* Per-frame drain state: sends one CC pair per video frame */
+    int drain_event;        /* Event currently being loaded, or -1 */
+    int drain_pos;          /* Byte offset in event's cc_data */
+    int erase_event;        /* Event currently being erased, or -1 */
+    int erase_pos;          /* Byte offset in erase_data (0 or 3) */
+    uint8_t erase_data[6];  /* Pre-encoded EDM command */
+    int erase_data_size;    /* Size of erase_data (6) */
+
+    /* Scheduling cursors */
+    int next_load;          /* Next event index to consider for loading */
+    int next_erase;         /* Next event index to consider for erasing */
+    int64_t frame_dur;      /* Frame duration in AV_TIME_BASE units (0 = unset) */
 } CEA608EmbedContext;
 
 /* Character set from encoder - minimal version for filter use */
@@ -399,6 +410,8 @@ static int add_subtitle_event(CEA608EmbedContext *ctx, int64_t start_pts,
     ctx->events[ctx->nb_events].start_pts = start_pts;
     ctx->events[ctx->nb_events].end_pts = end_pts;
     ctx->events[ctx->nb_events].text = av_strdup(text);
+    ctx->events[ctx->nb_events].cc_data = NULL;
+    ctx->events[ctx->nb_events].cc_data_size = 0;
     ctx->events[ctx->nb_events].sent = 0;
     ctx->events[ctx->nb_events].cleared = 0;
     if (!ctx->events[ctx->nb_events].text)
@@ -533,6 +546,9 @@ static int encode_text_to_cc(CEA608EmbedContext *ctx, const char *text,
         emit_control(buf, &pos, 0x14, CC_RU2 + (ctx->roll_up - 2), ctx->data_field);
     } else {
         emit_control(buf, &pos, 0x14, CC_RCL, ctx->data_field);
+        /* Clear non-displayed buffer so stale text from the previous
+         * caption (swapped in by the last EOC) doesn't bleed through */
+        emit_control(buf, &pos, 0x14, CC_ENM, ctx->data_field);
     }
 
     /* Calculate starting row */
@@ -655,6 +671,27 @@ static av_cold int init(AVFilterContext *avctx)
     if (ret < 0)
         return ret;
 
+    /* Pre-encode CC data for each subtitle event */
+    for (int i = 0; i < ctx->nb_events; i++) {
+        uint8_t tmp_buf[MAX_CC_PER_FRAME * 3];
+        int size = encode_text_to_cc(ctx, ctx->events[i].text, tmp_buf, sizeof(tmp_buf));
+        if (size > 0) {
+            ctx->events[i].cc_data = av_memdup(tmp_buf, size);
+            ctx->events[i].cc_data_size = size;
+            if (!ctx->events[i].cc_data)
+                return AVERROR(ENOMEM);
+        }
+    }
+
+    /* Pre-encode erase (EDM) command */
+    ctx->erase_data_size = encode_erase_cc(ctx, ctx->erase_data, sizeof(ctx->erase_data));
+
+    /* Initialize drain state */
+    ctx->drain_event = -1;
+    ctx->erase_event = -1;
+    ctx->next_load = 0;
+    ctx->next_erase = 0;
+
     return 0;
 }
 
@@ -692,50 +729,107 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     CEA608EmbedContext *ctx = avctx->priv;
     AVFilterLink *outlink = avctx->outputs[0];
     int64_t frame_pts;
-    uint8_t cc_buf[MAX_CC_PER_FRAME * 3];
-    int cc_size = 0;
-    const char *caption_text = NULL;
-    int is_erase = 0;
+    uint8_t out_triplet[3];
+    int have_output = 0;
+
+    /* Compute frame duration on first call */
+    if (!ctx->frame_dur) {
+        AVRational fr = ff_filter_link(inlink)->frame_rate;
+        if (fr.num > 0 && fr.den > 0)
+            ctx->frame_dur = av_rescale_q(1, av_inv_q(fr), AV_TIME_BASE_Q);
+        else
+            ctx->frame_dur = AV_TIME_BASE / 30;
+    }
 
     /* Convert frame PTS to AV_TIME_BASE */
     frame_pts = av_rescale_q(frame->pts, inlink->time_base, AV_TIME_BASE_Q);
 
-    /* Check for subtitle events that should start/end */
-    for (int i = 0; i < ctx->nb_events; i++) {
-        SubtitleEvent *ev = &ctx->events[i];
-
-        /* Start event */
-        if (!ev->sent && frame_pts >= ev->start_pts && frame_pts < ev->end_pts) {
-            cc_size = encode_text_to_cc(ctx, ev->text, cc_buf, sizeof(cc_buf));
-            ev->sent = 1;
-            ctx->have_active_sub = 1;
-            ctx->current_event = i;
-            caption_text = ev->text;
+    /* If not currently draining anything, check for new work */
+    if (ctx->drain_event < 0 && ctx->erase_event < 0) {
+        /* Check for pending erases (events already sent but not yet cleared) */
+        while (ctx->next_erase < ctx->next_load && ctx->next_erase < ctx->nb_events) {
+            SubtitleEvent *ev = &ctx->events[ctx->next_erase];
+            if (!ev->sent)
+                break; /* Can't erase what hasn't been sent */
+            if (ev->cleared) {
+                ctx->next_erase++;
+                continue;
+            }
+            if (frame_pts >= ev->end_pts) {
+                /* Check if we should skip this erase: if the next event's
+                 * loading would overlap, the EOC will replace the display
+                 * anyway, so EDM is unnecessary */
+                int skip = 0;
+                int next = ctx->next_erase + 1;
+                if (next < ctx->nb_events && ctx->events[next].cc_data_size > 0) {
+                    SubtitleEvent *nev = &ctx->events[next];
+                    int npairs = nev->cc_data_size / 3;
+                    int64_t nload = nev->start_pts - (int64_t)(npairs - 1) * ctx->frame_dur;
+                    if (nload <= ev->end_pts + 2 * ctx->frame_dur) {
+                        skip = 1;
+                        ev->cleared = 1;
+                        ctx->next_erase++;
+                        continue;
+                    }
+                }
+                if (!skip) {
+                    ctx->erase_event = ctx->next_erase;
+                    ctx->erase_pos = 0;
+                    ctx->next_erase++;
+                    log_cc_data(avctx, ctx->erase_data, ctx->erase_data_size, NULL, 1);
+                    break;
+                }
+            }
             break;
         }
 
-        /* End event - send erase if this subtitle just ended */
-        if (ev->sent && !ev->cleared && frame_pts >= ev->end_pts) {
-            cc_size = encode_erase_cc(ctx, cc_buf, sizeof(cc_buf));
-            ev->cleared = 1;
-            ctx->have_active_sub = 0;
-            ctx->current_event = -1;
-            is_erase = 1;
-            break;
+        /* Check for events to start loading */
+        if (ctx->erase_event < 0 && ctx->next_load < ctx->nb_events) {
+            SubtitleEvent *ev = &ctx->events[ctx->next_load];
+            if (ev->cc_data_size > 0) {
+                int npairs = ev->cc_data_size / 3;
+                /* Schedule loading so the last triplet (EOC) lands at start_pts */
+                int64_t load_start = ev->start_pts - (int64_t)(npairs - 1) * ctx->frame_dur;
+                if (frame_pts >= load_start) {
+                    ctx->drain_event = ctx->next_load;
+                    ctx->drain_pos = 0;
+                    ctx->next_load++;
+                    log_cc_data(avctx, ev->cc_data, ev->cc_data_size, ev->text, 0);
+                }
+            } else {
+                /* Skip events with empty cc_data */
+                ctx->events[ctx->next_load].sent = 1;
+                ctx->events[ctx->next_load].cleared = 1;
+                ctx->next_load++;
+            }
         }
     }
 
-    /* Inject CC data directly as side data */
-    if (cc_size > 0) {
-        AVFrameSideData *sd;
+    /* Output one CC triplet per frame */
+    if (ctx->erase_event >= 0) {
+        memcpy(out_triplet, ctx->erase_data + ctx->erase_pos, 3);
+        ctx->erase_pos += 3;
+        if (ctx->erase_pos >= ctx->erase_data_size) {
+            ctx->events[ctx->erase_event].cleared = 1;
+            ctx->erase_event = -1;
+        }
+        have_output = 1;
+    } else if (ctx->drain_event >= 0) {
+        SubtitleEvent *ev = &ctx->events[ctx->drain_event];
+        memcpy(out_triplet, ev->cc_data + ctx->drain_pos, 3);
+        ctx->drain_pos += 3;
+        if (ctx->drain_pos >= ev->cc_data_size) {
+            ev->sent = 1;
+            ctx->drain_event = -1;
+        }
+        have_output = 1;
+    }
 
-        /* Log the caption at debug level */
-        log_cc_data(avctx, cc_buf, cc_size, caption_text, is_erase);
-
-        /* Add CC data as A53 side data */
-        sd = av_frame_new_side_data(frame, AV_FRAME_DATA_A53_CC, cc_size);
+    /* Inject single CC triplet as side data */
+    if (have_output) {
+        AVFrameSideData *sd = av_frame_new_side_data(frame, AV_FRAME_DATA_A53_CC, 3);
         if (sd) {
-            memcpy(sd->data, cc_buf, cc_size);
+            memcpy(sd->data, out_triplet, 3);
         } else {
             av_log(avctx, AV_LOG_WARNING, "Failed to allocate CC side data\n");
         }
@@ -750,6 +844,7 @@ static av_cold void uninit(AVFilterContext *avctx)
 
     for (int i = 0; i < ctx->nb_events; i++) {
         av_free(ctx->events[i].text);
+        av_free(ctx->events[i].cc_data);
     }
     av_freep(&ctx->events);
     ctx->nb_events = 0;
