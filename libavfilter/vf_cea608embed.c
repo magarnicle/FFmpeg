@@ -394,6 +394,57 @@ static char *extract_subtitle_text(const AVSubtitleRect *rect)
     return result;
 }
 
+/**
+ * Wrap lines exceeding 32 characters at word boundaries.
+ * CEA-608 allows at most 32 characters per row.
+ */
+static char *wrap_cea608_text(const char *text)
+{
+    AVBPrint bp;
+    const char *p = text;
+
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+    while (*p) {
+        const char *line_end = strchr(p, '\n');
+        int line_len;
+
+        if (!line_end)
+            line_end = p + strlen(p);
+        line_len = line_end - p;
+
+        while (line_len > 32) {
+            /* Find last space within first 32 chars */
+            int wrap = 32;
+            while (wrap > 0 && p[wrap] != ' ')
+                wrap--;
+            if (wrap == 0)
+                wrap = 32; /* No space found, hard break */
+            av_bprintf(&bp, "%.*s\n", wrap, p);
+            p += wrap;
+            if (*p == ' ')
+                p++;
+            line_len = line_end - p;
+        }
+
+        av_bprintf(&bp, "%.*s", line_len, p);
+
+        if (*line_end == '\n') {
+            av_bprintf(&bp, "\n");
+            p = line_end + 1;
+        } else {
+            p = line_end;
+        }
+    }
+
+    char *result = NULL;
+    if (av_bprint_is_complete(&bp))
+        av_bprint_finalize(&bp, &result);
+    else
+        av_bprint_finalize(&bp, NULL);
+    return result;
+}
+
 static int add_subtitle_event(CEA608EmbedContext *ctx, int64_t start_pts,
                               int64_t end_pts, const char *text)
 {
@@ -409,7 +460,7 @@ static int add_subtitle_event(CEA608EmbedContext *ctx, int64_t start_pts,
 
     ctx->events[ctx->nb_events].start_pts = start_pts;
     ctx->events[ctx->nb_events].end_pts = end_pts;
-    ctx->events[ctx->nb_events].text = av_strdup(text);
+    ctx->events[ctx->nb_events].text = wrap_cea608_text(text);
     ctx->events[ctx->nb_events].cc_data = NULL;
     ctx->events[ctx->nb_events].cc_data_size = 0;
     ctx->events[ctx->nb_events].sent = 0;
