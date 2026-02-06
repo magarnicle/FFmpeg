@@ -251,6 +251,13 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
         AVSubtitle *sub = (AVSubtitle *)buf->buf[0]->data;
         if (sub) {
             int64_t delta_us = av_rescale_q(cat->delta_ts, outlink->time_base, AV_TIME_BASE_Q);
+            av_log(ctx, AV_LOG_DEBUG,
+                   "subtitle: seg=%u in_pts=%"PRId64" delta_ts=%"PRId64
+                   " out_pts=%"PRId64" sub->pts=%"PRId64" -> %"PRId64
+                   " start_disp=%"PRIu32" end_disp=%"PRIu32"\n",
+                   seg_idx, buf->pts - cat->delta_ts, cat->delta_ts,
+                   buf->pts, sub->pts, sub->pts + delta_us,
+                   sub->start_display_time, sub->end_display_time);
             sub->pts += delta_us;
         }
     }
