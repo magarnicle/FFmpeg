@@ -21,10 +21,14 @@
 
 /**
  * @file
- * Video filter to embed CEA-608 closed captions from a subtitle file.
+ * Video filter to embed CEA-608 closed captions.
  *
- * Reads subtitles (SRT, ASS, etc.) and encodes them as CEA-608 triplets,
- * then injects them into video frames as AV_FRAME_DATA_A53_CC side data.
+ * Supports two modes:
+ * - File mode: reads subtitles from a file at init time (filename option set)
+ * - Stream mode: accepts a subtitle stream as second input (no filename set)
+ *
+ * Encodes subtitles as CEA-608 triplets and injects them into video frames
+ * as AV_FRAME_DATA_A53_CC side data.
  */
 
 #include "libavcodec/avcodec.h"
@@ -85,6 +89,10 @@ typedef struct CEA608EmbedContext {
     int next_load;          /* Next event index to consider for loading */
     int next_erase;         /* Next event index to consider for erasing */
     int64_t frame_dur;      /* Frame duration in AV_TIME_BASE units (0 = unset) */
+
+    /* Stream input mode */
+    int stream_input;       /* 1 = subtitle stream input, 0 = file input */
+    int sub_eof;            /* 1 = subtitle input has reached EOF */
 } CEA608EmbedContext;
 
 /* Character set from encoder - minimal version for filter use */
@@ -713,32 +721,53 @@ static int encode_erase_cc(CEA608EmbedContext *ctx, uint8_t *buf, int bufsize)
 static av_cold int init(AVFilterContext *avctx)
 {
     CEA608EmbedContext *ctx = avctx->priv;
+    AVFilterPad pad;
     int ret;
-
-    if (!ctx->filename) {
-        av_log(avctx, AV_LOG_ERROR, "No subtitle file specified\n");
-        return AVERROR(EINVAL);
-    }
 
     if (ctx->roll_up != 0 && (ctx->roll_up < 2 || ctx->roll_up > 4)) {
         av_log(avctx, AV_LOG_ERROR, "roll_up must be 0 (pop-on) or 2-4\n");
         return AVERROR(EINVAL);
     }
 
-    ret = load_subtitles(avctx);
+    /* Always add video input pad */
+    memset(&pad, 0, sizeof(pad));
+    pad.name = "default";
+    pad.type = AVMEDIA_TYPE_VIDEO;
+    ret = ff_append_inpad(avctx, &pad);
     if (ret < 0)
         return ret;
 
-    /* Pre-encode CC data for each subtitle event */
-    for (int i = 0; i < ctx->nb_events; i++) {
-        uint8_t tmp_buf[MAX_CC_PER_FRAME * 3];
-        int size = encode_text_to_cc(ctx, ctx->events[i].text, tmp_buf, sizeof(tmp_buf));
-        if (size > 0) {
-            ctx->events[i].cc_data = av_memdup(tmp_buf, size);
-            ctx->events[i].cc_data_size = size;
-            if (!ctx->events[i].cc_data)
-                return AVERROR(ENOMEM);
+    if (ctx->filename) {
+        /* File mode: load subtitles from file */
+        ctx->stream_input = 0;
+
+        ret = load_subtitles(avctx);
+        if (ret < 0)
+            return ret;
+
+        /* Pre-encode CC data for each subtitle event */
+        for (int i = 0; i < ctx->nb_events; i++) {
+            uint8_t tmp_buf[MAX_CC_PER_FRAME * 3];
+            int size = encode_text_to_cc(ctx, ctx->events[i].text, tmp_buf, sizeof(tmp_buf));
+            if (size > 0) {
+                ctx->events[i].cc_data = av_memdup(tmp_buf, size);
+                ctx->events[i].cc_data_size = size;
+                if (!ctx->events[i].cc_data)
+                    return AVERROR(ENOMEM);
+            }
         }
+    } else {
+        /* Stream mode: add subtitle input pad */
+        ctx->stream_input = 1;
+
+        memset(&pad, 0, sizeof(pad));
+        pad.name = "subtitle";
+        pad.type = AVMEDIA_TYPE_SUBTITLE;
+        ret = ff_append_inpad(avctx, &pad);
+        if (ret < 0)
+            return ret;
+
+        av_log(avctx, AV_LOG_INFO, "Stream input mode: expecting subtitle stream on second input\n");
     }
 
     /* Pre-encode erase (EDM) command */
@@ -749,6 +778,7 @@ static av_cold int init(AVFilterContext *avctx)
     ctx->erase_event = -1;
     ctx->next_load = 0;
     ctx->next_erase = 0;
+    ctx->sub_eof = 0;
 
     return 0;
 }
@@ -781,9 +811,60 @@ static void log_cc_data(AVFilterContext *avctx, const uint8_t *data, int size,
     av_bprint_finalize(&bp, NULL);
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
+/**
+ * Process a subtitle AVFrame arriving from the stream input.
+ */
+static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
 {
-    AVFilterContext *avctx = inlink->dst;
+    CEA608EmbedContext *ctx = avctx->priv;
+    AVSubtitle *sub;
+    AVFilterLink *sub_link = avctx->inputs[1];
+    int64_t start_pts, duration, end_pts;
+
+    if (!frame->buf[0])
+        return 0;
+
+    sub = (AVSubtitle *)frame->buf[0]->data;
+    if (!sub)
+        return 0;
+
+    start_pts = av_rescale_q(frame->pts, sub_link->time_base, AV_TIME_BASE_Q);
+    duration = (int64_t)sub->end_display_time * 1000;
+    end_pts = start_pts + duration;
+
+    for (int i = 0; i < sub->num_rects; i++) {
+        char *text = extract_subtitle_text(sub->rects[i]);
+        if (text) {
+            int ret = add_subtitle_event(ctx, start_pts, end_pts, text);
+            if (ret < 0) {
+                av_free(text);
+                return ret;
+            }
+            /* Pre-encode CC data immediately */
+            {
+                uint8_t tmp[MAX_CC_PER_FRAME * 3];
+                int size = encode_text_to_cc(ctx, text, tmp, sizeof(tmp));
+                if (size > 0) {
+                    int idx = ctx->nb_events - 1;
+                    ctx->events[idx].cc_data = av_memdup(tmp, size);
+                    ctx->events[idx].cc_data_size = size;
+                    if (!ctx->events[idx].cc_data) {
+                        av_free(text);
+                        return AVERROR(ENOMEM);
+                    }
+                }
+            }
+            av_free(text);
+        }
+    }
+    return 0;
+}
+
+/**
+ * Core video frame processing: schedule and inject CC data.
+ */
+static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVFrame *frame)
+{
     CEA608EmbedContext *ctx = avctx->priv;
     AVFilterLink *outlink = avctx->outputs[0];
     int64_t frame_pts;
@@ -808,26 +889,18 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
         while (ctx->next_erase < ctx->next_load && ctx->next_erase < ctx->nb_events) {
             SubtitleEvent *ev = &ctx->events[ctx->next_erase];
             if (!ev->sent)
-                break; /* Can't erase what hasn't been sent */
+                break;
             if (ev->cleared) {
                 ctx->next_erase++;
                 continue;
             }
             if (frame_pts >= ev->end_pts) {
-                /* Check if we should skip this erase: if the next event's
-                 * loading would overlap, the EOC will replace the display
-                 * anyway, so EDM is unnecessary */
                 int skip = 0;
                 int next = ctx->next_erase + 1;
                 if (next < ctx->nb_events && ctx->events[next].cc_data_size > 0) {
                     SubtitleEvent *nev = &ctx->events[next];
                     int npairs = nev->cc_data_size / 3;
                     int64_t nload = nev->start_pts - (int64_t)(npairs - 1) * ctx->frame_dur;
-                    av_log(avctx, AV_LOG_DEBUG,
-                           "erase_skip_check[%d]: frame=%.3f end=%.3f nload=%.3f threshold=%.3f %s\n",
-                           ctx->next_erase, frame_pts/1e6, ev->end_pts/1e6,
-                           nload/1e6, (ev->end_pts + 2*ctx->frame_dur)/1e6,
-                           nload <= ev->end_pts + 2*ctx->frame_dur ? "SKIP" : "ERASE");
                     if (nload <= ev->end_pts + 2 * ctx->frame_dur) {
                         skip = 1;
                         ev->cleared = 1;
@@ -836,9 +909,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                     }
                 }
                 if (!skip) {
-                    av_log(avctx, AV_LOG_DEBUG,
-                           "erase_start[%d]: frame=%.3f end=%.3f\n",
-                           ctx->next_erase, frame_pts/1e6, ev->end_pts/1e6);
                     ctx->erase_event = ctx->next_erase;
                     ctx->erase_pos = 0;
                     ctx->next_erase++;
@@ -849,31 +919,20 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             break;
         }
 
-        /* Check for events to start loading.
-         * Don't load the next event until the previous one has been fully
-         * cleared (erased or erase-skipped).  Without this gate, a new
-         * event whose preload-adjusted load_start has already passed would
-         * begin loading immediately after the previous drain completes,
-         * ignoring the display gap between them. */
+        /* Check for events to start loading */
         if (ctx->erase_event < 0 && ctx->next_load < ctx->nb_events &&
             (ctx->next_load == 0 || ctx->events[ctx->next_load - 1].cleared)) {
             SubtitleEvent *ev = &ctx->events[ctx->next_load];
             if (ev->cc_data_size > 0) {
                 int npairs = ev->cc_data_size / 3;
-                /* Schedule loading so the last triplet (EOC) lands at start_pts */
                 int64_t load_start = ev->start_pts - (int64_t)(npairs - 1) * ctx->frame_dur;
                 if (frame_pts >= load_start) {
-                    av_log(avctx, AV_LOG_DEBUG,
-                           "load_start[%d]: frame=%.3f load_start=%.3f start=%.3f end=%.3f npairs=%d\n",
-                           ctx->next_load, frame_pts/1e6, load_start/1e6,
-                           ev->start_pts/1e6, ev->end_pts/1e6, npairs);
                     ctx->drain_event = ctx->next_load;
                     ctx->drain_pos = 0;
                     ctx->next_load++;
                     log_cc_data(avctx, ev->cc_data, ev->cc_data_size, ev->text, 0);
                 }
             } else {
-                /* Skip events with empty cc_data */
                 ctx->events[ctx->next_load].sent = 1;
                 ctx->events[ctx->next_load].cleared = 1;
                 ctx->next_load++;
@@ -914,6 +973,63 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     return ff_filter_frame(outlink, frame);
 }
 
+static int activate(AVFilterContext *avctx)
+{
+    CEA608EmbedContext *ctx = avctx->priv;
+    AVFilterLink *video_link = avctx->inputs[0];
+    AVFilterLink *outlink = avctx->outputs[0];
+    AVFrame *frame;
+    int ret, status;
+    int64_t pts;
+
+    FF_FILTER_FORWARD_STATUS_BACK_ALL(outlink, avctx);
+
+    if (ctx->stream_input) {
+        AVFilterLink *sub_link = avctx->inputs[1];
+
+        /* Drain all available subtitle frames first */
+        if (!ctx->sub_eof) {
+            while (1) {
+                ret = ff_inlink_consume_frame(sub_link, &frame);
+                if (ret < 0)
+                    return ret;
+                if (!ret)
+                    break;
+                ret = process_subtitle_frame(avctx, frame);
+                av_frame_free(&frame);
+                if (ret < 0)
+                    return ret;
+            }
+
+            /* Check if subtitle input hit EOF */
+            if (ff_inlink_acknowledge_status(sub_link, &status, &pts))
+                ctx->sub_eof = 1;
+        }
+    }
+
+    /* Process one video frame */
+    ret = ff_inlink_consume_frame(video_link, &frame);
+    if (ret < 0)
+        return ret;
+    if (ret > 0)
+        return process_video_frame(avctx, video_link, frame);
+
+    /* Forward video EOF to output */
+    if (ff_inlink_acknowledge_status(video_link, &status, &pts)) {
+        ff_outlink_set_status(outlink, status, pts);
+        return 0;
+    }
+
+    /* Request more frames */
+    if (ff_outlink_frame_wanted(outlink)) {
+        ff_inlink_request_frame(video_link);
+        if (ctx->stream_input && !ctx->sub_eof)
+            ff_inlink_request_frame(avctx->inputs[1]);
+    }
+
+    return 0;
+}
+
 static av_cold void uninit(AVFilterContext *avctx)
 {
     CEA608EmbedContext *ctx = avctx->priv;
@@ -941,21 +1057,39 @@ static const AVOption cea608embed_options[] = {
 
 AVFILTER_DEFINE_CLASS(cea608embed);
 
-static const AVFilterPad cea608embed_inputs[] = {
+static int config_output(AVFilterLink *outlink)
+{
+    AVFilterContext *ctx = outlink->src;
+    AVFilterLink *inlink = ctx->inputs[0]; /* video input */
+    FilterLink *il = ff_filter_link(inlink);
+    FilterLink *ol = ff_filter_link(outlink);
+
+    outlink->w          = inlink->w;
+    outlink->h          = inlink->h;
+    outlink->time_base  = inlink->time_base;
+    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
+    ol->frame_rate      = il->frame_rate;
+
+    return 0;
+}
+
+static const AVFilterPad cea608embed_outputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = filter_frame,
+        .config_props = config_output,
     },
 };
 
 const FFFilter ff_vf_cea608embed = {
     .p.name        = "cea608embed",
-    .p.description = NULL_IF_CONFIG_SMALL("Embed CEA-608 closed captions from subtitle file"),
+    .p.description = NULL_IF_CONFIG_SMALL("Embed CEA-608 closed captions from file or subtitle stream"),
     .p.priv_class  = &cea608embed_class,
+    .p.inputs      = NULL,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size     = sizeof(CEA608EmbedContext),
     .init          = init,
     .uninit        = uninit,
-    FILTER_INPUTS(cea608embed_inputs),
-    FILTER_OUTPUTS(ff_video_default_filterpad),
+    .activate      = activate,
+    FILTER_OUTPUTS(cea608embed_outputs),
 };
