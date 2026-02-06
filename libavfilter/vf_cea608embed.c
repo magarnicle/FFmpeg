@@ -565,6 +565,13 @@ static int load_subtitles(AVFilterContext *avctx)
 
     av_log(avctx, AV_LOG_INFO, "Loaded %d subtitle events from '%s'\n",
            ctx->nb_events, ctx->filename);
+    for (int i = 0; i < ctx->nb_events; i++) {
+        SubtitleEvent *ev = &ctx->events[i];
+        av_log(avctx, AV_LOG_DEBUG,
+               "  event[%d]: start=%"PRId64" (%.3fs) end=%"PRId64" (%.3fs) \"%s\"\n",
+               i, ev->start_pts, ev->start_pts / 1e6,
+               ev->end_pts, ev->end_pts / 1e6, ev->text);
+    }
     ret = 0;
 
 end:
@@ -816,6 +823,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                     SubtitleEvent *nev = &ctx->events[next];
                     int npairs = nev->cc_data_size / 3;
                     int64_t nload = nev->start_pts - (int64_t)(npairs - 1) * ctx->frame_dur;
+                    av_log(avctx, AV_LOG_DEBUG,
+                           "erase_skip_check[%d]: frame=%.3f end=%.3f nload=%.3f threshold=%.3f %s\n",
+                           ctx->next_erase, frame_pts/1e6, ev->end_pts/1e6,
+                           nload/1e6, (ev->end_pts + 2*ctx->frame_dur)/1e6,
+                           nload <= ev->end_pts + 2*ctx->frame_dur ? "SKIP" : "ERASE");
                     if (nload <= ev->end_pts + 2 * ctx->frame_dur) {
                         skip = 1;
                         ev->cleared = 1;
@@ -824,6 +836,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                     }
                 }
                 if (!skip) {
+                    av_log(avctx, AV_LOG_DEBUG,
+                           "erase_start[%d]: frame=%.3f end=%.3f\n",
+                           ctx->next_erase, frame_pts/1e6, ev->end_pts/1e6);
                     ctx->erase_event = ctx->next_erase;
                     ctx->erase_pos = 0;
                     ctx->next_erase++;
@@ -834,14 +849,24 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             break;
         }
 
-        /* Check for events to start loading */
-        if (ctx->erase_event < 0 && ctx->next_load < ctx->nb_events) {
+        /* Check for events to start loading.
+         * Don't load the next event until the previous one has been fully
+         * cleared (erased or erase-skipped).  Without this gate, a new
+         * event whose preload-adjusted load_start has already passed would
+         * begin loading immediately after the previous drain completes,
+         * ignoring the display gap between them. */
+        if (ctx->erase_event < 0 && ctx->next_load < ctx->nb_events &&
+            (ctx->next_load == 0 || ctx->events[ctx->next_load - 1].cleared)) {
             SubtitleEvent *ev = &ctx->events[ctx->next_load];
             if (ev->cc_data_size > 0) {
                 int npairs = ev->cc_data_size / 3;
                 /* Schedule loading so the last triplet (EOC) lands at start_pts */
                 int64_t load_start = ev->start_pts - (int64_t)(npairs - 1) * ctx->frame_dur;
                 if (frame_pts >= load_start) {
+                    av_log(avctx, AV_LOG_DEBUG,
+                           "load_start[%d]: frame=%.3f load_start=%.3f start=%.3f end=%.3f npairs=%d\n",
+                           ctx->next_load, frame_pts/1e6, load_start/1e6,
+                           ev->start_pts/1e6, ev->end_pts/1e6, npairs);
                     ctx->drain_event = ctx->next_load;
                     ctx->drain_pos = 0;
                     ctx->next_load++;
