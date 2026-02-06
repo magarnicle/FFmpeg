@@ -840,12 +840,12 @@ static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
                 av_free(text);
                 return ret;
             }
-            /* Pre-encode CC data immediately */
+            /* Pre-encode CC data from the wrapped text */
             {
+                int idx = ctx->nb_events - 1;
                 uint8_t tmp[MAX_CC_PER_FRAME * 3];
-                int size = encode_text_to_cc(ctx, text, tmp, sizeof(tmp));
+                int size = encode_text_to_cc(ctx, ctx->events[idx].text, tmp, sizeof(tmp));
                 if (size > 0) {
-                    int idx = ctx->nb_events - 1;
                     ctx->events[idx].cc_data = av_memdup(tmp, size);
                     ctx->events[idx].cc_data_size = size;
                     if (!ctx->events[idx].cc_data) {
