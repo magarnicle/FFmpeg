@@ -2,11 +2,12 @@
 # FFmpeg QC script equivalent to Venera Pulsar "ACCTV NEW Master" template
 # Usage: ./pulsar_qc.sh <input_file>
 
-set -euo pipefail
+set -uo pipefail
 
 INPUT="$1"
-FFPROBE="ffprobe"
-FFMPEG="ffmpeg"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FFPROBE="${SCRIPT_DIR}/ffprobe"
+FFMPEG="${SCRIPT_DIR}/ffmpeg"
 REPORT_DIR="./qc_reports"
 mkdir -p "$REPORT_DIR"
 BASENAME=$(basename "$INPUT")
@@ -122,7 +123,7 @@ echo "--- AUDIO PARAMETER CHECKS ---" | tee -a "$REPORT"
 
 A_CODEC=$($FFPROBE -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT")
 A_SAMPLE_RATE=$($FFPROBE -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$INPUT")
-A_BITS=$($FFPROBE -v error -select_streams a:0 -show_entries stream=bits_per_raw_sample,bits_per_coded_sample -of csv=p=0 "$INPUT" | tr ',' '\n' | grep -v "^$" | head -1)
+A_BITS=$($FFPROBE -v error -select_streams a:0 -show_entries stream=bits_per_raw_sample,bits_per_coded_sample,bits_per_sample -of csv=p=0 "$INPUT" | tr ',' '\n' | grep -v "^$" | grep -v "N/A" | grep -v "0" | head -1)
 
 # Codec check: PCM (sowt, twos, or raw)
 if [[ "$A_CODEC" != "pcm_s16le" && "$A_CODEC" != "pcm_s16be" && "$A_CODEC" != "pcm_s24le" && "$A_CODEC" != "pcm_s24be" && "$A_CODEC" != *"pcm"* ]]; then
