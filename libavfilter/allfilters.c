@@ -216,6 +216,7 @@ extern const FFFilter ff_vf_chromanr;
 extern const FFFilter ff_vf_chromashift;
 extern const FFFilter ff_vf_ciescope;
 extern const FFFilter ff_vf_codecview;
+extern const FFFilter ff_vf_colorbarsdetect;
 extern const FFFilter ff_vf_colorbalance;
 extern const FFFilter ff_vf_colorchannelmixer;
 extern const FFFilter ff_vf_colorcontrast;
