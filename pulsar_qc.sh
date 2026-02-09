@@ -175,7 +175,7 @@ QC_OUTPUT=$($FFMPEG -i "$INPUT" \
         [a1]silencedetect=noise=-60dB:d=10[aout];
         [a2]ebur128=peak=true:framelog=verbose,anullsink;
         [a3]clipdetect=n=1000,anullsink;
-        [a4]dualmonodetect,anullsink
+        [a4]dualmonodetect=d=2:ratio=50,anullsink
     " -map "[vout]" -map "[aout]" -f null - 2>&1)
 
 # Parse results from the combined output
@@ -258,11 +258,19 @@ fi
 
 # Dual mono
 DUALMONO=$(echo "$QC_OUTPUT" | grep "dual_mono_start:" | sed 's/.*dual_mono_start/dual_mono_start/' || true)
+DUALMONO_PCT=$(echo "$QC_OUTPUT" | grep "dual_mono_percent:" | sed 's/.*dual_mono_total/dual_mono_total/' || true)
+DUALMONO_WARN=$(echo "$QC_OUTPUT" | grep "dual mono percentage" | sed 's/.*dual mono/dual mono/' || true)
 if [[ -n "$DUALMONO" ]]; then
     echo "$DUALMONO" | tee -a "$REPORT"
-    warn "Dual mono detected"
-else
-    info "No dual mono detected"
+    warn "Dual mono regions detected (>= 2s)"
+fi
+if [[ -n "$DUALMONO_PCT" ]]; then
+    echo "$DUALMONO_PCT" | tee -a "$REPORT"
+fi
+if [[ -n "$DUALMONO_WARN" ]]; then
+    warn "$DUALMONO_WARN"
+elif [[ -z "$DUALMONO" ]]; then
+    info "No significant dual mono detected"
 fi
 
 # ============================================================

@@ -27,6 +27,12 @@
  * left and right channels. If the difference energy is below a
  * threshold relative to the signal energy, the audio is flagged
  * as dual mono.
+ *
+ * Options:
+ *   threshold (th): max diff/signal energy ratio to consider dual mono (default 0.001)
+ *   duration (d):   minimum duration in seconds for a dual mono region to be reported (default 2)
+ *   ratio (r):      if set >0, report overall dual mono percentage at end and warn if
+ *                   the percentage exceeds this value (0-100, default 0 = disabled)
  */
 
 #include <float.h>
@@ -42,13 +48,15 @@ typedef struct DualMonoDetectContext {
     const AVClass *class;
 
     double threshold;           ///< max diff/signal ratio to consider dual mono
-    double min_duration_time;   ///< minimum duration in seconds to report
-    int64_t min_duration;       ///< minimum duration in samples
+    int64_t duration;           ///< minimum duration of dual mono to report (microseconds)
+    double ratio;               ///< percentage threshold for overall dual mono warning (0=disabled)
 
     int dual_mono_started;
     int64_t dm_start_pts;       ///< pts of start of dual mono region
     int64_t dm_end_pts;         ///< pts of end of dual mono region
     int64_t last_pts;
+    int64_t total_dm_samples;   ///< total samples in dual mono regions
+    int64_t total_samples;      ///< total samples processed
     int sample_rate;
     AVRational time_base;
 } DualMonoDetectContext;
@@ -61,10 +69,14 @@ static const AVOption dualmonodetect_options[] = {
       AV_OPT_TYPE_DOUBLE, {.dbl = 0.001}, 0, 1, FLAGS },
     { "th", "set difference threshold ratio", OFFSET(threshold),
       AV_OPT_TYPE_DOUBLE, {.dbl = 0.001}, 0, 1, FLAGS },
-    { "d", "set minimum duration in seconds", OFFSET(min_duration_time),
-      AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, DBL_MAX, FLAGS },
-    { "duration", "set minimum duration in seconds", OFFSET(min_duration_time),
-      AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, DBL_MAX, FLAGS },
+    { "d", "set minimum duration in seconds", OFFSET(duration),
+      AV_OPT_TYPE_DURATION, {.i64 = 2000000}, 0, INT64_MAX, FLAGS },
+    { "duration", "set minimum duration in seconds", OFFSET(duration),
+      AV_OPT_TYPE_DURATION, {.i64 = 2000000}, 0, INT64_MAX, FLAGS },
+    { "ratio", "set percentage threshold for overall dual mono warning (0=disabled)", OFFSET(ratio),
+      AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, 100, FLAGS },
+    { "r", "set percentage threshold for overall dual mono warning (0=disabled)", OFFSET(ratio),
+      AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, 100, FLAGS },
     { NULL }
 };
 
@@ -77,7 +89,6 @@ static int config_input(AVFilterLink *inlink)
 
     s->sample_rate = inlink->sample_rate;
     s->time_base = inlink->time_base;
-    s->min_duration = s->min_duration_time * s->sample_rate;
 
     if (inlink->ch_layout.nb_channels != 2) {
         av_log(ctx, AV_LOG_ERROR, "dualmonodetect requires stereo input (got %d channels)\n",
@@ -86,16 +97,20 @@ static int config_input(AVFilterLink *inlink)
     }
 
     av_log(ctx, AV_LOG_VERBOSE,
-           "threshold:%f min_duration:%.3fs sample_rate:%d\n",
-           s->threshold, s->min_duration_time, s->sample_rate);
+           "threshold:%f duration:%s sample_rate:%d ratio:%.1f%%\n",
+           s->threshold,
+           av_ts2timestr(s->duration, &AV_TIME_BASE_Q),
+           s->sample_rate, s->ratio);
     return 0;
 }
 
 static void report_dual_mono(AVFilterContext *ctx)
 {
     DualMonoDetectContext *s = ctx->priv;
+    int64_t dm_duration = av_rescale_q(s->dm_end_pts - s->dm_start_pts,
+                                       s->time_base, AV_TIME_BASE_Q);
 
-    if (s->dm_end_pts > s->dm_start_pts) {
+    if (dm_duration >= s->duration) {
         av_log(ctx, AV_LOG_INFO,
                "dual_mono_start:%s dual_mono_end:%s dual_mono_duration:%s\n",
                av_ts2timestr(s->dm_start_pts, &s->time_base),
@@ -104,6 +119,41 @@ static void report_dual_mono(AVFilterContext *ctx)
     }
 }
 
+/**
+ * Compute diff/signal energy ratio for a frame. Returns 1 if dual mono.
+ * Handles all supported sample formats via a macro to avoid duplication.
+ */
+#define COMPUTE_DUAL_MONO_PLANAR(type, cast)                                \
+    do {                                                                    \
+        const type *left  = (const type *)frame->extended_data[0];          \
+        const type *right = (const type *)frame->extended_data[1];          \
+        double diff_energy = 0, signal_energy = 0;                         \
+        for (int i = 0; i < nb_samples; i++) {                             \
+            double l = (cast)left[i], r = (cast)right[i];                  \
+            double d = l - r;                                              \
+            diff_energy += d * d;                                          \
+            signal_energy += l * l + r * r;                                \
+        }                                                                  \
+        is_dual_mono = signal_energy > 0                                   \
+            ? (diff_energy / signal_energy) < s->threshold                 \
+            : 1;                                                           \
+    } while (0)
+
+#define COMPUTE_DUAL_MONO_INTERLEAVED(type, cast)                           \
+    do {                                                                    \
+        const type *data = (const type *)frame->data[0];                    \
+        double diff_energy = 0, signal_energy = 0;                         \
+        for (int i = 0; i < nb_samples; i++) {                             \
+            double l = (cast)data[i * 2], r = (cast)data[i * 2 + 1];      \
+            double d = l - r;                                              \
+            diff_energy += d * d;                                          \
+            signal_energy += l * l + r * r;                                \
+        }                                                                  \
+        is_dual_mono = signal_energy > 0                                   \
+            ? (diff_energy / signal_energy) < s->threshold                 \
+            : 1;                                                           \
+    } while (0)
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -111,149 +161,31 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     int nb_samples = frame->nb_samples;
     int is_dual_mono = 0;
 
-    if (frame->format == AV_SAMPLE_FMT_FLTP) {
-        const float *left  = (const float *)frame->extended_data[0];
-        const float *right = (const float *)frame->extended_data[1];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            double d = left[i] - right[i];
-            diff_energy += d * d;
-            signal_energy += left[i] * (double)left[i] + right[i] * (double)right[i];
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        /* Also flag as dual mono if both channels are silent */
-        if (signal_energy == 0)
-            is_dual_mono = 1;
-    } else if (frame->format == AV_SAMPLE_FMT_FLT) {
-        const float *data = (const float *)frame->data[0];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            float left  = data[i * 2];
-            float right = data[i * 2 + 1];
-            double d = left - right;
-            diff_energy += d * d;
-            signal_energy += left * (double)left + right * (double)right;
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        if (signal_energy == 0)
-            is_dual_mono = 1;
-    } else if (frame->format == AV_SAMPLE_FMT_DBLP) {
-        const double *left  = (const double *)frame->extended_data[0];
-        const double *right = (const double *)frame->extended_data[1];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            double d = left[i] - right[i];
-            diff_energy += d * d;
-            signal_energy += left[i] * left[i] + right[i] * right[i];
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        if (signal_energy == 0)
-            is_dual_mono = 1;
-    } else if (frame->format == AV_SAMPLE_FMT_DBL) {
-        const double *data = (const double *)frame->data[0];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            double left  = data[i * 2];
-            double right = data[i * 2 + 1];
-            double d = left - right;
-            diff_energy += d * d;
-            signal_energy += left * left + right * right;
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        if (signal_energy == 0)
-            is_dual_mono = 1;
-    } else if (frame->format == AV_SAMPLE_FMT_S16P) {
-        const int16_t *left  = (const int16_t *)frame->extended_data[0];
-        const int16_t *right = (const int16_t *)frame->extended_data[1];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            double d = left[i] - right[i];
-            diff_energy += d * d;
-            signal_energy += (double)left[i] * left[i] + (double)right[i] * right[i];
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        if (signal_energy == 0)
-            is_dual_mono = 1;
-    } else if (frame->format == AV_SAMPLE_FMT_S16) {
-        const int16_t *data = (const int16_t *)frame->data[0];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            double left  = data[i * 2];
-            double right = data[i * 2 + 1];
-            double d = left - right;
-            diff_energy += d * d;
-            signal_energy += left * left + right * right;
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        if (signal_energy == 0)
-            is_dual_mono = 1;
-    } else if (frame->format == AV_SAMPLE_FMT_S32P) {
-        const int32_t *left  = (const int32_t *)frame->extended_data[0];
-        const int32_t *right = (const int32_t *)frame->extended_data[1];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            double d = (double)left[i] - right[i];
-            diff_energy += d * d;
-            signal_energy += (double)left[i] * left[i] + (double)right[i] * right[i];
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        if (signal_energy == 0)
-            is_dual_mono = 1;
-    } else if (frame->format == AV_SAMPLE_FMT_S32) {
-        const int32_t *data = (const int32_t *)frame->data[0];
-        double diff_energy = 0, signal_energy = 0;
-
-        for (int i = 0; i < nb_samples; i++) {
-            double left  = data[i * 2];
-            double right = data[i * 2 + 1];
-            double d = left - right;
-            diff_energy += d * d;
-            signal_energy += left * left + right * right;
-        }
-
-        double ratio = (signal_energy > 0) ? diff_energy / signal_energy : 0;
-        is_dual_mono = (ratio < s->threshold);
-        if (signal_energy == 0)
-            is_dual_mono = 1;
+    switch (frame->format) {
+    case AV_SAMPLE_FMT_FLTP:  COMPUTE_DUAL_MONO_PLANAR(float, double);       break;
+    case AV_SAMPLE_FMT_FLT:   COMPUTE_DUAL_MONO_INTERLEAVED(float, double);  break;
+    case AV_SAMPLE_FMT_DBLP:  COMPUTE_DUAL_MONO_PLANAR(double, double);      break;
+    case AV_SAMPLE_FMT_DBL:   COMPUTE_DUAL_MONO_INTERLEAVED(double, double); break;
+    case AV_SAMPLE_FMT_S16P:  COMPUTE_DUAL_MONO_PLANAR(int16_t, double);     break;
+    case AV_SAMPLE_FMT_S16:   COMPUTE_DUAL_MONO_INTERLEAVED(int16_t, double);break;
+    case AV_SAMPLE_FMT_S32P:  COMPUTE_DUAL_MONO_PLANAR(int32_t, double);     break;
+    case AV_SAMPLE_FMT_S32:   COMPUTE_DUAL_MONO_INTERLEAVED(int32_t, double);break;
     }
+
+    s->total_samples += nb_samples;
+    if (is_dual_mono)
+        s->total_dm_samples += nb_samples;
 
     if (is_dual_mono) {
         if (!s->dual_mono_started) {
             s->dual_mono_started = 1;
             s->dm_start_pts = frame->pts;
-            av_dict_set(&frame->metadata, "lavfi.dual_mono", "1", 0);
-            av_dict_set(&frame->metadata, "lavfi.dual_mono_start",
-                        av_ts2timestr(frame->pts, &s->time_base), 0);
         }
         s->dm_end_pts = frame->pts +
             av_rescale_q(nb_samples, (AVRational){1, s->sample_rate}, s->time_base);
     } else if (s->dual_mono_started) {
         s->dual_mono_started = 0;
         report_dual_mono(ctx);
-        av_dict_set(&frame->metadata, "lavfi.dual_mono", "0", 0);
-        av_dict_set(&frame->metadata, "lavfi.dual_mono_end",
-                    av_ts2timestr(s->dm_end_pts, &s->time_base), 0);
     }
 
     s->last_pts = frame->pts +
@@ -265,9 +197,24 @@ static av_cold void uninit(AVFilterContext *ctx)
 {
     DualMonoDetectContext *s = ctx->priv;
 
+    /* Flush any in-progress region */
     if (s->dual_mono_started) {
         s->dm_end_pts = s->last_pts;
         report_dual_mono(ctx);
+    }
+
+    /* Report overall dual mono percentage */
+    if (s->total_samples > 0) {
+        double pct = 100.0 * s->total_dm_samples / s->total_samples;
+        av_log(ctx, AV_LOG_INFO,
+               "dual_mono_total_samples:%"PRId64" total_samples:%"PRId64" dual_mono_percent:%.2f%%\n",
+               s->total_dm_samples, s->total_samples, pct);
+
+        if (s->ratio > 0 && pct >= s->ratio) {
+            av_log(ctx, AV_LOG_WARNING,
+                   "dual mono percentage %.2f%% exceeds threshold %.1f%%\n",
+                   pct, s->ratio);
+        }
     }
 }
 
