@@ -123,6 +123,7 @@ extern const FFFilter ff_af_dcshift;
 extern const FFFilter ff_af_deesser;
 extern const FFFilter ff_af_dialoguenhance;
 extern const FFFilter ff_af_drmeter;
+extern const FFFilter ff_af_dualmonodetect;
 extern const FFFilter ff_af_dynaudnorm;
 extern const FFFilter ff_af_earwax;
 extern const FFFilter ff_af_ebur128;

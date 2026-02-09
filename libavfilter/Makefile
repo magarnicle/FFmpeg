@@ -137,6 +137,7 @@ OBJS-$(CONFIG_DCSHIFT_FILTER)                += af_dcshift.o
 OBJS-$(CONFIG_DEESSER_FILTER)                += af_deesser.o
 OBJS-$(CONFIG_DIALOGUENHANCE_FILTER)         += af_dialoguenhance.o
 OBJS-$(CONFIG_DRMETER_FILTER)                += af_drmeter.o
+OBJS-$(CONFIG_DUALMONODETECT_FILTER)         += af_dualmonodetect.o
 OBJS-$(CONFIG_DYNAUDNORM_FILTER)             += af_dynaudnorm.o
 OBJS-$(CONFIG_EARWAX_FILTER)                 += af_earwax.o
 OBJS-$(CONFIG_EBUR128_FILTER)                += f_ebur128.o
