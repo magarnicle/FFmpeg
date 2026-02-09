@@ -1,0 +1,56 @@
+Type	General
+Template Name	ACCTV NEW Master
+Category	ACCTV
+General
+File Filters	Include only - mov
+Reporting	Report Path : C:\Users\Administrator\Documents\Pulsar_Reports
+Report Language(s): eng(English)
+Default Report Language: eng(English)
+Allow long path for report : Enabled
+Generate additional reports: PDF
+Report Customization	File name in report : Fully Qualified File Path
+Error Reporting	Max errors (overall): 500, Max errors (per check): 200, Thumbnail resolution: Actual Size, Thumbnail naming convention: Frame index based
+Analysis Mode	Full Analysis
+Template information	Attach template information to the end of job report
+Correction Path	Modify existing file
+Container
+Conformance	Enabled
+Unsupported streams	Video [E] , Audio [E]
+File Size	Minimum: 10 MB [E]
+Report MD5 CheckSum	Enabled
+Container Type	MP4/MOV/3GPP [E]
+Match file extension [E]
+MXF
+Timecode	Source for reporting: EBU recommended timecode source
+Video
+Video Parameters
+Video Conformance	Enabled
+Codec	ProRes [E]
+Chroma Format	4:2:2 [E]
+Video Format	PAL [E]
+Frame rate	25 [E]
+Display Width	1920 [E]
+Display Height	1080 [E]
+ProRes
+Verify profile/Level	ProRes 422 LT [E]
+Video Quality
+Black Frames	Bit depth: 8, Luma Level: 20, Frame Count: greater than 75 [W]
+Color Bar	Enabled [E]
+Freeze Frames	Sensitivity: 1, Minimum Duration: 00 hh 00 mm 20 ss 00 ff Timecode, Maximum Duration: hh mm ss ff Timecode [E] ,
+Audio
+Audio Parameters
+Codec	SOWT PCM, TWOS PCM, RAW PCM [E]
+Sampling Frequency	48000 [E]
+Quantization Bits	16 [E]
+Audio Quality
+Dual Mono	Enabled [W]
+Mute	Duration: 10 seconds [W]
+Loudness	Mode: OP-59
+Integrated with Relative Gate (-10 LKFS), Max Loudness: -24 LKFS with tolerance of 1 [W] , Min Loudness: -26 LKFS with tolerance of 1 [W] , DialNorm: None [W]
+Correct Loudness: Enabled
+True Peak	True Peak detection: Level: -2 dBTP, Sample count: 1 [E]
+Clipping	Duration: 1000 samples [W]
+Cross-check
+Video (container & essence)	Display width [W] Report only if present at both locations , Display Height [W] Report only if present at both locations , Frame rate [W] Report only if present at both locations , Chroma Format [W] Report only if present at both locations , Duration with tolerance of 999 [W] Report only if present at both locations
+Audio (container & essence)	Sampling frequency [W] Report only if present at both locations , Bit depth [W] Report only if present at both locations , Duration with tolerance of 999 [W] Report only if present at both locations
+Audio-Video	Actual duration with tolerance of 999 [W] 

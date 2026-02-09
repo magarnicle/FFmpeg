@@ -1,0 +1,134 @@
+============================================================
+Pulsar QC Features NOT Achievable with Current FFmpeg
+============================================================
+This document identifies Pulsar template checks that ffmpeg cannot
+currently replicate and proposes what would need to be added.
+
+============================================================
+1. COLOR BAR DETECTION
+============================================================
+Pulsar check: "Color Bar: Enabled [E]"
+Purpose: Detect presence of SMPTE/EBU color bars (typically at head/tail).
+
+Current state: FFmpeg has no color bar DETECTION filter. It can GENERATE
+color bars (smptebars/smptehdbars source filters) but cannot detect them.
+
+Plan:
+- Create a new video filter: vf_colorbarsdetect.c
+- Approach: Compare input frames against known color bar patterns
+  (SMPTE, EBU, ARIB) using template matching or histogram analysis.
+- Each frame's color histogram can be compared against reference
+  histograms for standard bar patterns.
+- Output metadata: colorbar_start, colorbar_end, colorbar_type
+- Complexity: Medium. The patterns are well-defined; histogram matching
+  against known references is straightforward.
+
+============================================================
+2. DUAL MONO DETECTION
+============================================================
+Pulsar check: "Dual Mono: Enabled [W]"
+Purpose: Detect when left and right channels carry identical audio
+(mono content duplicated to stereo).
+
+Current state: No dedicated filter. Could be approximated by:
+  ffmpeg -i input -af "pan=1c|c0=c0-c1,astats" -f null -
+  (subtract channels; if RMS is near-silent, it's dual mono)
+But this is a workaround, not a proper detection with metadata output.
+
+Plan:
+- Create a new audio filter: af_dualmono.c
+- Approach: Compute cross-correlation or difference between channel
+  pairs. If the difference energy is below a threshold, flag as
+  dual mono.
+- Output metadata: dual_mono=true/false per segment
+- Alternatively, extend the existing astats filter to report
+  inter-channel correlation coefficient. If correlation ≈ 1.0 across
+  the file, it's dual mono.
+- Complexity: Low-Medium.
+
+============================================================
+3. AUDIO CLIPPING DETECTION (sample-count based)
+============================================================
+Pulsar check: "Clipping: Duration: 1000 samples [W]"
+Purpose: Detect sustained clipping (samples at max level) lasting
+at least 1000 consecutive samples.
+
+Current state: astats can count total clipped samples but does NOT
+report consecutive clip duration. It has no "sustained clipping"
+threshold.
+
+Plan:
+- Extend af_astats.c to add a "min_clip_duration" option that only
+  reports clipping events where consecutive clipped samples exceed
+  the threshold.
+- Or create a dedicated af_clipdetect.c filter that:
+  - Tracks runs of consecutive clipped samples (>= +/- full scale)
+  - Reports start time, duration, and channel for each event
+  - Accepts a threshold for minimum consecutive sample count
+- Complexity: Low.
+
+============================================================
+4. CONTAINER vs ESSENCE CROSS-CHECK
+============================================================
+Pulsar check: Cross-check section comparing container-level metadata
+against essence-level metadata for resolution, frame rate, chroma,
+sample rate, bit depth, and duration.
+
+Current state: ffprobe reports both container and stream level info,
+but there is no built-in mechanism to cross-check and flag
+discrepancies. This is currently a scripting exercise.
+
+Plan:
+- This is best handled in the QC shell script rather than inside
+  ffmpeg itself. The script (pulsar_qc.sh) can query ffprobe for
+  both container-level and stream-level values and compare them.
+- For the duration cross-check: compare format duration vs stream
+  duration and flag if they differ beyond the tolerance (999ms as
+  specified in the template).
+- Already partially addressed in the script. No ffmpeg code changes
+  needed — just script improvements.
+- Complexity: Low (script only).
+
+============================================================
+5. TIMECODE HANDLING (EBU Recommended Source)
+============================================================
+Pulsar check: "Timecode Source for reporting: EBU recommended timecode source"
+Purpose: Extract and report timecode from the EBU-recommended location
+in the container (e.g., tmcd track in MOV, or MXF timecode).
+
+Current state: ffprobe can extract timecode from MOV tmcd tracks and
+MXF containers. The information is available but requires specific
+ffprobe queries. No gap vs. what Pulsar does — this is scriptable.
+
+Plan:
+- Script improvement only. Use:
+  ffprobe -v error -show_entries stream_tags=timecode \
+    -select_streams d:0 -of csv=p=0 input.mov
+- Complexity: Low (script only).
+
+============================================================
+6. PDF REPORT GENERATION
+============================================================
+Pulsar check: "Generate additional reports: PDF"
+
+Current state: ffmpeg/ffprobe output text only. No PDF generation.
+
+Plan:
+- Handle outside ffmpeg entirely. The QC script can pipe its text
+  report through a tool like `pandoc`, `wkhtmltopdf`, or `enscript`
+  to produce PDF output.
+- Complexity: Low (external tool, not ffmpeg).
+
+============================================================
+SUMMARY: What Needs to Be Built in FFmpeg
+============================================================
+Priority  | Item                        | Effort
+----------|-----------------------------|--------
+HIGH      | Color bar detection filter  | Medium
+MEDIUM    | Dual mono detection filter  | Low-Med
+LOW       | Sustained clipping in astats| Low
+N/A       | Cross-check, timecode, PDF  | Script only
+
+The remaining checks (black frames, freeze frames, silence, loudness,
+true peak, codec/format validation) are all fully achievable with
+existing ffmpeg filters and ffprobe, as implemented in pulsar_qc.sh.
