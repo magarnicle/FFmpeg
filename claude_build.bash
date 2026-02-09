@@ -43,8 +43,8 @@ PATH="$HOME/bin:$PATH" PKG_CONFIG_PATH="/usr/src/ffmpeg/build/lib/pkgconfig:/usr
 --enable-libx264 \
 --enable-libx265 \
 --enable-libklvanc \
---enable-nonfree \
---enable-decklink
+--enable-nonfree
+#--enable-decklink
 #--enable-swscale-alpha
 # --enable-openssl \
 # --enable-libfreetype # for graphics
