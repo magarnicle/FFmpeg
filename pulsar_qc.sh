@@ -1,6 +1,9 @@
 #!/bin/bash
 # FFmpeg QC script equivalent to Venera Pulsar "ACCTV NEW Master" template
 # Usage: ./pulsar_qc.sh <input_file>
+#
+# Runs all video and audio quality checks in a single ffmpeg decode pass
+# using a complex filtergraph.
 
 set -uo pipefail
 
@@ -60,18 +63,21 @@ MD5=$(md5sum "$INPUT" | awk '{print $1}')
 info "MD5 Checksum: $MD5"
 
 # ============================================================
-# 2. VIDEO PARAMETER CHECKS
+# 2. VIDEO PARAMETER CHECKS (single ffprobe call)
 # ============================================================
 echo "" | tee -a "$REPORT"
 echo "--- VIDEO PARAMETER CHECKS ---" | tee -a "$REPORT"
 
-# Extract video stream info
-V_CODEC=$($FFPROBE -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT")
-V_WIDTH=$($FFPROBE -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$INPUT")
-V_HEIGHT=$($FFPROBE -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$INPUT")
-V_FPS=$($FFPROBE -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$INPUT")
-V_PIX_FMT=$($FFPROBE -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$INPUT")
-V_PROFILE=$($FFPROBE -v error -select_streams v:0 -show_entries stream=profile -of csv=p=0 "$INPUT")
+# Extract all video stream info in one ffprobe call
+V_INFO=$($FFPROBE -v error -select_streams v:0 \
+    -show_entries stream=codec_name,width,height,r_frame_rate,pix_fmt,profile \
+    -of default=nw=1:nk=0 "$INPUT")
+V_CODEC=$(echo "$V_INFO" | grep "^codec_name=" | cut -d= -f2)
+V_WIDTH=$(echo "$V_INFO" | grep "^width=" | cut -d= -f2)
+V_HEIGHT=$(echo "$V_INFO" | grep "^height=" | cut -d= -f2)
+V_FPS=$(echo "$V_INFO" | grep "^r_frame_rate=" | cut -d= -f2)
+V_PIX_FMT=$(echo "$V_INFO" | grep "^pix_fmt=" | cut -d= -f2)
+V_PROFILE=$(echo "$V_INFO" | grep "^profile=" | cut -d= -f2)
 
 # Codec check: ProRes
 if [[ "$V_CODEC" != "prores" ]]; then
@@ -116,14 +122,17 @@ else
 fi
 
 # ============================================================
-# 3. AUDIO PARAMETER CHECKS
+# 3. AUDIO PARAMETER CHECKS (single ffprobe call)
 # ============================================================
 echo "" | tee -a "$REPORT"
 echo "--- AUDIO PARAMETER CHECKS ---" | tee -a "$REPORT"
 
-A_CODEC=$($FFPROBE -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$INPUT")
-A_SAMPLE_RATE=$($FFPROBE -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$INPUT")
-A_BITS=$($FFPROBE -v error -select_streams a:0 -show_entries stream=bits_per_raw_sample,bits_per_coded_sample,bits_per_sample -of csv=p=0 "$INPUT" | tr ',' '\n' | grep -v "^$" | grep -v "N/A" | grep -v "0" | head -1)
+A_INFO=$($FFPROBE -v error -select_streams a:0 \
+    -show_entries stream=codec_name,sample_rate,bits_per_raw_sample,bits_per_coded_sample,bits_per_sample \
+    -of default=nw=1:nk=0 "$INPUT")
+A_CODEC=$(echo "$A_INFO" | grep "^codec_name=" | cut -d= -f2)
+A_SAMPLE_RATE=$(echo "$A_INFO" | grep "^sample_rate=" | cut -d= -f2)
+A_BITS=$(echo "$A_INFO" | grep "^bits_per" | cut -d= -f2 | grep -v "N/A" | grep -v "^0$" | head -1)
 
 # Codec check: PCM (sowt, twos, or raw)
 if [[ "$A_CODEC" != "pcm_s16le" && "$A_CODEC" != "pcm_s16be" && "$A_CODEC" != "pcm_s24le" && "$A_CODEC" != "pcm_s24be" && "$A_CODEC" != *"pcm"* ]]; then
@@ -147,51 +156,78 @@ else
 fi
 
 # ============================================================
-# 4. VIDEO QUALITY CHECKS
+# 4. VIDEO + AUDIO QUALITY CHECKS (single ffmpeg pass)
 # ============================================================
 echo "" | tee -a "$REPORT"
-echo "--- VIDEO QUALITY CHECKS ---" | tee -a "$REPORT"
+echo "--- QUALITY CHECKS (single-pass) ---" | tee -a "$REPORT"
+info "Running all quality checks in one pass..."
 
-# Black frames detection: luma level <= 20 (8-bit scale), >75 consecutive frames = >3s at 25fps
-info "Running black frame detection (luma<=20, >75 frames = >3s)..."
-$FFMPEG -i "$INPUT" -vf "blackdetect=d=3:pix_th=0.0784:pic_th=0.98" -an -f null - 2>&1 \
-    | grep "blackdetect" | tee -a "$REPORT" || true
-# pix_th=0.0784 approximates luma level 20 on 8-bit (20/255)
+# Single ffmpeg command with complex filtergraph:
+#   Video: chain blackdetect -> freezedetect -> colorbarsdetect -> output
+#   Audio: asplit=4, one branch (silencedetect) to output, others to anullsink
+#   This decodes the file only once instead of 7 separate passes.
+QC_OUTPUT=$($FFMPEG -i "$INPUT" \
+    -filter_complex "
+        [0:v]blackdetect=d=3:pix_th=0.0784:pic_th=0.98,
+             freezedetect=n=0.001:d=20,
+             colorbarsdetect=d=0.5[vout];
+        [0:a]asplit=4[a1][a2][a3][a4];
+        [a1]silencedetect=noise=-60dB:d=10[aout];
+        [a2]ebur128=peak=true:framelog=verbose,anullsink;
+        [a3]clipdetect=n=1000,anullsink;
+        [a4]dualmonodetect,anullsink
+    " -map "[vout]" -map "[aout]" -f null - 2>&1)
 
-# Freeze frame detection: sensitivity 1, min duration 20s
-info "Running freeze frame detection (min duration 20s)..."
-$FFMPEG -i "$INPUT" -vf "freezedetect=n=0.001:d=20" -an -f null - 2>&1 \
-    | grep "freezedetect" | tee -a "$REPORT" || true
-
-# Color bar detection
-info "Running color bar detection..."
-$FFMPEG -i "$INPUT" -vf "colorbarsdetect=d=0.5" -an -f null - 2>&1 \
-    | grep "colorbars_" | tee -a "$REPORT" || true
-
-# ============================================================
-# 5. AUDIO QUALITY CHECKS
-# ============================================================
+# Parse results from the combined output
 echo "" | tee -a "$REPORT"
-echo "--- AUDIO QUALITY CHECKS ---" | tee -a "$REPORT"
+echo "--- VIDEO QUALITY ---" | tee -a "$REPORT"
 
-# Silence/Mute detection: 10 seconds
-info "Running mute/silence detection (duration >= 10s)..."
-$FFMPEG -i "$INPUT" -af "silencedetect=noise=-60dB:d=10" -vn -f null - 2>&1 \
-    | grep "silence_" | tee -a "$REPORT" || true
+# Black frames
+BLACKDETECT=$(echo "$QC_OUTPUT" | grep "black_start:" || true)
+if [[ -n "$BLACKDETECT" ]]; then
+    echo "$BLACKDETECT" | tee -a "$REPORT"
+    warn "Black frames detected"
+else
+    info "No black frames detected"
+fi
 
-# Loudness measurement (EBU R128 / OP-59 mode)
-# OP-59: Target -24 LKFS, tolerance +/-1 (so -25 to -23 LKFS)
-# True Peak: -2 dBTP
-info "Running EBU R128 loudness measurement (OP-59: target -24 LKFS, TP -2 dBTP)..."
-LOUDNESS_OUTPUT=$($FFMPEG -i "$INPUT" -af "ebur128=peak=true:framelog=verbose" -vn -f null - 2>&1)
-echo "$LOUDNESS_OUTPUT" | grep -E "I:|LRA:|Threshold:|Peak:" | tail -10 | tee -a "$REPORT"
+# Freeze frames
+FREEZEDETECT=$(echo "$QC_OUTPUT" | grep "freezedetect" || true)
+if [[ -n "$FREEZEDETECT" ]]; then
+    echo "$FREEZEDETECT" | tee -a "$REPORT"
+    error "Freeze frames detected"
+else
+    info "No freeze frames detected"
+fi
 
-# Parse integrated loudness
-INTEGRATED=$(echo "$LOUDNESS_OUTPUT" | grep "I:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
+# Color bars
+COLORBARS=$(echo "$QC_OUTPUT" | grep "colorbars_type" || true)
+if [[ -n "$COLORBARS" ]]; then
+    echo "$COLORBARS" | tee -a "$REPORT"
+    error "Color bars detected"
+else
+    info "No color bars detected"
+fi
+
+echo "" | tee -a "$REPORT"
+echo "--- AUDIO QUALITY ---" | tee -a "$REPORT"
+
+# Silence/Mute
+SILENCE=$(echo "$QC_OUTPUT" | grep "silence_" || true)
+if [[ -n "$SILENCE" ]]; then
+    echo "$SILENCE" | tee -a "$REPORT"
+    warn "Silence detected"
+else
+    info "No silence/mute detected"
+fi
+
+# Loudness (EBU R128 / OP-59)
+echo "$QC_OUTPUT" | grep -E "^\s+(I:|LRA:|Threshold:|Peak:)" | grep -v "Stream" | tail -10 | tee -a "$REPORT"
+
+INTEGRATED=$(echo "$QC_OUTPUT" | grep -E "^\s+I:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
 if [[ -n "$INTEGRATED" ]]; then
-    # Check against -24 LKFS +/- 1
-    TOO_LOUD=$(echo "$INTEGRATED > -23" | bc -l 2>/dev/null || python3 -c "print(1 if $INTEGRATED > -23 else 0)")
-    TOO_QUIET=$(echo "$INTEGRATED < -25" | bc -l 2>/dev/null || python3 -c "print(1 if $INTEGRATED < -25 else 0)")
+    TOO_LOUD=$(python3 -c "print(1 if $INTEGRATED > -23 else 0)")
+    TOO_QUIET=$(python3 -c "print(1 if $INTEGRATED < -25 else 0)")
     if [[ "$TOO_LOUD" == "1" ]]; then
         warn "Integrated loudness is ${INTEGRATED} LKFS, exceeds max -23 LKFS (target -24 +/- 1)"
     elif [[ "$TOO_QUIET" == "1" ]]; then
@@ -201,10 +237,9 @@ if [[ -n "$INTEGRATED" ]]; then
     fi
 fi
 
-# Parse true peak
-TRUE_PEAK=$(echo "$LOUDNESS_OUTPUT" | grep "Peak:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
+TRUE_PEAK=$(echo "$QC_OUTPUT" | grep -E "^\s+Peak:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
 if [[ -n "$TRUE_PEAK" ]]; then
-    TP_OVER=$(echo "$TRUE_PEAK > -2" | bc -l 2>/dev/null || python3 -c "print(1 if $TRUE_PEAK > -2 else 0)")
+    TP_OVER=$(python3 -c "print(1 if $TRUE_PEAK > -2 else 0)")
     if [[ "$TP_OVER" == "1" ]]; then
         error "True peak is ${TRUE_PEAK} dBTP, exceeds -2 dBTP limit"
     else
@@ -212,18 +247,26 @@ if [[ -n "$TRUE_PEAK" ]]; then
     fi
 fi
 
-# Sustained clipping detection (>= 1000 consecutive samples per Pulsar template)
-info "Running sustained clipping detection (>= 1000 consecutive samples)..."
-$FFMPEG -i "$INPUT" -af "clipdetect=n=1000" -vn -f null - 2>&1 \
-    | grep -E "clip_|total_" | tee -a "$REPORT" || true
+# Sustained clipping
+CLIPPING=$(echo "$QC_OUTPUT" | grep -E "clip_channel|total_clip" || true)
+if [[ -n "$CLIPPING" ]]; then
+    echo "$CLIPPING" | tee -a "$REPORT"
+    warn "Sustained clipping detected"
+else
+    info "No sustained clipping detected"
+fi
 
-# Dual mono detection
-info "Running dual mono detection..."
-$FFMPEG -i "$INPUT" -af "dualmonodetect" -vn -f null - 2>&1 \
-    | grep "dual_mono" | tee -a "$REPORT" || true
+# Dual mono
+DUALMONO=$(echo "$QC_OUTPUT" | grep "dual_mono_start:" | sed 's/.*dual_mono_start/dual_mono_start/' || true)
+if [[ -n "$DUALMONO" ]]; then
+    echo "$DUALMONO" | tee -a "$REPORT"
+    warn "Dual mono detected"
+else
+    info "No dual mono detected"
+fi
 
 # ============================================================
-# 6. LOUDNESS CORRECTION (if needed)
+# LOUDNESS CORRECTION (if needed)
 # ============================================================
 # To correct loudness to OP-59 target (-24 LKFS), uncomment:
 # $FFMPEG -i "$INPUT" -af loudnorm=I=-24:TP=-2:LRA=15 -c:v copy "$REPORT_DIR/${BASENAME%.*}_corrected.mov"
