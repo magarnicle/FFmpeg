@@ -120,15 +120,16 @@ Plan:
 - Complexity: Low (external tool, not ffmpeg).
 
 ============================================================
-SUMMARY: What Needs to Be Built in FFmpeg
+SUMMARY: Implementation Status
 ============================================================
-Priority  | Item                        | Effort
-----------|-----------------------------|--------
-HIGH      | Color bar detection filter  | Medium
-MEDIUM    | Dual mono detection filter  | Low-Med
-LOW       | Sustained clipping in astats| Low
-N/A       | Cross-check, timecode, PDF  | Script only
+Status    | Item                        | Filter
+----------|-----------------------------|--------------------------
+DONE      | Color bar detection filter  | vf_colorbarsdetect.c
+DONE      | Dual mono detection filter  | af_dualmonodetect.c
+DONE      | Sustained clipping detect   | af_clipdetect.c
+N/A       | Cross-check, timecode, PDF  | Script only (pulsar_qc.sh)
 
-The remaining checks (black frames, freeze frames, silence, loudness,
-true peak, codec/format validation) are all fully achievable with
-existing ffmpeg filters and ffprobe, as implemented in pulsar_qc.sh.
+All three new filters have been implemented and tested. The QC script
+(pulsar_qc.sh) has been updated to use them. The remaining items
+(cross-check, timecode, PDF) are handled at the script level and do
+not require ffmpeg code changes.

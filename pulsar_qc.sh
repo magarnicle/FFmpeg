@@ -162,6 +162,11 @@ info "Running freeze frame detection (min duration 20s)..."
 $FFMPEG -i "$INPUT" -vf "freezedetect=n=0.001:d=20" -an -f null - 2>&1 \
     | grep "freezedetect" | tee -a "$REPORT" || true
 
+# Color bar detection
+info "Running color bar detection..."
+$FFMPEG -i "$INPUT" -vf "colorbarsdetect=d=0.5" -an -f null - 2>&1 \
+    | grep "colorbars_" | tee -a "$REPORT" || true
+
 # ============================================================
 # 5. AUDIO QUALITY CHECKS
 # ============================================================
@@ -206,14 +211,15 @@ if [[ -n "$TRUE_PEAK" ]]; then
     fi
 fi
 
-# Audio clipping detection using astats
-info "Running clipping detection..."
-CLIP_OUTPUT=$($FFMPEG -i "$INPUT" -af "astats=metadata=1:reset=0" -vn -f null - 2>&1)
-# astats reports number of clipped samples
-CLIPPED=$(echo "$CLIP_OUTPUT" | grep -i "Number of clips" | tail -1 || true)
-if [[ -n "$CLIPPED" ]]; then
-    echo "$CLIPPED" | tee -a "$REPORT"
-fi
+# Sustained clipping detection (>= 1000 consecutive samples per Pulsar template)
+info "Running sustained clipping detection (>= 1000 consecutive samples)..."
+$FFMPEG -i "$INPUT" -af "clipdetect=n=1000" -vn -f null - 2>&1 \
+    | grep -E "clip_|total_" | tee -a "$REPORT" || true
+
+# Dual mono detection
+info "Running dual mono detection..."
+$FFMPEG -i "$INPUT" -af "dualmonodetect" -vn -f null - 2>&1 \
+    | grep "dual_mono" | tee -a "$REPORT" || true
 
 # ============================================================
 # 6. LOUDNESS CORRECTION (if needed)
