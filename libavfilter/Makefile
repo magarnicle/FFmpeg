@@ -129,6 +129,7 @@ OBJS-$(CONFIG_BS2B_FILTER)                   += af_bs2b.o
 OBJS-$(CONFIG_CHANNELMAP_FILTER)             += af_channelmap.o
 OBJS-$(CONFIG_CHANNELSPLIT_FILTER)           += af_channelsplit.o
 OBJS-$(CONFIG_CHORUS_FILTER)                 += af_chorus.o generate_wave_table.o
+OBJS-$(CONFIG_CLIPDETECT_FILTER)             += af_clipdetect.o
 OBJS-$(CONFIG_COMPAND_FILTER)                += af_compand.o
 OBJS-$(CONFIG_COMPENSATIONDELAY_FILTER)      += af_compensationdelay.o
 OBJS-$(CONFIG_CROSSFEED_FILTER)              += af_crossfeed.o
