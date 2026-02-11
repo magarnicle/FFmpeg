@@ -291,7 +291,7 @@ if [[ "$NEEDS_CORRECTION" == "1" ]]; then
     info "Loudness out of spec (I: ${INTEGRATED} LKFS, TP: ${TRUE_PEAK} dBTP) — correcting to OP-59 target"
     NORM_OUTPUT=$($FFMPEG -y -i "$INPUT" \
         -af loudnorm=I=-24:TP=-2:LRA=15:print_format=summary \
-        -c:v copy -c:a pcm_s16le "$CORRECTED" 2>&1)
+        -ar 48000 -c:v copy -c:a pcm_s16le "$CORRECTED" 2>&1)
     if [[ $? -eq 0 ]]; then
         # Extract loudnorm summary (Input/Output Integrated, TP, LRA, Threshold)
         NORM_SUMMARY=$(echo "$NORM_OUTPUT" | grep -E "^(Input|Output|Target)" || true)
