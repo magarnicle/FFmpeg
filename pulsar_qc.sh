@@ -163,12 +163,12 @@ echo "--- QUALITY CHECKS (single-pass) ---" | tee -a "$REPORT"
 info "Running all quality checks in one pass..."
 
 # Single ffmpeg command with complex filtergraph:
-#   Video: chain blackdetect -> freezedetect -> colorbarsdetect -> output
+#   Video: chain solidcolordetect -> freezedetect -> colorbarsdetect -> output
 #   Audio: asplit=4, one branch (silencedetect) to output, others to anullsink
 #   This decodes the file only once instead of 7 separate passes.
 QC_OUTPUT=$($FFMPEG -i "$INPUT" \
     -filter_complex "
-        [0:v]blackdetect=d=3:pix_th=0.0784:pic_th=0.98,
+        [0:v]solidcolordetect=d=3:pix_th=0.0784:pic_th=0.98:mode=1,
              freezedetect=n=0.001:d=20,
              colorbarsdetect=d=0.5[vout];
         [0:a]asplit=4[a1][a2][a3][a4];
@@ -182,13 +182,13 @@ QC_OUTPUT=$($FFMPEG -i "$INPUT" \
 echo "" | tee -a "$REPORT"
 echo "--- VIDEO QUALITY ---" | tee -a "$REPORT"
 
-# Black frames
-BLACKDETECT=$(echo "$QC_OUTPUT" | grep "black_start:" || true)
-if [[ -n "$BLACKDETECT" ]]; then
-    echo "$BLACKDETECT" | tee -a "$REPORT"
-    warn "Black frames detected"
+# Solid color frames (black, white, color flashes, etc.)
+SOLIDCOLOR=$(echo "$QC_OUTPUT" | grep "solid_start:" || true)
+if [[ -n "$SOLIDCOLOR" ]]; then
+    echo "$SOLIDCOLOR" | tee -a "$REPORT"
+    warn "Solid color frames detected"
 else
-    info "No black frames detected"
+    info "No solid color frames detected"
 fi
 
 # Freeze frames
