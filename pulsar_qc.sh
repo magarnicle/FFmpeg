@@ -259,21 +259,12 @@ else
     info "No sustained clipping detected"
 fi
 
-# Dual mono
-DUALMONO=$(echo "$QC_OUTPUT" | grep "dual_mono_start:" | sed 's/.*dual_mono_start/dual_mono_start/' || true)
-DUALMONO_PCT=$(echo "$QC_OUTPUT" | grep "dual_mono_percent:" | sed 's/.*dual_mono_total/dual_mono_total/' || true)
+# Dual mono (only warn if >80% of file is dual mono)
 DUALMONO_WARN=$(echo "$QC_OUTPUT" | grep "dual mono percentage" | sed 's/.*dual mono/dual mono/' || true)
-if [[ -n "$DUALMONO" ]]; then
-    echo "$DUALMONO" | tee -a "$REPORT"
-    warn "Dual mono regions detected (>= 2s)"
-fi
-if [[ -n "$DUALMONO_PCT" ]]; then
-    echo "$DUALMONO_PCT" | tee -a "$REPORT"
-fi
 if [[ -n "$DUALMONO_WARN" ]]; then
     warn "$DUALMONO_WARN"
-elif [[ -z "$DUALMONO" ]]; then
-    info "No significant dual mono detected"
+else
+    info "No dual mono issue detected"
 fi
 
 # ============================================================
