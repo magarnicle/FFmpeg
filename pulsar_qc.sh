@@ -175,7 +175,7 @@ QC_OUTPUT=$($FFMPEG -i "$INPUT" \
         [a1]silencedetect=noise=-60dB:d=10[aout];
         [a2]ebur128=peak=true:framelog=verbose,anullsink;
         [a3]clipdetect=n=1000,anullsink;
-        [a4]dualmonodetect=d=2:ratio=50,anullsink
+        [a4]dualmonodetect=ratio=80,anullsink
     " -map "[vout]" -map "[aout]" -f null - 2>&1)
 
 # Parse results from the combined output
@@ -291,7 +291,7 @@ if [[ "$NEEDS_CORRECTION" == "1" ]]; then
     info "Loudness out of spec (I: ${INTEGRATED} LKFS, TP: ${TRUE_PEAK} dBTP) — correcting to OP-59 target"
     NORM_OUTPUT=$($FFMPEG -y -i "$INPUT" \
         -af loudnorm=I=-24:TP=-2:LRA=15:print_format=summary \
-        -c:v copy "$CORRECTED" 2>&1)
+        -c:v copy -c:a pcm_s16le "$CORRECTED" 2>&1)
     if [[ $? -eq 0 ]]; then
         # Extract loudnorm summary (Input/Output Integrated, TP, LRA, Threshold)
         NORM_SUMMARY=$(echo "$NORM_OUTPUT" | grep -E "^(Input|Output|Target)" || true)
