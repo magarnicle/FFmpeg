@@ -224,6 +224,9 @@ fi
 # Loudness (EBU R128 / OP-59)
 echo "$QC_OUTPUT" | grep -E "^\s+(I:|LRA:|Threshold:|Peak:)" | grep -v "Stream" | tail -10 | tee -a "$REPORT"
 
+TOO_LOUD=0
+TOO_QUIET=0
+TP_OVER=0
 INTEGRATED=$(echo "$QC_OUTPUT" | grep -E "^\s+I:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
 if [[ -n "$INTEGRATED" ]]; then
     TOO_LOUD=$(python3 -c "print(1 if $INTEGRATED > -23 else 0)")
@@ -276,8 +279,32 @@ fi
 # ============================================================
 # LOUDNESS CORRECTION (if needed)
 # ============================================================
-# To correct loudness to OP-59 target (-24 LKFS), uncomment:
-# $FFMPEG -i "$INPUT" -af loudnorm=I=-24:TP=-2:LRA=15 -c:v copy "$REPORT_DIR/${BASENAME%.*}_corrected.mov"
+NEEDS_CORRECTION=0
+if [[ "$TOO_LOUD" == "1" || "$TOO_QUIET" == "1" || "$TP_OVER" == "1" ]]; then
+    NEEDS_CORRECTION=1
+fi
+
+if [[ "$NEEDS_CORRECTION" == "1" ]]; then
+    echo "" | tee -a "$REPORT"
+    echo "--- LOUDNESS CORRECTION ---" | tee -a "$REPORT"
+    CORRECTED="${REPORT_DIR}/${BASENAME%.*}_corrected.mov"
+    info "Loudness out of spec (I: ${INTEGRATED} LKFS, TP: ${TRUE_PEAK} dBTP) — correcting to OP-59 target"
+    NORM_OUTPUT=$($FFMPEG -y -i "$INPUT" \
+        -af loudnorm=I=-24:TP=-2:LRA=15:print_format=summary \
+        -c:v copy "$CORRECTED" 2>&1)
+    if [[ $? -eq 0 ]]; then
+        # Extract loudnorm summary (Input/Output Integrated, TP, LRA, Threshold)
+        NORM_SUMMARY=$(echo "$NORM_OUTPUT" | grep -E "^(Input|Output|Target)" || true)
+        if [[ -n "$NORM_SUMMARY" ]]; then
+            echo "$NORM_SUMMARY" | tee -a "$REPORT"
+        fi
+        info "Corrected file written to: $CORRECTED"
+    else
+        error "Loudness correction failed"
+    fi
+else
+    info "Loudness within spec — no correction needed"
+fi
 
 # ============================================================
 # SUMMARY
