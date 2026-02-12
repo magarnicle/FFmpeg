@@ -9382,6 +9382,65 @@ planes except alpha plane.
 @subsection Commands
 This filter supports same @ref{commands} as options.
 
+@section cea608embed
+
+Embed CEA-608 closed captions into video frames as A53 CC side data.
+
+The filter supports two modes of operation:
+
+@itemize
+@item
+File mode: When the @option{filename} option is set, subtitles are read from
+an SRT file at initialization time and encoded as CEA-608 caption data.
+
+@item
+Stream mode: When no filename is set, the filter accepts a subtitle stream
+as a second input and encodes captions in real time.
+@end itemize
+
+Subtitle lines longer than the 32-character CEA-608 row limit are
+automatically wrapped.
+
+The filter accepts the following options:
+
+@table @option
+
+@item filename, f
+Set the path to an SRT subtitle file. When set, the filter operates in file
+mode. When not set, the filter expects a subtitle stream as the second input.
+
+@item roll_up
+Set the roll-up mode. A value of @option{0} selects pop-on mode. Values of
+@option{2}, @option{3}, or @option{4} select roll-up mode with the
+corresponding number of visible rows. Default value is @option{0}.
+
+@item data_field
+Select the CEA-608 data field. @option{0} selects the first field (CC1),
+@option{1} selects the second field (CC3). Default value is @option{0}.
+
+@item start_row
+Set the starting row for caption placement. @option{0} selects automatic
+placement, values @option{1} through @option{15} set a fixed row.
+Default value is @option{0}.
+
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Embed captions from an SRT file using pop-on mode:
+@example
+ffmpeg -i input.mp4 -vf cea608embed=f=subs.srt -c:v libx264 output.mp4
+@end example
+
+@item
+Embed captions from a subtitle stream using roll-up mode with 3 rows:
+@example
+ffmpeg -i input.mp4 -i subs.srt -filter_complex "[0:v][1:s]cea608embed=roll_up=3[v]" -map "[v]" -c:v libx264 output.mp4
+@end example
+@end itemize
+
 @section chromahold
 Remove all color information for all colors except for certain one.
 
@@ -31467,6 +31526,14 @@ streams in each segment. Default is 1.
 Set the number of output audio streams, that is also the number of audio
 streams in each segment. Default is 0.
 
+@item s
+Set the number of output subtitle streams, that is also the number of
+subtitle streams in each segment. Default is 0.
+
+Subtitle timestamps are automatically offset so that each segment's
+subtitles are correctly positioned relative to the concatenated output
+timeline.
+
 @item unsafe
 Activate unsafe mode: do not fail if segments have a different format.
 
@@ -31478,12 +31545,12 @@ will produce log messages like "Segment 0 'intro' started at pts=0".
 
 @end table
 
-The filter has @var{v}+@var{a} outputs: first @var{v} video outputs, then
-@var{a} audio outputs.
+The filter has @var{v}+@var{a}+@var{s} outputs: first @var{v} video outputs,
+then @var{a} audio outputs, then @var{s} subtitle outputs.
 
-There are @var{n}x(@var{v}+@var{a}) inputs: first the inputs for the first
-segment, in the same order as the outputs, then the inputs for the second
-segment, etc.
+There are @var{n}x(@var{v}+@var{a}+@var{s}) inputs: first the inputs for the
+first segment, in the same order as the outputs, then the inputs for the
+second segment, etc.
 
 Related streams do not always have exactly the same duration, for various
 reasons including codec frame size or sloppy authoring. For that reason,

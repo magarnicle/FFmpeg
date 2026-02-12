@@ -4790,4 +4790,37 @@ determined based on this value.
 Defaults to 2 for centiseconds.
 @end table
 
+@section teletext
+
+This codec encodes subtitles as WST (World System Teletext) packets suitable
+for VANC insertion via OP47/SMPTE RDD-8. It is typically used to output
+teletext subtitles for SDI playout through DeckLink devices.
+
+@subsection Options
+
+@table @option
+@item teletext_page, page
+Set the teletext page number. Valid range is 100 to 899.
+Defaults to 888.
+
+@item magazine
+Set the magazine number. Valid range is 1 to 8.
+Defaults to 8.
+
+@item region
+Set the character set region for national character mapping. Valid range is 0
+to 15. Defaults to 0.
+
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Encode SRT subtitles as teletext on page 801 for DeckLink output:
+@example
+ffmpeg -i input.mp4 -i subs.srt -c:s teletext -teletext_page 801 -f decklink 'DeckLink Mini Monitor'
+@end example
+@end itemize
+
 @c man end SUBTITLES ENCODERS
