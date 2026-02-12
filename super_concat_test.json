@@ -1,0 +1,38 @@
+[
+  {
+    "inputs": [
+      {
+        "url": "/Volumes/san2/preview/AU101663-M-Preview.mov"
+      },
+      {
+        "options": {
+          "-an": 1
+        },
+        "url": "/home/matt/Pictures/good.mov"
+      }
+    ],
+    "filter": "[0:a]volume=volume=-0dB[audio0];  [0:v]scale='trunc(ih*dar):ih', scale=1920:1080:force_original_aspect_ratio=decrease, pad=1920:1080:-1:-1:color=black, setdar=16/9, setpts=PTS-STARTPTS, fps=fps=25, fieldorder=tff [video0];  [1:v]tpad=stop_mode=clone:stop=-1:stop_duration=1710.0, trim=duration=1710.0, setpts=PTS-STARTPTS+0.0/TB, fps=fps=25[graphic0.0.time];  [video0][graphic0.0.time]overlay=x=1400:y=20:alpha=straight:format=yuv444p10:repeatlast=0[graphic0.0];  ",
+    "maps": [
+      "[graphic0.0]",
+      "[audio0]"
+    ]
+  },
+  {
+    "inputs": [
+      {
+        "url": "/Volumes/san2/preview/AU110296-M-Preview.mov"
+      },
+      {
+        "options": {
+          "-an": 1
+        },
+        "url": "/home/matt/Pictures/good.png"
+      }
+    ],
+    "filter": "[0:a]volume=volume=-0dB[audio2];  [0:v]scale='trunc(ih*dar):ih', scale=1920:1080:force_original_aspect_ratio=decrease, pad=1920:1080:-1:-1:color=black, setdar=16/9, setpts=PTS-STARTPTS, fps=fps=25, fieldorder=tff [video2];  [1:v]tpad=stop_mode=clone:stop=-1:stop_duration=60.0, trim=duration=60.0, setpts=PTS-STARTPTS+0.0/TB, fps=fps=25[graphic2.0.time];  [video2][graphic2.0.time]overlay=x=1400:y=20:alpha=straight:format=yuv444p10:repeatlast=0[graphic2.0];",
+    "maps": [
+      "[graphic2.0]",
+      "[audio2]"
+    ]
+  }
+]

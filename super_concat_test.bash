@@ -1,0 +1,1 @@
+./ffmpeg -loglevel datetime+level+info -nostdin -hide_banner -noautorotate -fflags +discardcorrupt -y -super_concat super_concat_test.json -metadata name='2026-02-12 11:30:03.320000+11:00 AU101663-M.mov' super_concat.mov
