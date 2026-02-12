@@ -21,9 +21,9 @@
 
 /**
  * @file
- * Solid color frame detector. Detects frames that are a single uniform color.
- * In black mode (default), behaves like blackdetect.
- * In color mode, detects any solid color frame.
+ * Solid color frame detector. Detects frames that are a single non-black
+ * uniform color (e.g. solid blue, green, grey, etc.). Black frames are
+ * excluded — use blackdetect for those.
  */
 
 #include <float.h>
@@ -36,11 +36,6 @@
 #include "formats.h"
 #include "video.h"
 
-enum SolidColorMode {
-    MODE_BLACK = 0,
-    MODE_COLOR = 1,
-};
-
 typedef struct SolidColorDetectContext {
     const AVClass *class;
     double  min_duration_time;
@@ -52,7 +47,6 @@ typedef struct SolidColorDetectContext {
 
     double  picture_ratio_th;
     double  pixel_th;
-    int     mode;
 
     unsigned int nb_matching_pixels;
     AVRational   time_base;
@@ -74,7 +68,6 @@ static const AVOption solidcolordetect_options[] = {
     { "pic_th",           "set the picture solid ratio threshold", OFFSET(picture_ratio_th), AV_OPT_TYPE_DOUBLE, {.dbl=.98}, 0, 1, FLAGS },
     { "pixel_th",  "set the pixel tolerance threshold", OFFSET(pixel_th), AV_OPT_TYPE_DOUBLE, {.dbl=.10}, 0, 1, FLAGS },
     { "pix_th",    "set the pixel tolerance threshold", OFFSET(pixel_th), AV_OPT_TYPE_DOUBLE, {.dbl=.10}, 0, 1, FLAGS },
-    { "mode",      "detection mode: 0=black only, 1=any color", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=MODE_BLACK}, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -124,10 +117,9 @@ static int config_input(AVFilterLink *inlink)
     s->min_duration = s->min_duration_time / av_q2d(s->time_base);
 
     av_log(ctx, AV_LOG_VERBOSE,
-           "min_duration:%s pixel_th:%f picture_ratio_th:%f mode:%s\n",
+           "min_duration:%s pixel_th:%f picture_ratio_th:%f\n",
            av_ts2timestr(s->min_duration, &s->time_base),
-           s->pixel_th, s->picture_ratio_th,
-           s->mode == MODE_BLACK ? "black" : "color");
+           s->pixel_th, s->picture_ratio_th);
     return 0;
 }
 
@@ -236,33 +228,26 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
     pixel_tol_i = full ? s->pixel_th * max :
         16 * factor + s->pixel_th * (235 - 16) * factor;
 
-    if (s->mode == MODE_BLACK) {
-        /* Black mode: count pixels below threshold (same as blackdetect) */
-        ref_y = 0;
-        if (s->depth <= 8)
-            nb_matching = count_within8(picref->data[0], picref->linesize[0],
-                                        w, h, 0, pixel_tol_i);
-        else
-            nb_matching = count_within16(picref->data[0], picref->linesize[0],
-                                         w, h, 0, pixel_tol_i);
+    /* Compute average luma, then count pixels near that average */
+    if (s->depth <= 8) {
+        ref_y = compute_avg8(picref->data[0], picref->linesize[0], w, h);
+        nb_matching = count_within8(picref->data[0], picref->linesize[0],
+                                    w, h, ref_y, pixel_tol_i);
     } else {
-        /* Color mode: compute average luma, then count pixels near that average */
-        if (s->depth <= 8) {
-            ref_y = compute_avg8(picref->data[0], picref->linesize[0], w, h);
-            nb_matching = count_within8(picref->data[0], picref->linesize[0],
-                                        w, h, ref_y, pixel_tol_i);
-        } else {
-            ref_y = compute_avg16(picref->data[0], picref->linesize[0], w, h);
-            nb_matching = count_within16(picref->data[0], picref->linesize[0],
-                                         w, h, ref_y, pixel_tol_i);
-        }
+        ref_y = compute_avg16(picref->data[0], picref->linesize[0], w, h);
+        nb_matching = count_within16(picref->data[0], picref->linesize[0],
+                                     w, h, ref_y, pixel_tol_i);
     }
 
-    picture_ratio = (double)nb_matching / (w * h);
+    /* Exclude black frames: if average luma is within tolerance of 0, skip */
+    if (ref_y <= pixel_tol_i) {
+        picture_ratio = 0;
+    } else {
+        picture_ratio = (double)nb_matching / (w * h);
+    }
 
-    /* In color mode, also check chroma planes for uniformity */
-    if (s->mode == MODE_COLOR && picture_ratio >= s->picture_ratio_th &&
-        desc->nb_components >= 3) {
+    /* Also check chroma planes for uniformity */
+    if (picture_ratio >= s->picture_ratio_th && desc->nb_components >= 3) {
         int chroma_w = AV_CEIL_RSHIFT(w, desc->log2_chroma_w);
         int chroma_h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
         unsigned ref_u, ref_v, match_u, match_v;
@@ -294,10 +279,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
         s->avg_y = ref_y;
         s->avg_u = ref_u;
         s->avg_v = ref_v;
-    } else if (s->mode == MODE_BLACK) {
-        s->avg_y = 0;
-        s->avg_u = 128 * factor;
-        s->avg_v = 128 * factor;
     }
 
     av_log(ctx, AV_LOG_DEBUG,
@@ -346,7 +327,7 @@ static const AVFilterPad solidcolordetect_inputs[] = {
 
 const FFFilter ff_vf_solidcolordetect = {
     .p.name        = "solidcolordetect",
-    .p.description = NULL_IF_CONFIG_SMALL("Detect video intervals that are a solid color."),
+    .p.description = NULL_IF_CONFIG_SMALL("Detect video intervals that are a non-black solid color."),
     .p.priv_class  = &solidcolordetect_class,
     .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(SolidColorDetectContext),
