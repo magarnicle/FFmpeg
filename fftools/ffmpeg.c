@@ -83,6 +83,7 @@
 #endif
 #include "ffmpeg.h"
 #include "ffmpeg_sched.h"
+#include "ffmpeg_super_concat.h"
 #include "ffmpeg_utils.h"
 #include "graph/graphprint.h"
 
@@ -1013,6 +1014,22 @@ int main(int argc, char **argv)
     avformat_network_init();
 
     show_banner(argc, argv, options);
+
+    /* Check for -super_concat mode */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-super_concat") && i + 1 < argc) {
+            const char *playlist_file = argv[i + 1];
+            /* Last non-option argument is the output file */
+            const char *output_url = argv[argc - 1];
+            /* Remaining args (between playlist and output) are output options */
+            int opt_argc = argc - i - 3; /* skip program, -super_concat, playlist, output */
+            char **opt_argv = argv + i + 2;
+            if (opt_argc < 0)
+                opt_argc = 0;
+            ret = super_concat_main(playlist_file, output_url, opt_argc, opt_argv);
+            return ret;
+        }
+    }
 
     sch = sch_alloc();
     if (!sch) {

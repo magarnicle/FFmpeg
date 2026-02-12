@@ -14,6 +14,7 @@ include $(SRC_PATH)/fftools/resources/Makefile
 OBJS-ffmpeg +=                  \
     fftools/ffmpeg_dec.o        \
     fftools/ffmpeg_demux.o      \
+    fftools/ffmpeg_super_concat.o \
     fftools/ffmpeg_enc.o        \
     fftools/ffmpeg_filter.o     \
     fftools/ffmpeg_hw.o         \
