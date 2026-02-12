@@ -433,11 +433,13 @@ FATE_FILTER_SAMPLES-$(call FILTERDEMDEC, FORMAT PERMS GRADFUN SCALE, VMD, VMDVID
 fate-filter-gradfun-sample: tests/data/filtergraphs/gradfun
 fate-filter-gradfun-sample: CMD = framecrc -auto_conversion_filters -i $(TARGET_SAMPLES)/vmd/12.vmd -/filter $(TARGET_PATH)/tests/data/filtergraphs/gradfun -an -frames:v 20
 
-FATE_FILTER-$(call FILTERFRAMECRC, TESTSRC SINE CONCAT, FILE_PROTOCOL) += fate-filter-concat fate-filter-concat-vfr
+FATE_FILTER-$(call FILTERFRAMECRC, TESTSRC SINE CONCAT, FILE_PROTOCOL) += fate-filter-concat fate-filter-concat-vfr fate-filter-concat-subtitle
 fate-filter-concat: tests/data/filtergraphs/concat
 fate-filter-concat: CMD = framecrc -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/concat
 fate-filter-concat-vfr: tests/data/filtergraphs/concat-vfr
 fate-filter-concat-vfr: CMD = framecrc -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/concat-vfr
+fate-filter-concat-subtitle: tests/data/filtergraphs/concat-subtitle
+fate-filter-concat-subtitle: CMD = framecrc -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/concat-subtitle
 
 FATE_FILTER-$(call FILTERFRAMECRC, TESTSRC2 CHROMASHIFT) += fate-filter-chromashift-smear fate-filter-chromashift-wrap
 fate-filter-chromashift-smear: CMD = framecrc -lavfi testsrc2=r=5:d=1,chromashift=cbh=-1:cbv=1:crh=2:crv=-2:edge=smear -pix_fmt yuv420p
