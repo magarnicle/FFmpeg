@@ -6,12 +6,14 @@
 # using a complex filtergraph.
 
 set -uo pipefail
+set -o xtrace
 
 INPUT="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FILE_DIR="$(dirname "$1")"
 FFPROBE="${SCRIPT_DIR}/ffprobe"
 FFMPEG="${SCRIPT_DIR}/ffmpeg"
-REPORT_DIR="./qc_reports"
+REPORT_DIR="${FILE_DIR}/qc_reports"
 mkdir -p "$REPORT_DIR"
 BASENAME=$(basename "$INPUT")
 REPORT="$REPORT_DIR/${BASENAME%.*}_qc_report.txt"
@@ -163,12 +165,14 @@ echo "--- QUALITY CHECKS (single-pass) ---" | tee -a "$REPORT"
 info "Running all quality checks in one pass..."
 
 # Single ffmpeg command with complex filtergraph:
+#   Video: chain blackdetect -> freezedetect -> colorbarsdetect -> output
 #   Video: chain solidcolordetect -> freezedetect -> colorbarsdetect -> output
 #   Audio: asplit=4, one branch (silencedetect) to output, others to anullsink
 #   This decodes the file only once instead of 7 separate passes.
-QC_OUTPUT=$($FFMPEG -i "$INPUT" \
+QC_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -i "$INPUT" \
     -filter_complex "
-        [0:v]solidcolordetect=d=3:pix_th=0.0784:pic_th=0.98:mode=1,
+        [0:v]blackdetect=d=3:pix_th=0.0784:pic_th=0.98,
+             solidcolordetect=d=0:pix_th=0.0784:pic_th=1,
              freezedetect=n=0.001:d=20,
              colorbarsdetect=d=0.5[vout];
         [0:a]asplit=4[a1][a2][a3][a4];
@@ -178,9 +182,20 @@ QC_OUTPUT=$($FFMPEG -i "$INPUT" \
         [a4]dualmonodetect=ratio=80,anullsink
     " -map "[vout]" -map "[aout]" -f null - 2>&1)
 
+
+
 # Parse results from the combined output
 echo "" | tee -a "$REPORT"
 echo "--- VIDEO QUALITY ---" | tee -a "$REPORT"
+
+# Black frames
+BLACKDETECT=$(echo "$QC_OUTPUT" | grep "black_start:" || true)
+if [[ -n "$BLACKDETECT" ]]; then
+    echo "$BLACKDETECT" | tee -a "$REPORT"
+    warn "Black frames detected"
+else
+    info "No black frames detected"
+fi
 
 # Solid color frames (black, white, color flashes, etc.)
 SOLIDCOLOR=$(echo "$QC_OUTPUT" | grep "solid_start:" || true)
@@ -278,9 +293,9 @@ fi
 if [[ "$NEEDS_CORRECTION" == "1" ]]; then
     echo "" | tee -a "$REPORT"
     echo "--- LOUDNESS CORRECTION ---" | tee -a "$REPORT"
-    CORRECTED="${REPORT_DIR}/${BASENAME%.*}_corrected.mov"
+    CORRECTED="${FILE_DIR}/${BASENAME%.*}_corrected.mov"
     info "Loudness out of spec (I: ${INTEGRATED} LKFS, TP: ${TRUE_PEAK} dBTP) — correcting to OP-59 target"
-    NORM_OUTPUT=$($FFMPEG -y -i "$INPUT" \
+    NORM_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -y -i "$INPUT" \
         -af loudnorm=I=-24:TP=-2:LRA=15:print_format=summary \
         -ar 48000 -c:v copy -c:a pcm_s16le "$CORRECTED" 2>&1)
     if [[ $? -eq 0 ]]; then
@@ -304,3 +319,11 @@ echo "" | tee -a "$REPORT"
 echo "============================================" | tee -a "$REPORT"
 echo "SUMMARY: $ERRORS error(s), $WARNINGS warning(s)" | tee -a "$REPORT"
 echo "============================================" | tee -a "$REPORT"
+if [[ "$ERRORS" -gt 0 ]]
+then
+    exit 1
+fi
+if [[ "$WARNINGS" -gt 0 ]]
+then
+    exit 2
+fi
