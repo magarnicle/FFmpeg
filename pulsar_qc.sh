@@ -197,8 +197,8 @@ else
     info "No black frames detected"
 fi
 
-# Solid color frames (black, white, color flashes, etc.)
-SOLIDCOLOR=$(echo "$QC_OUTPUT" | grep "solid_start:" || true)
+# Solid color frames (excluding black, which blackdetect handles)
+SOLIDCOLOR=$(echo "$QC_OUTPUT" | grep "solid_start:" | grep -v "color:black" || true)
 if [[ -n "$SOLIDCOLOR" ]]; then
     echo "$SOLIDCOLOR" | tee -a "$REPORT"
     warn "Solid color frames detected"
