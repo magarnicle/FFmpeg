@@ -21,9 +21,8 @@
 
 /**
  * @file
- * Solid color frame detector. Detects frames that are a single non-black
- * uniform color (e.g. solid blue, green, grey, etc.). Black frames are
- * excluded — use blackdetect for those.
+ * Solid color frame detector. Detects frames that are a single uniform
+ * color (e.g. solid black, blue, green, grey, etc.).
  */
 
 #include <float.h>
@@ -56,6 +55,7 @@ typedef struct SolidColorDetectContext {
     unsigned int avg_y;
     unsigned int avg_u;
     unsigned int avg_v;
+    const char  *color_name;
 } SolidColorDetectContext;
 
 #define OFFSET(x) offsetof(SolidColorDetectContext, x)
@@ -123,6 +123,84 @@ static int config_input(AVFilterLink *inlink)
     return 0;
 }
 
+/**
+ * Map average YUV values to a human-readable color name.
+ */
+static const char *get_color_name(unsigned avg_y, unsigned avg_u, unsigned avg_v,
+                                  int depth, int full)
+{
+    const int factor = 1 << (depth - 8);
+    double y_norm, u_norm, v_norm;
+    double r, g, b;
+    double cmax, cmin, delta, h, s, l;
+
+    /* Normalize Y to 0.0–1.0 */
+    if (full)
+        y_norm = (double)avg_y / ((1 << depth) - 1);
+    else
+        y_norm = ((double)avg_y - 16.0 * factor) / (219.0 * factor);
+    y_norm = av_clipd(y_norm, 0.0, 1.0);
+
+    /* Normalize U, V to signed -1.0 to 1.0 */
+    if (full) {
+        u_norm = ((double)avg_u - 128.0 * factor) / (128.0 * factor);
+        v_norm = ((double)avg_v - 128.0 * factor) / (128.0 * factor);
+    } else {
+        u_norm = ((double)avg_u - 128.0 * factor) / (112.0 * factor);
+        v_norm = ((double)avg_v - 128.0 * factor) / (112.0 * factor);
+    }
+
+    /* YCbCr to RGB (BT.601) */
+    r = av_clipd(y_norm + 1.402 * v_norm, 0.0, 1.0);
+    g = av_clipd(y_norm - 0.344136 * u_norm - 0.714136 * v_norm, 0.0, 1.0);
+    b = av_clipd(y_norm + 1.772 * u_norm, 0.0, 1.0);
+
+    /* RGB to HSL */
+    cmax  = FFMAX3(r, g, b);
+    cmin  = FFMIN3(r, g, b);
+    l     = (cmax + cmin) * 0.5;
+    delta = cmax - cmin;
+
+    if (delta < 1e-3) {
+        h = 0;
+        s = 0;
+    } else {
+        s = l > 0.5 ? delta / (2.0 - cmax - cmin) : delta / (cmax + cmin);
+        if (cmax == r)
+            h = fmod((g - b) / delta + 6.0, 6.0) * 60.0;
+        else if (cmax == g)
+            h = ((b - r) / delta + 2.0) * 60.0;
+        else
+            h = ((r - g) / delta + 4.0) * 60.0;
+    }
+
+    /* Achromatic */
+    if (s < 0.15) {
+        if (l < 0.12) return "black";
+        if (l > 0.88) return "white";
+        if (l < 0.35) return "dark grey";
+        if (l > 0.65) return "light grey";
+        return "grey";
+    }
+
+    /* Chromatic: classify hue */
+    static const char * const base_names[]  = { "red", "orange", "yellow", "green", "blue", "magenta" };
+    static const char * const dark_names[]  = { "dark red", "dark orange", "dark yellow", "dark green", "dark blue", "dark magenta" };
+    static const char * const light_names[] = { "light red", "light orange", "light yellow", "light green", "light blue", "light magenta" };
+
+    int hue_idx;
+    if      (h >= 345 || h < 15) hue_idx = 0;
+    else if (h < 45)             hue_idx = 1;
+    else if (h < 75)             hue_idx = 2;
+    else if (h < 165)            hue_idx = 3;
+    else if (h < 285)            hue_idx = 4;
+    else                         hue_idx = 5;
+
+    if (l < 0.25) return dark_names[hue_idx];
+    if (l > 0.75) return light_names[hue_idx];
+    return base_names[hue_idx];
+}
+
 static void check_solid_end(AVFilterContext *ctx)
 {
     SolidColorDetectContext *s = ctx->priv;
@@ -130,11 +208,11 @@ static void check_solid_end(AVFilterContext *ctx)
     if ((s->solid_end - s->solid_start) >= s->min_duration) {
         av_log(ctx, AV_LOG_INFO,
                "solid_start:%s solid_end:%s solid_duration:%s "
-               "avg_y:%u avg_u:%u avg_v:%u\n",
+               "color:%s avg_y:%u avg_u:%u avg_v:%u\n",
                av_ts2timestr(s->solid_start, &s->time_base),
                av_ts2timestr(s->solid_end,   &s->time_base),
                av_ts2timestr(s->solid_end - s->solid_start, &s->time_base),
-               s->avg_y, s->avg_u, s->avg_v);
+               s->color_name, s->avg_y, s->avg_u, s->avg_v);
     }
 }
 
@@ -239,12 +317,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
                                      w, h, ref_y, pixel_tol_i);
     }
 
-    /* Exclude black frames: if average luma is within tolerance of 0, skip */
-    if (ref_y <= pixel_tol_i) {
-        picture_ratio = 0;
-    } else {
-        picture_ratio = (double)nb_matching / (w * h);
-    }
+    picture_ratio = (double)nb_matching / (w * h);
 
     /* Also check chroma planes for uniformity */
     if (picture_ratio >= s->picture_ratio_th && desc->nb_components >= 3) {
@@ -279,7 +352,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
         s->avg_y = ref_y;
         s->avg_u = ref_u;
         s->avg_v = ref_v;
+    } else if (picture_ratio >= s->picture_ratio_th) {
+        /* Grayscale format: no chroma planes */
+        s->avg_y = ref_y;
+        s->avg_u = 128 * factor;
+        s->avg_v = 128 * factor;
     }
+
+    if (picture_ratio >= s->picture_ratio_th)
+        s->color_name = get_color_name(s->avg_y, s->avg_u, s->avg_v,
+                                       s->depth, full);
 
     av_log(ctx, AV_LOG_DEBUG,
            "frame:%"PRId64" picture_ratio:%f pts:%s t:%s type:%c\n",
@@ -327,7 +409,7 @@ static const AVFilterPad solidcolordetect_inputs[] = {
 
 const FFFilter ff_vf_solidcolordetect = {
     .p.name        = "solidcolordetect",
-    .p.description = NULL_IF_CONFIG_SMALL("Detect video intervals that are a non-black solid color."),
+    .p.description = NULL_IF_CONFIG_SMALL("Detect video intervals that are a solid color."),
     .p.priv_class  = &solidcolordetect_class,
     .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(SolidColorDetectContext),
