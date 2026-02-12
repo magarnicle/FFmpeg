@@ -769,6 +769,7 @@ extern int debug_ts;
 extern int exit_on_error;
 extern int abort_on_flags;
 extern int print_stats;
+extern int no_progress;
 extern int64_t stats_period;
 extern int stdin_interaction;
 extern AVIOContext *progress_avio;

@@ -71,6 +71,7 @@ int debug_ts          = 0;
 int exit_on_error     = 0;
 int abort_on_flags    = 0;
 int print_stats       = -1;
+int no_progress       = 0;
 int stdin_interaction = 1;
 float max_error_rate  = 2.0/3;
 char *filter_nbthreads;
@@ -1848,6 +1849,9 @@ const OptionDef options[] = {
     { "stats",               OPT_TYPE_BOOL, 0,
         { &print_stats },
         "print progress report during encoding", },
+    { "noprogress",          OPT_TYPE_BOOL, 0,
+        { &no_progress },
+        "suppress periodic progress output, only print final report", },
     { "stats_period",        OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_stats_period },
         "set the period at which ffmpeg updates stats and -progress output", "time" },
