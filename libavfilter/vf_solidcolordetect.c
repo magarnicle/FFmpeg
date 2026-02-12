@@ -21,9 +21,8 @@
 
 /**
  * @file
- * Solid color frame detector. Detects frames that are a single non-black
- * uniform color (e.g. solid blue, green, grey, etc.). Black frames are
- * excluded — use blackdetect for those.
+ * Solid color frame detector. Detects frames that are a single uniform
+ * color (e.g. solid black, blue, green, grey, etc.).
  */
 
 #include <float.h>
@@ -239,12 +238,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
                                      w, h, ref_y, pixel_tol_i);
     }
 
-    /* Exclude black frames: if average luma is within tolerance of 0, skip */
-    if (ref_y <= pixel_tol_i) {
-        picture_ratio = 0;
-    } else {
-        picture_ratio = (double)nb_matching / (w * h);
-    }
+    picture_ratio = (double)nb_matching / (w * h);
 
     /* Also check chroma planes for uniformity */
     if (picture_ratio >= s->picture_ratio_th && desc->nb_components >= 3) {
@@ -327,7 +321,7 @@ static const AVFilterPad solidcolordetect_inputs[] = {
 
 const FFFilter ff_vf_solidcolordetect = {
     .p.name        = "solidcolordetect",
-    .p.description = NULL_IF_CONFIG_SMALL("Detect video intervals that are a non-black solid color."),
+    .p.description = NULL_IF_CONFIG_SMALL("Detect video intervals that are a solid color."),
     .p.priv_class  = &solidcolordetect_class,
     .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(SolidColorDetectContext),
