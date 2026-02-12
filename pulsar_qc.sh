@@ -305,8 +305,11 @@ if [[ "$NEEDS_CORRECTION" == "1" ]]; then
             echo "$NORM_SUMMARY" | tee -a "$REPORT"
         fi
         info "Corrected file written to: $CORRECTED"
+        mv "${CORRECTED}" "${1}"
+        info "Corrected file replaced original file"
     else
         error "Loudness correction failed"
+        rm "${CORRECTED}"
     fi
 else
     info "Loudness within spec — no correction needed"
