@@ -56,6 +56,19 @@ typedef struct SolidColorDetectContext {
     unsigned int avg_u;
     unsigned int avg_v;
     const char  *color_name;
+
+    /* accumulated sums for period-wide averages */
+    uint64_t sum_y, sum_u, sum_v;
+    unsigned int nb_solid_frames;
+    int          last_full; /* full-range flag for color naming */
+
+    /* min/max of per-frame averages across the detected period */
+    unsigned int min_y, max_y;
+    unsigned int min_u, max_u;
+    unsigned int min_v, max_v;
+
+    /* min/max of per-frame max pixel deviation from ref_y */
+    unsigned int min_dev_y, max_dev_y;
 } SolidColorDetectContext;
 
 #define OFFSET(x) offsetof(SolidColorDetectContext, x)
@@ -174,6 +187,10 @@ static const char *get_color_name(unsigned avg_y, unsigned avg_u, unsigned avg_v
             h = ((r - g) / delta + 4.0) * 60.0;
     }
 
+    /* Near-black/white: HSL saturation is unstable at extreme luminance */
+    if (l < 0.05) return "black";
+    if (l > 0.95) return "white";
+
     /* Achromatic */
     if (s < 0.15) {
         if (l < 0.12) return "black";
@@ -206,13 +223,25 @@ static void check_solid_end(AVFilterContext *ctx)
     SolidColorDetectContext *s = ctx->priv;
 
     if ((s->solid_end - s->solid_start) >= s->min_duration) {
+        unsigned period_y = (unsigned)(s->sum_y / s->nb_solid_frames);
+        unsigned period_u = (unsigned)(s->sum_u / s->nb_solid_frames);
+        unsigned period_v = (unsigned)(s->sum_v / s->nb_solid_frames);
+        const char *name = get_color_name(period_y, period_u, period_v,
+                                          s->depth, s->last_full);
+
         av_log(ctx, AV_LOG_INFO,
                "solid_start:%s solid_end:%s solid_duration:%s "
-               "color:%s avg_y:%u avg_u:%u avg_v:%u\n",
+               "color:%s avg_y:%u avg_u:%u avg_v:%u "
+               "y:%u-%u u:%u-%u v:%u-%u "
+               "luma_dev:%u-%u\n",
                av_ts2timestr(s->solid_start, &s->time_base),
                av_ts2timestr(s->solid_end,   &s->time_base),
                av_ts2timestr(s->solid_end - s->solid_start, &s->time_base),
-               s->color_name, s->avg_y, s->avg_u, s->avg_v);
+               name, period_y, period_u, period_v,
+               s->min_y, s->max_y,
+               s->min_u, s->max_u,
+               s->min_v, s->max_v,
+               s->min_dev_y, s->max_dev_y);
     }
 }
 
@@ -286,6 +315,43 @@ static unsigned count_within16(const uint8_t *src, ptrdiff_t stride,
     return count;
 }
 
+/**
+ * Compute the max absolute deviation from a reference value (8-bit).
+ */
+static unsigned compute_max_dev8(const uint8_t *src, ptrdiff_t stride,
+                                 int width, int height, unsigned ref)
+{
+    unsigned max_dev = 0;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            unsigned d = src[x] > ref ? src[x] - ref : ref - src[x];
+            if (d > max_dev)
+                max_dev = d;
+        }
+        src += stride;
+    }
+    return max_dev;
+}
+
+/**
+ * Compute the max absolute deviation from a reference value (>8-bit).
+ */
+static unsigned compute_max_dev16(const uint8_t *src, ptrdiff_t stride,
+                                  int width, int height, unsigned ref)
+{
+    unsigned max_dev = 0;
+    for (int y = 0; y < height; y++) {
+        const uint16_t *src16 = (const uint16_t *)src;
+        for (int x = 0; x < width; x++) {
+            unsigned d = src16[x] > ref ? src16[x] - ref : ref - src16[x];
+            if (d > max_dev)
+                max_dev = d;
+        }
+        src += stride;
+    }
+    return max_dev;
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
 {
     FilterLink *inl = ff_filter_link(inlink);
@@ -304,7 +370,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
 
     /* Compute pixel tolerance in integer units */
     pixel_tol_i = full ? s->pixel_th * max :
-        16 * factor + s->pixel_th * (235 - 16) * factor;
+        s->pixel_th * (235 - 16) * factor;
 
     /* Compute average luma, then count pixels near that average */
     if (s->depth <= 8) {
@@ -360,8 +426,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
     }
 
     if (picture_ratio >= s->picture_ratio_th)
-        s->color_name = get_color_name(s->avg_y, s->avg_u, s->avg_v,
-                                       s->depth, full);
+        s->last_full = full;
 
     av_log(ctx, AV_LOG_DEBUG,
            "frame:%"PRId64" picture_ratio:%f pts:%s t:%s type:%c\n",
@@ -370,11 +435,42 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
            av_get_picture_type_char(picref->pict_type));
 
     if (picture_ratio >= s->picture_ratio_th) {
+        unsigned frame_dev;
+
+        /* Compute max pixel deviation from ref_y for this frame */
+        if (s->depth <= 8)
+            frame_dev = compute_max_dev8(picref->data[0], picref->linesize[0],
+                                         w, h, ref_y);
+        else
+            frame_dev = compute_max_dev16(picref->data[0], picref->linesize[0],
+                                          w, h, ref_y);
+
         if (!s->solid_started) {
             s->solid_started = 1;
             s->solid_start = picref->pts;
+            s->min_y = s->max_y = s->avg_y;
+            s->min_u = s->max_u = s->avg_u;
+            s->min_v = s->max_v = s->avg_v;
+            s->min_dev_y = s->max_dev_y = frame_dev;
+            s->sum_y = s->avg_y;
+            s->sum_u = s->avg_u;
+            s->sum_v = s->avg_v;
+            s->nb_solid_frames = 1;
             av_dict_set(&picref->metadata, "lavfi.solid_start",
                 av_ts2timestr(s->solid_start, &s->time_base), 0);
+        } else {
+            if (s->avg_y < s->min_y) s->min_y = s->avg_y;
+            if (s->avg_y > s->max_y) s->max_y = s->avg_y;
+            if (s->avg_u < s->min_u) s->min_u = s->avg_u;
+            if (s->avg_u > s->max_u) s->max_u = s->avg_u;
+            if (s->avg_v < s->min_v) s->min_v = s->avg_v;
+            if (s->avg_v > s->max_v) s->max_v = s->avg_v;
+            if (frame_dev < s->min_dev_y) s->min_dev_y = frame_dev;
+            if (frame_dev > s->max_dev_y) s->max_dev_y = frame_dev;
+            s->sum_y += s->avg_y;
+            s->sum_u += s->avg_u;
+            s->sum_v += s->avg_v;
+            s->nb_solid_frames++;
         }
     } else if (s->solid_started) {
         s->solid_started = 0;
