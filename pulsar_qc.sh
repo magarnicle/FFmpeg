@@ -21,6 +21,7 @@ REPORT="$REPORT_DIR/${BASENAME%.*}_qc_report.txt"
 echo "============================================" | tee "$REPORT"
 echo "QC Report: $INPUT" | tee -a "$REPORT"
 echo "Date: $(date)" | tee -a "$REPORT"
+stat "$INPUT" | tee -a "$REPORT"
 echo "============================================" | tee -a "$REPORT"
 
 ERRORS=0
@@ -172,7 +173,7 @@ info "Running all quality checks in one pass..."
 QC_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -i "$INPUT" \
     -filter_complex "
         [0:v]blackdetect=d=3:pix_th=0.0784:pic_th=0.98,
-             solidcolordetect=d=0:pix_th=0.0784:pic_th=1,
+             solidcolordetect=d=0:pix_th=0.01:pic_th=0.97,
              freezedetect=n=0.001:d=20,
              colorbarsdetect=d=0.5[vout];
         [0:a]asplit=4[a1][a2][a3][a4];
