@@ -22609,6 +22609,107 @@ Set value which will be added to filtered result.
 
 This filter supports the all above options as @ref{commands}.
 
+@section solidcolordetect
+
+Detect video intervals that are a single uniform solid color (e.g. black,
+blue, green, grey, etc.). Can be useful to detect chapter transitions,
+commercials, slates, or invalid recordings.
+
+The filter outputs its detection analysis to both the log as well as
+frame metadata. If a solid color segment of at least the specified minimum
+duration is found, a line with the timestamps, color, and statistics is
+printed to the log with level @code{info}. In addition, a log line with
+level @code{debug} is printed per frame showing the solid ratio detected
+for that frame.
+
+The filter also attaches metadata to the first frame of a solid color
+segment with key @code{lavfi.solid_start} and to the first frame
+after the segment ends with key @code{lavfi.solid_end}. The value is
+the frame's timestamp. This metadata is added regardless of the minimum
+duration specified.
+
+The filter accepts the following options:
+
+@table @option
+@item min_duration, d
+Set the minimum detected solid color duration expressed in seconds. It must
+be a non-negative floating point number.
+
+Default value is 2.0.
+
+@item picture_ratio_th, pic_th
+Set the threshold for considering a picture as a solid color.
+Express the minimum value for the ratio:
+@example
+@var{nb_matching_pixels} / @var{nb_pixels}
+@end example
+
+for which a picture is considered solid. All three planes (Y, U, V) must
+independently meet this threshold.
+Default value is 0.98.
+
+@item pixel_th, pix_th
+Set the pixel tolerance threshold. This controls how much each pixel's
+value may deviate from the frame's average and still be considered
+"matching". The value is a fraction of the luma range:
+@example
+@var{tolerance} = @var{pixel_th} * @var{luma_range_size}
+@end example
+
+@var{luma_range_size} is 255 for YUV full-range formats and 219 (i.e.
+235 minus 16) for YUV limited-range formats, scaled by bit depth.
+
+Default value is 0.10.
+@end table
+
+@subsection Output format
+
+When a solid color segment is detected, the following fields are printed:
+
+@table @option
+@item solid_start
+Start timestamp of the solid color segment.
+
+@item solid_end
+End timestamp of the solid color segment.
+
+@item solid_duration
+Duration of the solid color segment.
+
+@item color
+Human-readable color name derived from the period-wide average YUV values
+(e.g. "black", "dark blue", "green", "white").
+
+@item avg_y, avg_u, avg_v
+Average Y, U, and V values across all qualifying frames in the detected
+period, in native bit-depth units.
+
+@item y, u, v (min-max ranges)
+The minimum and maximum per-frame average Y, U, and V values observed
+across the detected period. Shows how much the color drifted between
+frames.
+
+@item luma_dev (min-max range)
+The minimum and maximum per-frame peak luma pixel deviation from the
+frame's average luma. This shows the worst-case pixel spread within
+individual frames and is useful for calibrating @option{pix_th}: if
+the maximum luma_dev is below your tolerance in native units, the
+detection is reliable.
+@end table
+
+@subsection Examples
+
+Detect solid color intervals of at least 2 seconds with default thresholds:
+@example
+solidcolordetect
+@end example
+
+Detect only perfectly uniform frames (all pixels identical) with no
+minimum duration:
+@example
+solidcolordetect=d=0:pix_th=0:pic_th=1
+@end example
+
 @anchor{spp}
 @section spp
 
