@@ -56,7 +56,7 @@ typedef struct SolidColorDetectContext {
     unsigned int avg_y;
     unsigned int avg_u;
     unsigned int avg_v;
-    const char  *color_name;
+    const char  *current_color;
 
     /* accumulated sums for period-wide averages */
     uint64_t sum_y, sum_u, sum_v;
@@ -229,8 +229,6 @@ static void check_solid_end(AVFilterContext *ctx)
         unsigned period_y = (unsigned)(s->sum_y / s->nb_solid_frames);
         unsigned period_u = (unsigned)(s->sum_u / s->nb_solid_frames);
         unsigned period_v = (unsigned)(s->sum_v / s->nb_solid_frames);
-        const char *name = get_color_name(period_y, period_u, period_v,
-                                          s->depth, s->last_full);
 
         av_log(ctx, AV_LOG_INFO,
                "solid_start:%s solid_end:%s solid_duration:%s "
@@ -240,7 +238,7 @@ static void check_solid_end(AVFilterContext *ctx)
                av_ts2timestr(s->solid_start, &s->time_base),
                av_ts2timestr(s->solid_end,   &s->time_base),
                av_ts2timestr(s->solid_end - s->solid_start, &s->time_base),
-               name, period_y, period_u, period_v,
+               s->current_color, period_y, period_u, period_v,
                s->min_y, s->max_y,
                s->min_u, s->max_u,
                s->min_v, s->max_v,
@@ -464,32 +462,47 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
                 av_dict_set(&picref->metadata, "lavfi.solid_end",
                     av_ts2timestr(s->solid_end, &s->time_base), 0);
             }
-        } else if (!s->solid_started) {
-            s->solid_started = 1;
-            s->solid_start = picref->pts;
-            s->min_y = s->max_y = s->avg_y;
-            s->min_u = s->max_u = s->avg_u;
-            s->min_v = s->max_v = s->avg_v;
-            s->min_dev_y = s->max_dev_y = frame_dev;
-            s->sum_y = s->avg_y;
-            s->sum_u = s->avg_u;
-            s->sum_v = s->avg_v;
-            s->nb_solid_frames = 1;
-            av_dict_set(&picref->metadata, "lavfi.solid_start",
-                av_ts2timestr(s->solid_start, &s->time_base), 0);
         } else {
-            if (s->avg_y < s->min_y) s->min_y = s->avg_y;
-            if (s->avg_y > s->max_y) s->max_y = s->avg_y;
-            if (s->avg_u < s->min_u) s->min_u = s->avg_u;
-            if (s->avg_u > s->max_u) s->max_u = s->avg_u;
-            if (s->avg_v < s->min_v) s->min_v = s->avg_v;
-            if (s->avg_v > s->max_v) s->max_v = s->avg_v;
-            if (frame_dev < s->min_dev_y) s->min_dev_y = frame_dev;
-            if (frame_dev > s->max_dev_y) s->max_dev_y = frame_dev;
-            s->sum_y += s->avg_y;
-            s->sum_u += s->avg_u;
-            s->sum_v += s->avg_v;
-            s->nb_solid_frames++;
+            const char *frame_color = get_color_name(s->avg_y, s->avg_u, s->avg_v,
+                                                     s->depth, full);
+
+            if (s->solid_started && strcmp(frame_color, s->current_color)) {
+                /* Color changed: end current period, start new one */
+                s->solid_end = picref->pts;
+                check_solid_end(ctx);
+                av_dict_set(&picref->metadata, "lavfi.solid_end",
+                    av_ts2timestr(s->solid_end, &s->time_base), 0);
+                s->solid_started = 0;
+            }
+
+            if (!s->solid_started) {
+                s->solid_started = 1;
+                s->solid_start = picref->pts;
+                s->current_color = frame_color;
+                s->min_y = s->max_y = s->avg_y;
+                s->min_u = s->max_u = s->avg_u;
+                s->min_v = s->max_v = s->avg_v;
+                s->min_dev_y = s->max_dev_y = frame_dev;
+                s->sum_y = s->avg_y;
+                s->sum_u = s->avg_u;
+                s->sum_v = s->avg_v;
+                s->nb_solid_frames = 1;
+                av_dict_set(&picref->metadata, "lavfi.solid_start",
+                    av_ts2timestr(s->solid_start, &s->time_base), 0);
+            } else {
+                if (s->avg_y < s->min_y) s->min_y = s->avg_y;
+                if (s->avg_y > s->max_y) s->max_y = s->avg_y;
+                if (s->avg_u < s->min_u) s->min_u = s->avg_u;
+                if (s->avg_u > s->max_u) s->max_u = s->avg_u;
+                if (s->avg_v < s->min_v) s->min_v = s->avg_v;
+                if (s->avg_v > s->max_v) s->max_v = s->avg_v;
+                if (frame_dev < s->min_dev_y) s->min_dev_y = frame_dev;
+                if (frame_dev > s->max_dev_y) s->max_dev_y = frame_dev;
+                s->sum_y += s->avg_y;
+                s->sum_u += s->avg_u;
+                s->sum_v += s->avg_v;
+                s->nb_solid_frames++;
+            }
         }
     } else if (s->solid_started) {
         s->solid_started = 0;
