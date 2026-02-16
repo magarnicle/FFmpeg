@@ -46,6 +46,7 @@ typedef struct SolidColorDetectContext {
 
     double  picture_ratio_th;
     double  pixel_th;
+    double  dev_th;
 
     unsigned int nb_matching_pixels;
     AVRational   time_base;
@@ -81,6 +82,8 @@ static const AVOption solidcolordetect_options[] = {
     { "pic_th",           "set the picture solid ratio threshold", OFFSET(picture_ratio_th), AV_OPT_TYPE_DOUBLE, {.dbl=.98}, 0, 1, FLAGS },
     { "pixel_th",  "set the pixel tolerance threshold", OFFSET(pixel_th), AV_OPT_TYPE_DOUBLE, {.dbl=.10}, 0, 1, FLAGS },
     { "pix_th",    "set the pixel tolerance threshold", OFFSET(pixel_th), AV_OPT_TYPE_DOUBLE, {.dbl=.10}, 0, 1, FLAGS },
+    { "dev_th",      "set the max pixel deviation threshold", OFFSET(dev_th), AV_OPT_TYPE_DOUBLE, {.dbl=1.0}, 0, 1, FLAGS },
+    { "max_dev_th",  "set the max pixel deviation threshold", OFFSET(dev_th), AV_OPT_TYPE_DOUBLE, {.dbl=1.0}, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -130,9 +133,9 @@ static int config_input(AVFilterLink *inlink)
     s->min_duration = s->min_duration_time / av_q2d(s->time_base);
 
     av_log(ctx, AV_LOG_VERBOSE,
-           "min_duration:%s pixel_th:%f picture_ratio_th:%f\n",
+           "min_duration:%s pixel_th:%f picture_ratio_th:%f dev_th:%f\n",
            av_ts2timestr(s->min_duration, &s->time_base),
-           s->pixel_th, s->picture_ratio_th);
+           s->pixel_th, s->picture_ratio_th, s->dev_th);
     return 0;
 }
 
@@ -436,6 +439,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
 
     if (picture_ratio >= s->picture_ratio_th) {
         unsigned frame_dev;
+        unsigned dev_th_i;
 
         /* Compute max pixel deviation from ref_y for this frame */
         if (s->depth <= 8)
@@ -445,7 +449,22 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
             frame_dev = compute_max_dev16(picref->data[0], picref->linesize[0],
                                           w, h, ref_y);
 
-        if (!s->solid_started) {
+        /* Reject frame if max deviation exceeds dev_th */
+        dev_th_i = full ? s->dev_th * max :
+            s->dev_th * (235 - 16) * factor;
+        if (frame_dev > dev_th_i)
+            picture_ratio = 0;
+
+        if (picture_ratio < s->picture_ratio_th) {
+            /* dev_th rejected this frame; end any ongoing solid period */
+            if (s->solid_started) {
+                s->solid_started = 0;
+                s->solid_end = picref->pts;
+                check_solid_end(ctx);
+                av_dict_set(&picref->metadata, "lavfi.solid_end",
+                    av_ts2timestr(s->solid_end, &s->time_base), 0);
+            }
+        } else if (!s->solid_started) {
             s->solid_started = 1;
             s->solid_start = picref->pts;
             s->min_y = s->max_y = s->avg_y;

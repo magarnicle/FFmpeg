@@ -22660,6 +22660,22 @@ value may deviate from the frame's average and still be considered
 235 minus 16) for YUV limited-range formats, scaled by bit depth.
 
 Default value is 0.10.
+
+@item dev_th, max_dev_th
+Set the maximum pixel deviation threshold. If the maximum luma deviation
+of any pixel from the frame average exceeds this fraction of the luma
+range, the frame is rejected as non-solid regardless of @option{pic_th}.
+The value is scaled the same way as @option{pix_th}:
+@example
+@var{max_allowed_dev} = @var{dev_th} * @var{luma_range_size}
+@end example
+
+This is useful for rejecting frames that have a high proportion of
+uniform pixels but also contain some outlier pixels with large deviation
+(e.g. noisy dark frames, textured backgrounds). Use the @code{luma_dev}
+field in the output to calibrate an appropriate value.
+
+Default value is 1.0 (disabled, allows any deviation).
 @end table
 
 @subsection Output format
