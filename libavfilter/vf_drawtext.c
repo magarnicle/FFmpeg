@@ -359,6 +359,11 @@ typedef struct DrawTextContext {
     int blank_advance64;            ///< the size of the space character
     int tab_warning_printed;        ///< ensure the tab warning to be printed only once
     hb_font_t *hb_font;             ///< shared HarfBuzz font (owned by context, not per-line)
+
+    // Tracks which lines were visible last frame so we can clear only the
+    // lines that leave the viewport (not all 30k+ lines) each frame.
+    int prev_first_visible_line;    ///< first_visible_line from previous frame (-1 = none)
+    int prev_last_visible_line;     ///< last_visible_line from previous frame  (-1 = none)
 } DrawTextContext;
 
 #define OFFSET(x) offsetof(DrawTextContext, x)
@@ -1076,6 +1081,8 @@ static av_cold int init(AVFilterContext *ctx)
 
     s->fontsize = 0;
     s->default_fontsize = 16;
+    s->prev_first_visible_line = -1;
+    s->prev_last_visible_line  = -1;
 
     if (!s->fontfile && !CONFIG_LIBFONTCONFIG) {
         av_log(ctx, AV_LOG_ERROR, "No font filename provided\n");
@@ -1472,9 +1479,17 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
         tile_y_end = ((canvas_y + canvas_h) / tile_h) + 1;
     }
 
+    // In non-tile mode restrict to the visible line window so we don't
+    // traverse all N line structs just to skip them.
+    int l_start = 0, l_end = s->line_count - 1;
+    if (!canvas_tile && s->prev_first_visible_line >= 0) {
+        l_start = s->prev_first_visible_line;
+        l_end   = s->prev_last_visible_line;
+    }
+
     for (tile_y = tile_y_start; tile_y <= tile_y_end; ++tile_y) {
     for (tile_x = tile_x_start; tile_x <= tile_x_end; ++tile_x) {
-    for (l = 0; l < s->line_count; ++l) {
+    for (l = l_start; l <= l_end; ++l) {
         TextLine *line = &s->lines[l];
 
         /* Skip lines that weren't shaped (viewport optimization) */
@@ -1688,23 +1703,61 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         hb_destroy(&hb_data);
     }
 
-    // Process each line, shaping only visible lines
-    for (int line_idx = 0; line_idx < s->line_count; ++line_idx) {
-        TextLine *cur_line = &s->lines[line_idx];
-        int is_visible = (line_idx >= first_visible_line && line_idx <= last_visible_line);
+    // Clear lines that were shaped last frame but are now outside the viewport.
+    // Using prev_first/prev_last avoids touching all N lines every frame —
+    // only the lines entering/leaving the window need work (usually O(1)/frame).
+    {
+        int old_first = s->prev_first_visible_line;
+        int old_last  = s->prev_last_visible_line;
+        if (old_first >= 0) {
+            // Lines at top of old window now above the new window
+            int end = FFMIN(first_visible_line, old_last + 1);
+            for (int i = old_first; i < end; i++) {
+                s->lines[i].is_shaped          = 0;
+                s->lines[i].hb_data.glyph_count = 0;
+                s->lines[i].hb_data.glyph_info  = NULL;
+                s->lines[i].hb_data.glyph_pos   = NULL;
+                s->lines[i].width64              = 0;
+                s->lines[i].width_px             = 0;
+            }
+            // Lines at bottom of old window now below the new window
+            int start = FFMAX(last_visible_line + 1, old_first);
+            for (int i = start; i <= old_last; i++) {
+                s->lines[i].is_shaped          = 0;
+                s->lines[i].hb_data.glyph_count = 0;
+                s->lines[i].hb_data.glyph_info  = NULL;
+                s->lines[i].hb_data.glyph_pos   = NULL;
+                s->lines[i].width64              = 0;
+                s->lines[i].width_px             = 0;
+            }
+        }
+    }
+    s->prev_first_visible_line = first_visible_line;
+    s->prev_last_visible_line  = last_visible_line;
 
-        // Skip shaping for non-visible lines
-        if (!is_visible) {
-            cur_line->is_shaped = 0;
-            cur_line->hb_data.glyph_count = 0;
-            // Keep hb_data.buf alive for reuse when this line becomes visible again.
-            // Null stale interior pointers so they aren't accidentally dereferenced.
-            cur_line->hb_data.glyph_info = NULL;
-            cur_line->hb_data.glyph_pos  = NULL;
-            cur_line->width64  = 0;
-            cur_line->width_px = 0;
-            // Issue 7: O(1) skip — no need to scan tab_clusters for this line
-            // because first_tab_idx/line_tab_count were pre-computed per line.
+    // Shape only visible lines — O(visible_count) per frame, not O(total_lines).
+    for (int line_idx = first_visible_line; line_idx <= last_visible_line; ++line_idx) {
+        TextLine *cur_line = &s->lines[line_idx];
+        HarfbuzzData *hb = &cur_line->hb_data;
+
+        // If this line was already shaped with the current fontsize, the
+        // HarfBuzz glyph_info/glyph_pos and all cached metrics are still
+        // valid (text is static, font unchanged).  Skip the expensive
+        // reshape and the per-glyph width walk entirely.
+        if (cur_line->is_shaped && cur_line->metrics_fontsize == s->fontsize) {
+            w64 = cur_line->width64;
+            last_max_x64 = FFMAX(cur_line->offset_right64, last_max_x64);
+            cur_min_y64  = cur_line->line_min_y64;
+            if (first_max_y64 == -32000)
+                first_max_y64 = FFMAX(cur_line->line_max_y64, first_max_y64);
+            if (first_min_x64 == 32000)
+                first_min_x64 = FFMIN(cur_line->offset_left64, first_min_x64);
+            min_y64 = FFMIN(cur_line->line_min_y64, min_y64);
+            max_y64 = FFMAX(cur_line->line_max_y64, max_y64);
+            min_x64 = FFMIN(cur_line->line_min_x64, min_x64);
+            max_x64 = FFMAX(cur_line->line_max_x64, max_x64);
+            if (w64 > width64)
+                width64 = w64;
             continue;
         }
 
@@ -1744,7 +1797,6 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         }
 
         // Shape the line (reuses existing hb_data.buf via hb_buffer_reset — Issue 5)
-        HarfbuzzData *hb = &cur_line->hb_data;
         ret = shape_text_hb(s, hb, line_buf, cur_line->text_len);
         if (ret != 0) {
             goto done;
@@ -2024,6 +2076,9 @@ continue_count1:
 
         s->lines_text_version = s->text_version;
         s->lines_expanded_len = s->expanded_text.len;
+        // Fresh lines array — no previous visible-line state is valid.
+        s->prev_first_visible_line = -1;
+        s->prev_last_visible_line  = -1;
     }
     /* else: text unchanged, reuse cached line boundaries */
 
@@ -2165,13 +2220,16 @@ continue_count1:
         y64 = (int)(s->y * 64. + metrics.offset_top64);
     }
 
-    for (int l = 0; l < s->line_count; ++l) {
+    // Jump directly to first visible line instead of iterating from line 0.
+    // For uniform line height (the common case) y is strictly additive so
+    // we can precompute its value without touching every line struct.
+    y = first_visible_line * (metrics.line_height64 + s->line_spacing * 64);
+
+    for (int l = first_visible_line; l <= last_visible_line; ++l) {
         TextLine *line = &s->lines[l];
         HarfbuzzData *hb = &line->hb_data;
 
-        /* Skip lines that weren't shaped (viewport optimization) */
         if (!line->is_shaped) {
-            // Keep line->glyphs alive for potential reuse when line becomes visible.
             y += metrics.line_height64 + s->line_spacing * 64;
             continue;
         }
