@@ -1,0 +1,214 @@
+Pessimization issues found in libavfilter/vf_drawtext.c
+========================================================
+
+These are cases where unnecessary work is done — not active optimization
+opportunities, but things that any reasonable programmer would agree are
+avoidable overhead. Listed in rough order of impact.
+
+STATUS: Issues 1, 2, 3 have been fixed in this working tree.
+        Issues 5, 6, 7, 9 have been fixed in this working tree.
+
+---
+
+Issue 1: Tab search O(glyphs × tabs) instead of O(glyphs + tabs)
+  Location: measure_text(), ~line 1738 (original)
+  Status: FIXED
+
+  For every glyph in a shaped line, the code searched backward through
+  tab_clusters to determine whether that glyph was a tab character:
+
+      for (int ti = last_tab_idx - 1;
+           ti >= 0 && s->tab_clusters[ti] >= cur_line->cluster_offset; --ti) {
+          if (hb->glyph_info[t].cluster == s->tab_clusters[ti] - ...) {
+              is_tab = 1;
+              break;
+          }
+      }
+
+  This is O(G * T) where G = glyphs per line, T = tabs per line.
+  draw_text() already used the correct pattern: a single forward-advancing
+  index that scans each tab at most once. A line_tab_idx variable was even
+  declared in measure_text() at line 1737 but left unused (initialized to 0,
+  never incremented). The fix saves first_line_tab_idx before the tab
+  replacement loop, then uses line_tab_idx as a forward scan from there.
+
+---
+
+Issue 2: HarfBuzz font created and destroyed once per shaped line per frame
+  Location: shape_text_hb() / hb_destroy(), ~lines 1543, 1557 (original)
+  Status: FIXED
+
+  hb_ft_font_create_referenced(s->face) was called for every visible line
+  on every frame. The font is a wrapper around s->face, which does not change
+  between lines or frames (only when the font file or size changes). This
+  means on a 30fps video with 20 visible lines, 600 font objects were created
+  and destroyed per second for no reason.
+
+  Fix: added hb_font_t *hb_font to DrawTextContext, created once in init(),
+  destroyed once in uninit(). shape_text_hb() uses s->hb_font directly.
+  hb_destroy() no longer touches the font. set_fontsize() now calls
+  hb_ft_font_changed(s->hb_font) once instead of iterating all lines.
+  The font field was removed from HarfbuzzData entirely.
+
+---
+
+Issue 3: strcpy/strcat without bounds in detection bbox path
+  Location: filter_frame(), ~lines 2279-2282 (original)
+  Status: FIXED
+
+  When text_source == AV_FRAME_DATA_DETECTION_BBOXES, the code did:
+
+      strcpy(s->text, bbox->detect_label);
+      for (int j = 0; j < bbox->classify_count; j++) {
+          strcat(s->text, ", ");
+          strcat(s->text, bbox->classify_labels[j]);
+      }
+
+  The buffer s->text is allocated as:
+      (AV_DETECTION_BBOX_LABEL_NAME_MAX_SIZE + 1) * (AV_NUM_DETECTION_BBOX_CLASSIFY + 1)
+  bytes. The separator strings ", " add bytes not accounted for in that
+  formula, making overflow possible. Replaced with av_strlcpy/av_strlcat
+  with the known buffer size.
+
+---
+
+Issue 4: X expression evaluated twice unconditionally
+  Location: draw_text(), ~line 2023 (original)
+  Status: not fixed
+
+  After evaluating x and y expressions, x is evaluated a second time:
+
+      s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, ...);
+      s->y = s->var_values[VAR_Y] = av_expr_eval(s->y_pexpr, ...);
+      /* It is necessary if x is expressed from y */
+      s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, ...);
+
+  The comment explains the intent: if the user writes x='y+10', the second
+  evaluation picks up the updated VAR_Y. However, this re-evaluation happens
+  unconditionally even when x does not reference y at all. av_expr_eval() is
+  non-trivial (it walks an expression tree). The fix would be to check whether
+  x_pexpr references VAR_Y before the second evaluation, or to track whether
+  y changed and only re-evaluate if so.
+
+---
+
+Issue 5: Glyph array allocated and freed every frame
+  Location: draw_text(), ~lines 2109 and 2222 (original)
+  Status: FIXED
+
+  For every visible line on every frame:
+
+      line->glyphs = av_mallocz(hb->glyph_count * sizeof(GlyphInfo));
+      // ... use ...
+      av_freep(&line->glyphs);
+
+  The glyph count per line does not change unless the text changes. The
+  text_version / lines_text_version mechanism already exists to detect
+  text changes. When text is static, line->glyphs could be kept alive across
+  frames and reallocated only when glyph_count changes. The same applies to
+  HarfBuzz buffers (hb_data.buf), which are also destroyed and recreated
+  every frame even when text is unchanged.
+
+---
+
+Issue 6: UTF-8 decoded again to find tab byte offsets
+  Location: measure_text(), ~lines 1711-1717 (original)
+  Status: FIXED
+
+  For each tab character in a line, the code walks the line buffer from the
+  start, re-decoding UTF-8 codepoints to find the byte position of the tab:
+
+      const uint8_t *p = (const uint8_t *)line_buf;
+      int char_idx = 0;
+      while (char_idx < tab_pos && *p) {
+          uint32_t code;
+          GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; p++;);
+          ++char_idx;
+      }
+
+  This runs once per tab per line. A line with T tabs costs O(T * line_len)
+  bytes scanned. The byte offsets could be computed in a single O(line_len)
+  pass, or the replacement could piggyback on the character-level scan already
+  done elsewhere.
+
+---
+
+Issue 7: Tab range scanned for every non-visible line
+  Location: measure_text(), ~lines 1682-1689 (original)
+  Status: FIXED
+
+  For lines skipped by the viewport optimization, the code still scans
+  tab_clusters to advance last_tab_idx past the tabs belonging to that line:
+
+      for (int t = last_tab_idx; t < s->tab_count; ++t) {
+          if (s->tab_clusters[t] >= cur_line->cluster_offset &&
+              s->tab_clusters[t] < cur_line->cluster_offset + cur_line->text_len) {
+              ++last_tab_idx;
+          } else if (...) { break; }
+      }
+
+  This is correct but could be eliminated by pre-computing the first and last
+  tab index for each line during count_text_lines() or build_line_boundaries(),
+  so that the visible-line check and tab-range lookup are both O(1).
+
+---
+
+Issue 8: POS_CEIL(line->width64, 64) recomputed at multiple call sites
+  Location: draw_glyphs(), draw_text(), ~lines 1469, 1794, 1796, 1963 (original)
+  Status: not fixed
+
+  The integer pixel width of a line (POS_CEIL(line->width64, 64)) is computed
+  multiple times for the same line at different call sites within the same
+  frame. Since width64 does not change once lines are measured, the result
+  could be cached in TextLine (e.g., as int width) and written once in
+  measure_text(), eliminating the repeated ceiling divisions.
+
+---
+
+Issue 9: Per-glyph FFMIN/FFMAX for metrics that could be cached per line
+  Location: measure_text(), ~lines 1775-1779 (original)
+  Status: FIXED
+
+  For every visible glyph in every visible line on every frame:
+
+      cur_min_y64 = FFMIN(glyph->bbox.yMin, cur_min_y64);
+      min_y64     = FFMIN(glyph->bbox.yMin, min_y64);
+      max_y64     = FFMAX(glyph->bbox.yMax, max_y64);
+      min_x64     = FFMIN(glyph->bbox.xMin, min_x64);
+      max_x64     = FFMAX(glyph->bbox.xMax, max_x64);
+
+  These aggregate metrics (text bounding box) depend only on which glyphs
+  appear in the text, not on the frame. When text is unchanged, glyph metrics
+  are the same every frame. They could be cached in TextLine or in the context
+  and recomputed only when text_version changes.
+
+---
+
+Issue 10: stat() syscall on every frame when canvas_tile_reload is set
+  Location: filter_frame(), ~line 2292 (original)
+  Status: not fixed
+
+  When the canvas_tile_reload option is enabled:
+
+      if (stat(s->textfile, &file_stat) == 0 &&
+          file_stat.st_mtime != s->canvas_tile_reload_mtime) { ... }
+
+  This calls stat() on every single frame. Syscalls have measurable overhead;
+  at 30fps this is 30 stat() calls per second against a file that is unlikely
+  to change that frequently. A frame counter could throttle this to once every
+  N frames, or a configurable poll interval could be exposed as an option.
+
+---
+
+Issue 11: hb_destroy() calls hb_font_destroy/hb_buffer_destroy unconditionally
+  Location: hb_destroy(), ~lines 1557-1558 (original; moot after fix #2)
+  Status: moot (font removed from HarfbuzzData by fix #2)
+
+  The original hb_destroy() called hb_font_destroy(hb->font) and
+  hb_buffer_destroy(hb->buf) without NULL guards, then set both to NULL.
+  If either pointer was already NULL (e.g., for a non-visible line that set
+  hb_data.font = NULL at line 1679), the destroy calls would invoke the
+  HarfBuzz library with a NULL pointer. Both HarfBuzz functions are documented
+  to tolerate NULL, so this was not a crash, but it was a needless call.
+  After fix #2 removed font from HarfbuzzData, this issue is moot for the
+  font; the buffer path should still guard on NULL.

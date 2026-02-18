@@ -192,10 +192,21 @@ typedef struct TextLine {
     int width64;                    ///< width of the line
     HarfbuzzData hb_data;           ///< libharfbuzz data of this text line
     GlyphInfo* glyphs;              ///< array of glyphs in this text line
+    int glyphs_alloc;               ///< allocated capacity of glyphs[] in GlyphInfo units
     int cluster_offset;             ///< the offset at which this line begins
     int is_shaped;                  ///< 1 if shaped, 0 if skipped for viewport optimization
     const char *text_start;         ///< pointer to start of line in text buffer
     int text_len;                   ///< byte length of this line
+    int first_tab_idx;              ///< index into s->tab_clusters of first tab in this line
+    int line_tab_count;             ///< number of tab characters in this line
+
+    // Per-line glyph metrics cache; valid when metrics_fontsize == s->fontsize.
+    // Cleared to 0 (invalid) whenever the lines[] array is rebuilt on text change.
+    unsigned int metrics_fontsize;  ///< fontsize when the fields below were last computed
+    int line_min_y64;               ///< min bbox.yMin across all shaped glyphs
+    int line_max_y64;               ///< max bbox.yMax across all shaped glyphs
+    int line_min_x64;               ///< min bbox.xMin across all shaped glyphs
+    int line_max_x64;               ///< max bbox.xMax across all shaped glyphs
 } TextLine;
 
 /** A glyph as loaded and rendered using libfreetype */
@@ -1536,9 +1547,14 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
 // Shapes a line of text using libharfbuzz
 static int shape_text_hb(DrawTextContext *s, HarfbuzzData* hb, const char* text, int textLen)
 {
-    hb->buf = hb_buffer_create();
-    if(!hb_buffer_allocation_successful(hb->buf)) {
-        return AVERROR(ENOMEM);
+    if (hb->buf) {
+        hb_buffer_reset(hb->buf);
+    } else {
+        hb->buf = hb_buffer_create();
+        if (!hb_buffer_allocation_successful(hb->buf)) {
+            hb->buf = NULL;
+            return AVERROR(ENOMEM);
+        }
     }
     hb_buffer_set_direction(hb->buf, HB_DIRECTION_LTR);
     hb_buffer_set_script(hb->buf, HB_SCRIPT_LATIN);
@@ -1597,6 +1613,7 @@ static int count_text_lines(AVFilterContext *ctx, const char *text,
 {
     int line_count = 0;
     int tab_count = 0;
+    int tab_start_for_line = 0;
     uint32_t code = 0;
     const uint8_t *p = (const uint8_t *)text;
     const uint8_t *line_start = p;
@@ -1620,8 +1637,13 @@ continue_count:
                     (lines[line_count - 1].cluster_offset + lines[line_count - 1].text_len + 1) : 0;
                 lines[line_count].is_shaped = 0;
                 lines[line_count].glyphs = NULL;
+                lines[line_count].glyphs_alloc = 0;
+                lines[line_count].first_tab_idx = tab_start_for_line;
+                lines[line_count].line_tab_count = tab_count - tab_start_for_line;
+                lines[line_count].metrics_fontsize = 0; // invalidate cached metrics
             }
             ++line_count;
+            tab_start_for_line = tab_count;
             line_start = p;
             if (code == 0) break;
         }
@@ -1648,14 +1670,13 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
     int first_min_x64 = 32000, last_max_x64 = -32000;
     int min_y64 = 32000, max_y64 = -32000, min_x64 = 32000, max_x64 = -32000;
     Glyph *glyph = NULL;
-    int last_tab_idx = 0;
     int ret = 0;
     char *line_buf = NULL;
     int line_buf_size = 0;
 
     // Evaluate the width of the space character if needed to replace tabs
     if (s->tab_count > 0 && !s->blank_advance64) {
-        HarfbuzzData hb_data;
+        HarfbuzzData hb_data = {0};
         ret = shape_text_hb(s, &hb_data, " ", 1);
         if (ret != 0) {
             return ret;
@@ -1673,17 +1694,13 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         if (!is_visible) {
             cur_line->is_shaped = 0;
             cur_line->hb_data.glyph_count = 0;
-            cur_line->hb_data.buf = NULL;
+            // Keep hb_data.buf alive for reuse when this line becomes visible again.
+            // Null stale interior pointers so they aren't accidentally dereferenced.
+            cur_line->hb_data.glyph_info = NULL;
+            cur_line->hb_data.glyph_pos  = NULL;
             cur_line->width64 = 0;
-            // Skip tabs in this line for proper tab index tracking
-            for (int t = last_tab_idx; t < s->tab_count; ++t) {
-                if (s->tab_clusters[t] >= cur_line->cluster_offset &&
-                    s->tab_clusters[t] < cur_line->cluster_offset + cur_line->text_len) {
-                    ++last_tab_idx;
-                } else if (s->tab_clusters[t] >= cur_line->cluster_offset + cur_line->text_len) {
-                    break;
-                }
-            }
+            // Issue 7: O(1) skip — no need to scan tab_clusters for this line
+            // because first_tab_idx/line_tab_count were pre-computed per line.
             continue;
         }
 
@@ -1700,29 +1717,29 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         memcpy(line_buf, cur_line->text_start, cur_line->text_len);
         line_buf[cur_line->text_len] = '\0';
 
-        // Replace tabs with spaces in the line buffer
-        int first_line_tab_idx = last_tab_idx;
-        for (int t = last_tab_idx; t < s->tab_count; ++t) {
-            int tab_pos = s->tab_clusters[t] - cur_line->cluster_offset;
-            if (tab_pos >= 0 && tab_pos < cur_line->text_len) {
-                // Find byte position for this character position
-                const uint8_t *p = (const uint8_t *)line_buf;
-                int char_idx = 0;
+        // Issue 6: Replace tabs with spaces in a single forward pass.
+        // Previously the code restarted UTF-8 decoding from line start for each
+        // tab, giving O(T * line_len) total. This advances p once per character
+        // across the entire line, giving O(line_len) regardless of tab count.
+        {
+            const uint8_t *p = (const uint8_t *)line_buf;
+            int char_idx = 0;
+            int tab_end_idx = cur_line->first_tab_idx + cur_line->line_tab_count;
+            for (int t = cur_line->first_tab_idx; t < tab_end_idx; ++t) {
+                int tab_pos = s->tab_clusters[t] - cur_line->cluster_offset;
+                if (tab_pos < 0 || tab_pos >= cur_line->text_len)
+                    break;
                 while (char_idx < tab_pos && *p) {
                     uint32_t code;
                     GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; p++;);
                     ++char_idx;
                 }
-                if (*p == '\t') {
+                if (*p == '\t')
                     *(char *)p = ' ';
-                }
-                ++last_tab_idx;
-            } else if (s->tab_clusters[t] >= cur_line->cluster_offset + cur_line->text_len) {
-                break;
             }
         }
 
-        // Shape the line
+        // Shape the line (reuses existing hb_data.buf via hb_buffer_reset — Issue 5)
         HarfbuzzData *hb = &cur_line->hb_data;
         ret = shape_text_hb(s, hb, line_buf, cur_line->text_len);
         if (ret != 0) {
@@ -1730,50 +1747,102 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         }
         cur_line->is_shaped = 1;
 
-        w64 = 0;
-        cur_min_y64 = 32000;
-        int line_tab_idx = first_line_tab_idx;
-        for (int t = 0; t < hb->glyph_count; ++t) {
-            uint8_t is_tab = line_tab_idx < last_tab_idx &&
-                hb->glyph_info[t].cluster == s->tab_clusters[line_tab_idx] - cur_line->cluster_offset;
-            if (is_tab)
-                ++line_tab_idx;
-
-            ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, -1, -1);
-            if (ret != 0) {
-                goto done;
-            }
-
-            if (line_idx == 0 || first_max_y64 == -32000) {
-                first_max_y64 = FFMAX(glyph->bbox.yMax, first_max_y64);
-            }
-            if (t == 0) {
-                cur_line->offset_left64 = glyph->bbox.xMin;
-                if (line_idx == 0 || first_min_x64 == 32000) {
-                    first_min_x64 = FFMIN(glyph->bbox.xMin, first_min_x64);
-                }
-            }
-            if (t == hb->glyph_count - 1) {
-                int last_char_width = hb->glyph_pos[t].x_advance;
-                w64 += last_char_width;
-                last_max_x64 = FFMAX(last_char_width, last_max_x64);
-                cur_line->offset_right64 = last_char_width;
-            } else {
-                if (is_tab) {
+        // Issue 9: If per-line glyph metrics are already cached for the current
+        // fontsize, skip load_glyph() and all per-glyph FFMIN/FFMAX calls.
+        // Width is still recomputed from HB positions every frame (it's O(glyphs)
+        // but cheap — no glyph cache lookup needed).
+        if (cur_line->metrics_fontsize == s->fontsize) {
+            // Cache hit — accumulate width, skip bbox work.
+            int line_tab_idx = cur_line->first_tab_idx;
+            int tab_end_idx  = cur_line->first_tab_idx + cur_line->line_tab_count;
+            w64 = 0;
+            for (unsigned int t = 0; t < hb->glyph_count; ++t) {
+                uint8_t is_tab = line_tab_idx < tab_end_idx &&
+                    hb->glyph_info[t].cluster ==
+                        s->tab_clusters[line_tab_idx] - cur_line->cluster_offset;
+                if (is_tab)
+                    ++line_tab_idx;
+                if (t == hb->glyph_count - 1) {
+                    int last_char_width = hb->glyph_pos[t].x_advance;
+                    w64 += last_char_width;
+                    last_max_x64 = FFMAX(last_char_width, last_max_x64);
+                    cur_line->offset_right64 = last_char_width;
+                } else if (is_tab) {
                     int size = s->blank_advance64 * s->tabsize;
                     w64 = (w64 / size + 1) * size;
                 } else {
                     w64 += hb->glyph_pos[t].x_advance;
                 }
             }
-            cur_min_y64 = FFMIN(glyph->bbox.yMin, cur_min_y64);
-            min_y64 = FFMIN(glyph->bbox.yMin, min_y64);
-            max_y64 = FFMAX(glyph->bbox.yMax, max_y64);
-            min_x64 = FFMIN(glyph->bbox.xMin, min_x64);
-            max_x64 = FFMAX(glyph->bbox.xMax, max_x64);
-        }
+            cur_line->width64 = w64;
 
-        cur_line->width64 = w64;
+            // Update global metrics from cached per-line values.
+            cur_min_y64 = cur_line->line_min_y64;
+            if (line_idx == 0 || first_max_y64 == -32000)
+                first_max_y64 = FFMAX(cur_line->line_max_y64, first_max_y64);
+            if (line_idx == 0 || first_min_x64 == 32000)
+                first_min_x64 = FFMIN(cur_line->offset_left64, first_min_x64);
+            min_y64 = FFMIN(cur_line->line_min_y64, min_y64);
+            max_y64 = FFMAX(cur_line->line_max_y64, max_y64);
+            min_x64 = FFMIN(cur_line->line_min_x64, min_x64);
+            max_x64 = FFMAX(cur_line->line_max_x64, max_x64);
+        } else {
+            // Cache miss — full per-glyph load+measure, then populate cache.
+            int line_min_y64_new = 32000, line_max_y64_new = -32000;
+            int line_min_x64_new = 32000, line_max_x64_new = -32000;
+            int line_tab_idx = cur_line->first_tab_idx;
+            int tab_end_idx  = cur_line->first_tab_idx + cur_line->line_tab_count;
+            w64 = 0;
+            cur_min_y64 = 32000;
+
+            for (unsigned int t = 0; t < hb->glyph_count; ++t) {
+                uint8_t is_tab = line_tab_idx < tab_end_idx &&
+                    hb->glyph_info[t].cluster ==
+                        s->tab_clusters[line_tab_idx] - cur_line->cluster_offset;
+                if (is_tab)
+                    ++line_tab_idx;
+
+                ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, -1, -1);
+                if (ret != 0)
+                    goto done;
+
+                if (line_idx == 0 || first_max_y64 == -32000)
+                    first_max_y64 = FFMAX(glyph->bbox.yMax, first_max_y64);
+                if (t == 0) {
+                    cur_line->offset_left64 = glyph->bbox.xMin;
+                    if (line_idx == 0 || first_min_x64 == 32000)
+                        first_min_x64 = FFMIN(glyph->bbox.xMin, first_min_x64);
+                }
+                if (t == hb->glyph_count - 1) {
+                    int last_char_width = hb->glyph_pos[t].x_advance;
+                    w64 += last_char_width;
+                    last_max_x64 = FFMAX(last_char_width, last_max_x64);
+                    cur_line->offset_right64 = last_char_width;
+                } else if (is_tab) {
+                    int size = s->blank_advance64 * s->tabsize;
+                    w64 = (w64 / size + 1) * size;
+                } else {
+                    w64 += hb->glyph_pos[t].x_advance;
+                }
+
+                cur_min_y64      = FFMIN(glyph->bbox.yMin, cur_min_y64);
+                line_min_y64_new = FFMIN(glyph->bbox.yMin, line_min_y64_new);
+                line_max_y64_new = FFMAX(glyph->bbox.yMax, line_max_y64_new);
+                line_min_x64_new = FFMIN(glyph->bbox.xMin, line_min_x64_new);
+                line_max_x64_new = FFMAX(glyph->bbox.xMax, line_max_x64_new);
+                min_y64          = FFMIN(glyph->bbox.yMin, min_y64);
+                max_y64          = FFMAX(glyph->bbox.yMax, max_y64);
+                min_x64          = FFMIN(glyph->bbox.xMin, min_x64);
+                max_x64          = FFMAX(glyph->bbox.xMax, max_x64);
+            }
+
+            cur_line->width64          = w64;
+            cur_line->line_min_y64     = line_min_y64_new;
+            cur_line->line_max_y64     = line_max_y64_new;
+            cur_line->line_min_x64     = line_min_x64_new;
+            cur_line->line_max_x64     = line_max_x64_new;
+            cur_line->metrics_fontsize = s->fontsize;
+        }
 
         av_log(ctx, AV_LOG_DEBUG, "  Line: %d -- glyphs count: %d - width64: %d - offset_left64: %d - offset_right64: %d)\n",
             line_idx, hb->glyph_count, cur_line->width64, cur_line->offset_left64, cur_line->offset_right64);
@@ -1830,7 +1899,6 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     int height = frame->height;
     int rec_x = 0, rec_y = 0, rec_width = 0, rec_height = 0;
     int is_outside = 0;
-    int last_tab_idx = 0;
 
     TextMetrics metrics;
     int line_height64;
@@ -2095,20 +2163,30 @@ continue_count1:
 
         /* Skip lines that weren't shaped (viewport optimization) */
         if (!line->is_shaped) {
-            line->glyphs = NULL;
+            // Keep line->glyphs alive for potential reuse when line becomes visible.
             y += metrics.line_height64 + s->line_spacing * 64;
             continue;
         }
 
-        line->glyphs = av_mallocz(hb->glyph_count * sizeof(GlyphInfo));
+        // Issue 5: Reuse existing allocation when glyph count hasn't grown.
+        if (hb->glyph_count > (unsigned int)line->glyphs_alloc) {
+            av_freep(&line->glyphs);
+            line->glyphs = av_mallocz(hb->glyph_count * sizeof(GlyphInfo));
+            if (!line->glyphs)
+                return AVERROR(ENOMEM);
+            line->glyphs_alloc = hb->glyph_count;
+        }
 
-        for (int t = 0; t < hb->glyph_count; ++t) {
+        // Issue 7: Use pre-computed per-line tab range instead of global last_tab_idx.
+        int line_tab_idx = line->first_tab_idx;
+        int tab_end_idx  = line->first_tab_idx + line->line_tab_count;
+        for (int t = 0; t < (int)hb->glyph_count; ++t) {
             GlyphInfo *g_info = &line->glyphs[t];
-            uint8_t is_tab = last_tab_idx < s->tab_count &&
-                hb->glyph_info[t].cluster == s->tab_clusters[last_tab_idx] - line->cluster_offset;
+            uint8_t is_tab = line_tab_idx < tab_end_idx &&
+                hb->glyph_info[t].cluster == s->tab_clusters[line_tab_idx] - line->cluster_offset;
             int true_x, true_y;
             if (is_tab) {
-                ++last_tab_idx;
+                ++line_tab_idx;
             }
             true_x = x + hb->glyph_pos[t].x_offset;
             true_y = y + hb->glyph_pos[t].y_offset;
@@ -2210,12 +2288,9 @@ continue_count1:
         }
     }
 
-    // Free per-frame rendering data; keep line boundaries cached for next frame
-    for (int l = 0; l < s->line_count; ++l) {
-        TextLine *line = &s->lines[l];
-        av_freep(&line->glyphs);
-        hb_destroy(&line->hb_data);
-    }
+    // Issue 5: glyphs[] and hb_data.buf are kept alive across frames to avoid
+    // per-frame malloc/free churn. They are freed when text changes (rebuild
+    // path in draw_text) or at uninit time.
 
     return 0;
 }
