@@ -373,6 +373,7 @@ typedef struct DrawTextContext {
 
     // Disk-based glyph cache
     char *glyph_cache_dir;          ///< directory for persistent glyph cache (NULL = disabled)
+    char *font_path;                ///< resolved font file path (for cache keying)
     uint64_t font_hash;             ///< hash of fontfile content for cache keying
     int glyph_cache_initialized;    ///< 1 if font_hash computed and cache ready
 } DrawTextContext;
@@ -875,6 +876,11 @@ static int load_font_file(AVFilterContext *ctx, const char *path, int index)
 #endif
         return AVERROR(EINVAL);
     }
+
+    /* Save resolved font path for disk cache keying */
+    av_freep(&s->font_path);
+    s->font_path = av_strdup(path);
+
     return 0;
 }
 
@@ -1421,14 +1427,14 @@ static av_cold int init(AVFilterContext *ctx)
     /* Initialize disk-based glyph cache if enabled */
     if (!s->glyph_cache_dir) {
         av_log(ctx, AV_LOG_DEBUG, "Glyph disk cache disabled: glyph_cache option not set\n");
-    } else if (!s->fontfile) {
-        av_log(ctx, AV_LOG_DEBUG, "Glyph disk cache disabled: no fontfile path (using fontconfig?)\n");
+    } else if (!s->font_path) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph disk cache disabled: no font path resolved\n");
     } else {
         struct stat st;
-        s->font_hash = compute_file_hash((const char *)s->fontfile);
+        s->font_hash = compute_file_hash(s->font_path);
         if (s->font_hash == 0) {
             av_log(ctx, AV_LOG_WARNING, "Glyph disk cache disabled: could not hash font file '%s'\n",
-                   s->fontfile);
+                   s->font_path);
         } else {
             /* Create cache directory if it doesn't exist */
             if (stat(s->glyph_cache_dir, &st) == -1) {
@@ -1437,16 +1443,17 @@ static av_cold int init(AVFilterContext *ctx)
 #else
                 if (mkdir(s->glyph_cache_dir, 0755) == 0) {
 #endif
-                    av_log(ctx, AV_LOG_INFO, "Created glyph cache directory: %s\n", s->glyph_cache_dir);
                     s->glyph_cache_initialized = 1;
+                    av_log(ctx, AV_LOG_INFO, "Glyph disk cache enabled: %s (font: %s, hash: %016" PRIx64 ") [created]\n",
+                           s->glyph_cache_dir, s->font_path, s->font_hash);
                 } else {
                     av_log(ctx, AV_LOG_WARNING, "Glyph disk cache disabled: could not create directory '%s'\n",
                            s->glyph_cache_dir);
                 }
             } else if (S_ISDIR(st.st_mode)) {
                 s->glyph_cache_initialized = 1;
-                av_log(ctx, AV_LOG_INFO, "Glyph disk cache enabled: %s (font hash: %016" PRIx64 ")\n",
-                       s->glyph_cache_dir, s->font_hash);
+                av_log(ctx, AV_LOG_INFO, "Glyph disk cache enabled: %s (font: %s, hash: %016" PRIx64 ")\n",
+                       s->glyph_cache_dir, s->font_path, s->font_hash);
             } else {
                 av_log(ctx, AV_LOG_WARNING, "Glyph disk cache disabled: '%s' exists but is not a directory\n",
                        s->glyph_cache_dir);
@@ -1557,6 +1564,8 @@ static av_cold void uninit(AVFilterContext *ctx)
     FT_Done_Face(s->face);
     FT_Stroker_Done(s->stroker);
     FT_Done_FreeType(s->library);
+
+    av_freep(&s->font_path);
 
     av_bprint_finalize(&s->expanded_text, NULL);
     av_bprint_finalize(&s->expanded_fontcolor, NULL);
