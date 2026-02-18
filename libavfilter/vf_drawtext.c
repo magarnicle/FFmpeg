@@ -336,12 +336,10 @@ typedef struct DrawTextContext {
     int canvas_tile_reload;         ///< reload text file for each tile
     time_t canvas_tile_reload_mtime; ///< cached mtime for tile reload
 
-    // Caching for static text optimization
-    char *cached_text;              ///< cached copy of last rendered text
-    TextMetrics cached_metrics;     ///< cached text metrics
-    TextLine *cached_lines;         ///< cached shaped lines
-    int cached_line_count;          ///< cached line count
-    int text_changed;               ///< flag indicating text changed since last frame
+    // Version counter for line-boundary cache invalidation
+    int text_version;               ///< incremented whenever s->text is loaded or reloaded
+    int lines_text_version;         ///< text_version when lines array was last built
+    unsigned int lines_expanded_len;///< expanded_text.len when lines array was last built
 
     TextLine *lines;                ///< computed information about text lines
     int line_count;                 ///< the number of text lines
@@ -525,6 +523,8 @@ static void glyph_hash_free_borders(GlyphHash *hash)
         }
     }
 }
+
+static void hb_destroy(HarfbuzzData *hb);
 
 static int glyph_cmp(const void *key, const void *b)
 {
@@ -1080,6 +1080,7 @@ static av_cold int init(AVFilterContext *ctx)
         }
         if ((err = ff_load_textfile(ctx, (const char *)s->textfile, &s->text, NULL)) < 0)
             return err;
+        s->text_version = 1;
     }
 
     if (s->reload && !s->textfile)
@@ -1230,13 +1231,14 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     glyph_hash_free(&s->glyph_hash);
 
-    av_freep(&s->cached_text);
-    if (s->cached_lines) {
-        for (int l = 0; l < s->cached_line_count; l++) {
-            av_freep(&s->cached_lines[l].glyphs);
+    if (s->lines) {
+        for (int l = 0; l < s->line_count; l++) {
+            av_freep(&s->lines[l].glyphs);
+            hb_destroy(&s->lines[l].hb_data);
         }
-        av_freep(&s->cached_lines);
+        av_freep(&s->lines);
     }
+    av_freep(&s->tab_clusters);
 
     FT_Done_Face(s->face);
     FT_Stroker_Done(s->stroker);
@@ -1891,49 +1893,71 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     /* Phase 1: Count lines without shaping (fast) */
     line_height64 = s->face->size->metrics.height;
 
-    /* First pass: just count lines and tabs */
-    {
-        const char *text = s->expanded_text.str;
-        const uint8_t *p = (const uint8_t *)text;
-        uint32_t code;
-        int line_count = 0;
-        int tab_count = 0;
+    /* Cache line boundaries across frames: only rebuild when text actually changed.
+     * text_version tracks explicit reloads; lines_expanded_len catches EXP_NORMAL
+     * content changes (e.g. %{pts} producing different-length output). */
+    if (s->lines == NULL ||
+        s->lines_text_version != s->text_version ||
+        s->lines_expanded_len != s->expanded_text.len) {
 
-        for (;;) {
-            GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; goto continue_count1;);
-continue_count1:
-            if (ff_is_newline(code) || code == 0) {
-                ++line_count;
-                if (code == 0) break;
-            } else if (code == '\t') {
-                ++tab_count;
+        /* Free stale line data before rebuilding */
+        if (s->lines) {
+            for (int l = 0; l < s->line_count; l++) {
+                av_freep(&s->lines[l].glyphs);
+                hb_destroy(&s->lines[l].hb_data);
             }
+            av_freep(&s->lines);
+        }
+        av_freep(&s->tab_clusters);
+
+        /* First pass: just count lines and tabs */
+        {
+            const char *text = s->expanded_text.str;
+            const uint8_t *p = (const uint8_t *)text;
+            uint32_t code;
+            int line_count = 0;
+            int tab_count = 0;
+
+            for (;;) {
+                GET_UTF8(code, *p ? *p++ : 0, code = 0xfffd; goto continue_count1;);
+continue_count1:
+                if (ff_is_newline(code) || code == 0) {
+                    ++line_count;
+                    if (code == 0) break;
+                } else if (code == '\t') {
+                    ++tab_count;
+                }
+            }
+
+            s->line_count = line_count;
+            s->tab_count = tab_count;
         }
 
-        s->line_count = line_count;
-        s->tab_count = tab_count;
-    }
+        /* Allocate lines and tab_clusters arrays */
+        s->lines = av_mallocz(s->line_count * sizeof(TextLine));
+        if (!s->lines)
+            return AVERROR(ENOMEM);
 
-    /* Allocate lines and tab_clusters arrays */
-    s->lines = av_mallocz(s->line_count * sizeof(TextLine));
-    if (!s->lines)
-        return AVERROR(ENOMEM);
+        s->tab_clusters = av_mallocz(FFMAX(s->tab_count, 1) * sizeof(uint32_t));
+        if (!s->tab_clusters) {
+            av_freep(&s->lines);
+            return AVERROR(ENOMEM);
+        }
 
-    s->tab_clusters = av_mallocz(FFMAX(s->tab_count, 1) * sizeof(uint32_t));
-    if (!s->tab_clusters) {
-        av_freep(&s->lines);
-        return AVERROR(ENOMEM);
-    }
+        /* Second pass: record line boundaries and tab positions */
+        ret = count_text_lines(ctx, s->expanded_text.str, s->lines, s->line_count,
+                               &s->line_count, &s->tab_count,
+                               s->tab_clusters, s->tab_count);
+        if (ret < 0) {
+            av_freep(&s->lines);
+            av_freep(&s->tab_clusters);
+            return ret;
+        }
 
-    /* Second pass: record line boundaries and tab positions */
-    ret = count_text_lines(ctx, s->expanded_text.str, s->lines, s->line_count,
-                           &s->line_count, &s->tab_count,
-                           s->tab_clusters, s->tab_count);
-    if (ret < 0) {
-        av_freep(&s->lines);
-        av_freep(&s->tab_clusters);
-        return ret;
+        s->lines_text_version = s->text_version;
+        s->lines_expanded_len = s->expanded_text.len;
     }
+    /* else: text unchanged, reuse cached line boundaries */
 
     /* Calculate preliminary text height based on line count and font metrics */
     preliminary_height = POS_CEIL(line_height64 * s->line_count, 64);
@@ -2192,14 +2216,12 @@ continue_count1:
         }
     }
 
-    // FREE data structures
+    // Free per-frame rendering data; keep line boundaries cached for next frame
     for (int l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
         av_freep(&line->glyphs);
         hb_destroy(&line->hb_data);
     }
-    av_freep(&s->lines);
-    av_freep(&s->tab_clusters);
 
     return 0;
 }
@@ -2232,6 +2254,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             av_frame_free(&frame);
             return ret;
         }
+        s->text_version++;
 #if CONFIG_LIBFRIBIDI
         if (s->text_shaping)
             if ((ret = shape_text(ctx)) < 0) {
@@ -2260,6 +2283,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             }
             s->x = bbox->x;
             s->y = bbox->y - s->fontsize;
+            s->text_version++;
         }
 
         // Reload text file when canvas_tile_reload is enabled and file has changed
@@ -2272,6 +2296,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                     av_frame_free(&frame);
                     return ret;
                 }
+                s->text_version++;
 #if CONFIG_LIBFRIBIDI
                 if (s->text_shaping)
                     if ((ret = shape_text(ctx)) < 0) {
