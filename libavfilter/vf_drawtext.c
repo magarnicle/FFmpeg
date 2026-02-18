@@ -35,6 +35,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdio.h>
+#include <inttypes.h>
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -220,6 +222,10 @@ typedef struct Glyph {
     FT_BitmapGlyph bglyph[16];
     /** Outlined glyph bitmaps with 1/4 pixel precision in both directions */
     FT_BitmapGlyph border_bglyph[16];
+    /** Bitmask: bit i set if bglyph[i] was loaded from disk cache (needs av_free) */
+    uint16_t bglyph_from_cache;
+    /** Bitmask: bit i set if border_bglyph[i] was loaded from disk cache */
+    uint16_t border_bglyph_from_cache;
     FT_BBox bbox;
     struct Glyph *next;             ///< next glyph in hash bucket
 } Glyph;
@@ -364,6 +370,11 @@ typedef struct DrawTextContext {
     // lines that leave the viewport (not all 30k+ lines) each frame.
     int prev_first_visible_line;    ///< first_visible_line from previous frame (-1 = none)
     int prev_last_visible_line;     ///< last_visible_line from previous frame  (-1 = none)
+
+    // Disk-based glyph cache
+    char *glyph_cache_dir;          ///< directory for persistent glyph cache (NULL = disabled)
+    uint64_t font_hash;             ///< hash of fontfile content for cache keying
+    int glyph_cache_initialized;    ///< 1 if font_hash computed and cache ready
 } DrawTextContext;
 
 #define OFFSET(x) offsetof(DrawTextContext, x)
@@ -434,6 +445,7 @@ static const AVOption drawtext_options[]= {
     {"fix_bounds",      "check and fix text coords to avoid clipping", OFFSET(fix_bounds), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
     {"start_number",    "start frame number for n/frame_num variable", OFFSET(start_number), AV_OPT_TYPE_INT, {.i64=0}, 0, INT_MAX, FLAGS},
     {"text_source",     "the source of text", OFFSET(text_source_string), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, FLAGS },
+    {"glyph_cache",     "directory for persistent glyph cache", OFFSET(glyph_cache_dir), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
 
 #if CONFIG_LIBFRIBIDI
     {"text_shaping", "attempt to shape text before drawing", OFFSET(text_shaping), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS},
@@ -499,6 +511,19 @@ static void glyph_hash_insert(GlyphHash *hash, Glyph *glyph)
     hash->buckets[idx] = glyph;
 }
 
+/* Free a bitmap glyph, handling both FreeType-allocated and disk-cached */
+static void free_bitmap_glyph(FT_BitmapGlyph bglyph, int from_cache)
+{
+    if (!bglyph)
+        return;
+    if (from_cache) {
+        av_free(bglyph->bitmap.buffer);
+        av_free(bglyph);
+    } else {
+        FT_Done_Glyph((FT_Glyph)bglyph);
+    }
+}
+
 static void glyph_hash_free(GlyphHash *hash)
 {
     for (int i = 0; i < GLYPH_HASH_SIZE; i++) {
@@ -509,10 +534,8 @@ static void glyph_hash_free(GlyphHash *hash)
             if (g->border_glyph)
                 FT_Done_Glyph(g->border_glyph);
             for (int t = 0; t < 16; t++) {
-                if (g->bglyph[t])
-                    FT_Done_Glyph((FT_Glyph)g->bglyph[t]);
-                if (g->border_bglyph[t])
-                    FT_Done_Glyph((FT_Glyph)g->border_bglyph[t]);
+                free_bitmap_glyph(g->bglyph[t], (g->bglyph_from_cache >> t) & 1);
+                free_bitmap_glyph(g->border_bglyph[t], (g->border_bglyph_from_cache >> t) & 1);
             }
             av_free(g);
             g = next;
@@ -529,15 +552,228 @@ static void glyph_hash_free_borders(GlyphHash *hash)
             if (g->border_glyph) {
                 for (int t = 0; t < 16; t++) {
                     if (g->border_bglyph[t]) {
-                        FT_Done_Glyph((FT_Glyph)g->border_bglyph[t]);
+                        free_bitmap_glyph(g->border_bglyph[t], (g->border_bglyph_from_cache >> t) & 1);
                         g->border_bglyph[t] = NULL;
                     }
                 }
+                g->border_bglyph_from_cache = 0;
                 FT_Done_Glyph(g->border_glyph);
                 g->border_glyph = NULL;
             }
             g = g->next;
         }
+    }
+}
+
+/*
+ * Disk-based glyph cache functions
+ *
+ * Cache file format (version 1):
+ *   - 4 bytes: magic "GCCH"
+ *   - 4 bytes: version (1)
+ *   - 4 bytes: bitmap width
+ *   - 4 bytes: bitmap rows (height)
+ *   - 4 bytes: bitmap pitch
+ *   - 4 bytes: left offset (signed)
+ *   - 4 bytes: top offset (signed)
+ *   - N bytes: bitmap data (rows * pitch)
+ */
+
+#define GLYPH_CACHE_MAGIC 0x48434347  /* "GCCH" */
+#define GLYPH_CACHE_VERSION 1
+
+/* Compute a 64-bit FNV-1a hash of a file's contents */
+static uint64_t compute_file_hash(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    uint64_t hash = 0xcbf29ce484222325ULL;  /* FNV offset basis */
+    uint8_t buf[4096];
+    size_t n;
+
+    if (!f)
+        return 0;
+
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            hash ^= buf[i];
+            hash *= 0x100000001b3ULL;  /* FNV prime */
+        }
+    }
+    fclose(f);
+    return hash;
+}
+
+/* Build cache file path: <cache_dir>/<font_hash>_<code>_<fontsize>_<subpixel>_<borderw>.gcch */
+static int build_cache_path(char *buf, size_t bufsize, const char *cache_dir,
+                            uint64_t font_hash, uint32_t code, unsigned int fontsize,
+                            int subpixel_idx, int borderw, int is_border)
+{
+    int ret = snprintf(buf, bufsize, "%s/%016" PRIx64 "_%08x_%u_%d_%d_%d.gcch",
+                       cache_dir, font_hash, code, fontsize, subpixel_idx, borderw, is_border);
+    return (ret > 0 && (size_t)ret < bufsize) ? 0 : -1;
+}
+
+/* Write a bitmap glyph to disk cache */
+static int disk_cache_write(const char *path, FT_BitmapGlyph bglyph)
+{
+    FILE *f;
+    uint32_t header[7];
+    FT_Bitmap *bmp = &bglyph->bitmap;
+
+    f = fopen(path, "wb");
+    if (!f)
+        return -1;
+
+    header[0] = GLYPH_CACHE_MAGIC;
+    header[1] = GLYPH_CACHE_VERSION;
+    header[2] = bmp->width;
+    header[3] = bmp->rows;
+    header[4] = bmp->pitch;
+    header[5] = (uint32_t)bglyph->left;
+    header[6] = (uint32_t)bglyph->top;
+
+    if (fwrite(header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+
+    if (bmp->rows > 0 && bmp->pitch > 0) {
+        size_t data_size = (size_t)bmp->rows * (size_t)bmp->pitch;
+        if (fwrite(bmp->buffer, 1, data_size, f) != data_size) {
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/* Read a bitmap glyph from disk cache; returns a synthetic FT_BitmapGlyph or NULL */
+static FT_BitmapGlyph disk_cache_read(FT_Library library, const char *path)
+{
+    FILE *f;
+    uint32_t header[7];
+    FT_BitmapGlyph bglyph = NULL;
+    FT_Bitmap *bmp;
+    size_t data_size;
+    FT_Error err;
+
+    f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+
+    if (fread(header, sizeof(header), 1, f) != 1)
+        goto fail;
+
+    if (header[0] != GLYPH_CACHE_MAGIC || header[1] != GLYPH_CACHE_VERSION)
+        goto fail;
+
+    /* Allocate a FT_GlyphRec structure for a bitmap glyph */
+    bglyph = av_mallocz(sizeof(*bglyph));
+    if (!bglyph)
+        goto fail;
+
+    bglyph->root.library = library;
+    bglyph->root.format = FT_GLYPH_FORMAT_BITMAP;
+    bglyph->left = (FT_Int)header[5];
+    bglyph->top = (FT_Int)header[6];
+
+    bmp = &bglyph->bitmap;
+    bmp->width = header[2];
+    bmp->rows = header[3];
+    bmp->pitch = header[4];
+    bmp->pixel_mode = FT_PIXEL_MODE_GRAY;
+    bmp->num_grays = 256;
+
+    data_size = (size_t)bmp->rows * (size_t)bmp->pitch;
+    if (data_size > 0) {
+        /* Use FreeType's allocator for the bitmap buffer */
+        bmp->buffer = av_malloc(data_size);
+        if (!bmp->buffer)
+            goto fail;
+
+        if (fread(bmp->buffer, 1, data_size, f) != data_size)
+            goto fail;
+    } else {
+        bmp->buffer = NULL;
+    }
+
+    fclose(f);
+    return bglyph;
+
+fail:
+    if (bglyph) {
+        av_free(bmp->buffer);
+        av_free(bglyph);
+    }
+    fclose(f);
+    return NULL;
+}
+
+/* Try to load a cached bitmap glyph from disk */
+static FT_BitmapGlyph disk_cache_try_load(AVFilterContext *ctx, DrawTextContext *s,
+                                          uint32_t code, unsigned int fontsize,
+                                          int subpixel_idx, int is_border)
+{
+    char path[512];
+    FT_BitmapGlyph result;
+
+    if (!s->glyph_cache_dir) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: miss code=0x%x size=%u subpx=%d border=%d reason=disabled\n",
+               code, fontsize, subpixel_idx, is_border);
+        return NULL;
+    }
+
+    if (!s->glyph_cache_initialized) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: miss code=0x%x size=%u subpx=%d border=%d reason=not_initialized\n",
+               code, fontsize, subpixel_idx, is_border);
+        return NULL;
+    }
+
+    if (build_cache_path(path, sizeof(path), s->glyph_cache_dir, s->font_hash,
+                         code, fontsize, subpixel_idx, s->borderw, is_border) < 0) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: miss code=0x%x size=%u subpx=%d border=%d reason=path_too_long\n",
+               code, fontsize, subpixel_idx, is_border);
+        return NULL;
+    }
+
+    result = disk_cache_read(s->library, path);
+    if (result) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: hit code=0x%x size=%u subpx=%d border=%d\n",
+               code, fontsize, subpixel_idx, is_border);
+    } else {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: miss code=0x%x size=%u subpx=%d border=%d reason=file_not_found_or_invalid\n",
+               code, fontsize, subpixel_idx, is_border);
+    }
+    return result;
+}
+
+/* Save a rendered bitmap glyph to disk cache */
+static void disk_cache_save(AVFilterContext *ctx, DrawTextContext *s,
+                            uint32_t code, unsigned int fontsize,
+                            int subpixel_idx, int is_border, FT_BitmapGlyph bglyph)
+{
+    char path[512];
+    int ret;
+
+    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
+        return;
+
+    if (build_cache_path(path, sizeof(path), s->glyph_cache_dir, s->font_hash,
+                         code, fontsize, subpixel_idx, s->borderw, is_border) < 0) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: save failed code=0x%x size=%u subpx=%d border=%d reason=path_too_long\n",
+               code, fontsize, subpixel_idx, is_border);
+        return;
+    }
+
+    ret = disk_cache_write(path, bglyph);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: save failed code=0x%x size=%u subpx=%d border=%d reason=write_error\n",
+               code, fontsize, subpixel_idx, is_border);
+    } else {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph cache: saved code=0x%x size=%u subpx=%d border=%d\n",
+               code, fontsize, subpixel_idx, is_border);
     }
 }
 
@@ -903,25 +1139,47 @@ static int load_glyph(AVFilterContext *ctx, Glyph **glyph_ptr, uint32_t code, in
         shift.y = shift_y64;
 
         if (!glyph->bglyph[idx]) {
-            FT_Glyph tmp_glyph = glyph->glyph;
-            if (FT_Glyph_To_Bitmap(&tmp_glyph, FT_RENDER_MODE_NORMAL, &shift, 0)) {
-                ret = AVERROR_EXTERNAL;
-                goto error;
-            }
-            glyph->bglyph[idx] = (FT_BitmapGlyph)tmp_glyph;
-            if (glyph->bglyph[idx]->bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
-                av_log(ctx, AV_LOG_ERROR, "Monocromatic (1bpp) fonts are not supported.\n");
-                ret = AVERROR(EINVAL);
-                goto error;
+            /* Try disk cache first */
+            FT_BitmapGlyph cached = disk_cache_try_load(ctx, s, code, s->fontsize, idx, 0);
+            if (cached) {
+                glyph->bglyph[idx] = cached;
+                glyph->bglyph_from_cache |= (1 << idx);
+            } else {
+                FT_Glyph tmp_glyph = glyph->glyph;
+                av_log(ctx, AV_LOG_DEBUG, "Glyph cache: rendering code=0x%x size=%u subpx=%d border=0 via FreeType\n",
+                       code, s->fontsize, idx);
+                if (FT_Glyph_To_Bitmap(&tmp_glyph, FT_RENDER_MODE_NORMAL, &shift, 0)) {
+                    ret = AVERROR_EXTERNAL;
+                    goto error;
+                }
+                glyph->bglyph[idx] = (FT_BitmapGlyph)tmp_glyph;
+                if (glyph->bglyph[idx]->bitmap.pixel_mode == FT_PIXEL_MODE_MONO) {
+                    av_log(ctx, AV_LOG_ERROR, "Monocromatic (1bpp) fonts are not supported.\n");
+                    ret = AVERROR(EINVAL);
+                    goto error;
+                }
+                /* Save to disk cache */
+                disk_cache_save(ctx, s, code, s->fontsize, idx, 0, glyph->bglyph[idx]);
             }
         }
         if (s->borderw && !glyph->border_bglyph[idx]) {
-            FT_Glyph tmp_glyph = glyph->border_glyph;
-            if (FT_Glyph_To_Bitmap(&tmp_glyph, FT_RENDER_MODE_NORMAL, &shift, 0)) {
-                ret = AVERROR_EXTERNAL;
-                goto error;
+            /* Try disk cache first */
+            FT_BitmapGlyph cached = disk_cache_try_load(ctx, s, code, s->fontsize, idx, 1);
+            if (cached) {
+                glyph->border_bglyph[idx] = cached;
+                glyph->border_bglyph_from_cache |= (1 << idx);
+            } else {
+                FT_Glyph tmp_glyph = glyph->border_glyph;
+                av_log(ctx, AV_LOG_DEBUG, "Glyph cache: rendering code=0x%x size=%u subpx=%d border=1 via FreeType\n",
+                       code, s->fontsize, idx);
+                if (FT_Glyph_To_Bitmap(&tmp_glyph, FT_RENDER_MODE_NORMAL, &shift, 0)) {
+                    ret = AVERROR_EXTERNAL;
+                    goto error;
+                }
+                glyph->border_bglyph[idx] = (FT_BitmapGlyph)tmp_glyph;
+                /* Save to disk cache */
+                disk_cache_save(ctx, s, code, s->fontsize, idx, 1, glyph->border_bglyph[idx]);
             }
-            glyph->border_bglyph[idx] = (FT_BitmapGlyph)tmp_glyph;
         }
     }
     if (glyph_ptr) {
@@ -1160,6 +1418,42 @@ static av_cold int init(AVFilterContext *ctx)
     if ((err = load_font(ctx)) < 0)
         return err;
 
+    /* Initialize disk-based glyph cache if enabled */
+    if (!s->glyph_cache_dir) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph disk cache disabled: glyph_cache option not set\n");
+    } else if (!s->fontfile) {
+        av_log(ctx, AV_LOG_DEBUG, "Glyph disk cache disabled: no fontfile path (using fontconfig?)\n");
+    } else {
+        struct stat st;
+        s->font_hash = compute_file_hash((const char *)s->fontfile);
+        if (s->font_hash == 0) {
+            av_log(ctx, AV_LOG_WARNING, "Glyph disk cache disabled: could not hash font file '%s'\n",
+                   s->fontfile);
+        } else {
+            /* Create cache directory if it doesn't exist */
+            if (stat(s->glyph_cache_dir, &st) == -1) {
+#ifdef _WIN32
+                if (mkdir(s->glyph_cache_dir) == 0) {
+#else
+                if (mkdir(s->glyph_cache_dir, 0755) == 0) {
+#endif
+                    av_log(ctx, AV_LOG_INFO, "Created glyph cache directory: %s\n", s->glyph_cache_dir);
+                    s->glyph_cache_initialized = 1;
+                } else {
+                    av_log(ctx, AV_LOG_WARNING, "Glyph disk cache disabled: could not create directory '%s'\n",
+                           s->glyph_cache_dir);
+                }
+            } else if (S_ISDIR(st.st_mode)) {
+                s->glyph_cache_initialized = 1;
+                av_log(ctx, AV_LOG_INFO, "Glyph disk cache enabled: %s (font hash: %016" PRIx64 ")\n",
+                       s->glyph_cache_dir, s->font_hash);
+            } else {
+                av_log(ctx, AV_LOG_WARNING, "Glyph disk cache disabled: '%s' exists but is not a directory\n",
+                       s->glyph_cache_dir);
+            }
+        }
+    }
+
     s->hb_font = hb_ft_font_create_referenced(s->face);
     if (!s->hb_font)
         return AVERROR(ENOMEM);
@@ -1206,10 +1500,11 @@ static int glyph_enu_border_free(void *opaque, void *elem)
     if (glyph->border_glyph != NULL) {
         for (int t = 0; t < 16; ++t) {
             if (glyph->border_bglyph[t] != NULL) {
-                FT_Done_Glyph((FT_Glyph)glyph->border_bglyph[t]);
+                free_bitmap_glyph(glyph->border_bglyph[t], (glyph->border_bglyph_from_cache >> t) & 1);
                 glyph->border_bglyph[t] = NULL;
             }
         }
+        glyph->border_bglyph_from_cache = 0;
         FT_Done_Glyph(glyph->border_glyph);
         glyph->border_glyph = NULL;
     }
@@ -1223,12 +1518,8 @@ static int glyph_enu_free(void *opaque, void *elem)
     FT_Done_Glyph(glyph->glyph);
     FT_Done_Glyph(glyph->border_glyph);
     for (int t = 0; t < 16; ++t) {
-        if (glyph->bglyph[t] != NULL) {
-            FT_Done_Glyph((FT_Glyph)glyph->bglyph[t]);
-        }
-        if (glyph->border_bglyph[t] != NULL) {
-            FT_Done_Glyph((FT_Glyph)glyph->border_bglyph[t]);
-        }
+        free_bitmap_glyph(glyph->bglyph[t], (glyph->bglyph_from_cache >> t) & 1);
+        free_bitmap_glyph(glyph->border_bglyph[t], (glyph->border_bglyph_from_cache >> t) & 1);
     }
     av_free(elem);
     return 0;
