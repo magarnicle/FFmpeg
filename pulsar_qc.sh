@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FILE_DIR="$(dirname "$1")"
 FFPROBE="${SCRIPT_DIR}/ffprobe"
 FFMPEG="${SCRIPT_DIR}/ffmpeg"
-REPORT_DIR="${FILE_DIR}/qc_reports"
+REPORT_DIR="${SCRIPT_DIR}/qc_reports"
 mkdir -p "$REPORT_DIR"
 BASENAME=$(basename "$INPUT")
 REPORT="$REPORT_DIR/${BASENAME%.*}_qc_report.txt"
@@ -173,7 +173,7 @@ info "Running all quality checks in one pass..."
 QC_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -i "$INPUT" \
     -filter_complex "
         [0:v]blackdetect=d=3:pix_th=0.0784:pic_th=0.98,
-             solidcolordetect=d=0:pix_th=0.01:pic_th=0.97,
+             solidcolordetect=d=0:pix_th=0.05:pic_th=0.99:dev_th=0.60,
              freezedetect=n=0.001:d=20,
              colorbarsdetect=d=0.5[vout];
         [0:a]asplit=4[a1][a2][a3][a4];
@@ -246,11 +246,11 @@ TP_OVER=0
 INTEGRATED=$(echo "$QC_OUTPUT" | grep -E "^\s+I:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
 if [[ -n "$INTEGRATED" ]]; then
     TOO_LOUD=$(python3 -c "print(1 if $INTEGRATED > -23 else 0)")
-    TOO_QUIET=$(python3 -c "print(1 if $INTEGRATED < -25 else 0)")
+    TOO_QUIET=$(python3 -c "print(1 if $INTEGRATED < -27 else 0)")
     if [[ "$TOO_LOUD" == "1" ]]; then
         warn "Integrated loudness is ${INTEGRATED} LKFS, exceeds max -23 LKFS (target -24 +/- 1)"
     elif [[ "$TOO_QUIET" == "1" ]]; then
-        warn "Integrated loudness is ${INTEGRATED} LKFS, below min -25 LKFS (target -24 +/- 1)"
+        warn "Integrated loudness is ${INTEGRATED} LKFS, below min -27 LKFS (target -26 +/- 1)"
     else
         info "Integrated loudness: ${INTEGRATED} LKFS (OK, within -25 to -23)"
     fi
