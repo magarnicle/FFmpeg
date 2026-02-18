@@ -169,7 +169,6 @@ enum text_alignment {
 
 typedef struct HarfbuzzData {
     hb_buffer_t* buf;
-    hb_font_t* font;
     unsigned int glyph_count;
     hb_glyph_info_t* glyph_info;
     hb_glyph_position_t* glyph_pos;
@@ -347,6 +346,7 @@ typedef struct DrawTextContext {
     int tab_count;                  ///< the number of tab characters
     int blank_advance64;            ///< the size of the space character
     int tab_warning_printed;        ///< ensure the tab warning to be printed only once
+    hb_font_t *hb_font;             ///< shared HarfBuzz font (owned by context, not per-line)
 } DrawTextContext;
 
 #define OFFSET(x) offsetof(DrawTextContext, x)
@@ -548,11 +548,9 @@ static av_cold int set_fontsize(AVFilterContext *ctx, unsigned int fontsize)
         return AVERROR(EINVAL);
     }
 
-    // Whenever the underlying FT_Face changes, harfbuzz has to be notified of the change.
-    for (int line = 0; line < s->line_count; line++) {
-        TextLine *cur_line = &s->lines[line];
-        hb_ft_font_changed(cur_line->hb_data.font);
-    }
+    // Whenever the underlying FT_Face changes, HarfBuzz has to be notified.
+    if (s->hb_font)
+        hb_ft_font_changed(s->hb_font);
 
     s->fontsize = fontsize;
 
@@ -1143,6 +1141,10 @@ static av_cold int init(AVFilterContext *ctx)
     if ((err = load_font(ctx)) < 0)
         return err;
 
+    s->hb_font = hb_ft_font_create_referenced(s->face);
+    if (!s->hb_font)
+        return AVERROR(ENOMEM);
+
     if ((err = update_fontsize(ctx)) < 0)
         return err;
 
@@ -1240,6 +1242,8 @@ static av_cold void uninit(AVFilterContext *ctx)
     }
     av_freep(&s->tab_clusters);
 
+    hb_font_destroy(s->hb_font);
+    s->hb_font = NULL;
     FT_Done_Face(s->face);
     FT_Stroker_Done(s->stroker);
     FT_Done_FreeType(s->library);
@@ -1540,12 +1544,8 @@ static int shape_text_hb(DrawTextContext *s, HarfbuzzData* hb, const char* text,
     hb_buffer_set_script(hb->buf, HB_SCRIPT_LATIN);
     hb_buffer_set_language(hb->buf, hb_language_from_string("en", -1));
     hb_buffer_guess_segment_properties(hb->buf);
-    hb->font = hb_ft_font_create_referenced(s->face);
-    if(hb->font == NULL) {
-        return AVERROR(ENOMEM);
-    }
     hb_buffer_add_utf8(hb->buf, text, textLen, 0, -1);
-    hb_shape(hb->font, hb->buf, NULL, 0);
+    hb_shape(s->hb_font, hb->buf, NULL, 0);
     hb->glyph_info = hb_buffer_get_glyph_infos(hb->buf, &hb->glyph_count);
     hb->glyph_pos = hb_buffer_get_glyph_positions(hb->buf, &hb->glyph_count);
 
@@ -1554,10 +1554,8 @@ static int shape_text_hb(DrawTextContext *s, HarfbuzzData* hb, const char* text,
 
 static void hb_destroy(HarfbuzzData *hb)
 {
-    hb_font_destroy(hb->font);
     hb_buffer_destroy(hb->buf);
     hb->buf = NULL;
-    hb->font = NULL;
     hb->glyph_info = NULL;
     hb->glyph_pos = NULL;
 }
@@ -1676,7 +1674,6 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
             cur_line->is_shaped = 0;
             cur_line->hb_data.glyph_count = 0;
             cur_line->hb_data.buf = NULL;
-            cur_line->hb_data.font = NULL;
             cur_line->width64 = 0;
             // Skip tabs in this line for proper tab index tracking
             for (int t = last_tab_idx; t < s->tab_count; ++t) {
@@ -1704,6 +1701,7 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         line_buf[cur_line->text_len] = '\0';
 
         // Replace tabs with spaces in the line buffer
+        int first_line_tab_idx = last_tab_idx;
         for (int t = last_tab_idx; t < s->tab_count; ++t) {
             int tab_pos = s->tab_clusters[t] - cur_line->cluster_offset;
             if (tab_pos >= 0 && tab_pos < cur_line->text_len) {
@@ -1734,16 +1732,12 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
 
         w64 = 0;
         cur_min_y64 = 32000;
-        int line_tab_idx = 0;
+        int line_tab_idx = first_line_tab_idx;
         for (int t = 0; t < hb->glyph_count; ++t) {
-            uint8_t is_tab = 0;
-            // Check if this glyph is a tab
-            for (int ti = last_tab_idx - 1; ti >= 0 && s->tab_clusters[ti] >= cur_line->cluster_offset; --ti) {
-                if (hb->glyph_info[t].cluster == s->tab_clusters[ti] - cur_line->cluster_offset) {
-                    is_tab = 1;
-                    break;
-                }
-            }
+            uint8_t is_tab = line_tab_idx < last_tab_idx &&
+                hb->glyph_info[t].cluster == s->tab_clusters[line_tab_idx] - cur_line->cluster_offset;
+            if (is_tab)
+                ++line_tab_idx;
 
             ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, -1, -1);
             if (ret != 0) {
@@ -2276,10 +2270,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     for (int i = 0; i < loop; i++) {
         if (header) {
             bbox = av_get_detection_bbox(header, i);
-            strcpy(s->text, bbox->detect_label);
+            size_t text_buf_size = (size_t)(AV_DETECTION_BBOX_LABEL_NAME_MAX_SIZE + 1) *
+                                   (AV_NUM_DETECTION_BBOX_CLASSIFY + 1);
+            av_strlcpy(s->text, bbox->detect_label, text_buf_size);
             for (int j = 0; j < bbox->classify_count; j++) {
-                strcat(s->text, ", ");
-                strcat(s->text, bbox->classify_labels[j]);
+                av_strlcat(s->text, ", ", text_buf_size);
+                av_strlcat(s->text, bbox->classify_labels[j], text_buf_size);
             }
             s->x = bbox->x;
             s->y = bbox->y - s->fontsize;
