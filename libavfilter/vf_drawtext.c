@@ -174,6 +174,7 @@ typedef struct HarfbuzzData {
     unsigned int glyph_count;
     hb_glyph_info_t* glyph_info;
     hb_glyph_position_t* glyph_pos;
+    int owns_arrays;                ///< 1 if glyph_info/glyph_pos are owned (from cache), 0 if from hb_buffer
 } HarfbuzzData;
 
 /** Information about a single glyph in a text line */
@@ -583,6 +584,9 @@ static void glyph_hash_free_borders(GlyphHash *hash)
 #define GLYPH_CACHE_MAGIC 0x48434347  /* "GCCH" */
 #define GLYPH_CACHE_VERSION 1
 
+#define SHAPE_CACHE_MAGIC 0x48435348  /* "HSCH" - HarfBuzz Shape Cache */
+#define SHAPE_CACHE_VERSION 1
+
 /* Compute a 64-bit FNV-1a hash of a file's contents */
 static uint64_t compute_file_hash(const char *path)
 {
@@ -778,7 +782,160 @@ static void disk_cache_save(AVFilterContext *ctx, DrawTextContext *s,
     }
 }
 
+/* Compute a 64-bit FNV-1a hash of text content */
+static uint64_t compute_text_hash(const char *text, int len)
+{
+    uint64_t hash = 0xcbf29ce484222325ULL;  /* FNV offset basis */
+    for (int i = 0; i < len; i++) {
+        hash ^= (unsigned char)text[i];
+        hash *= 0x100000001b3ULL;  /* FNV prime */
+    }
+    return hash;
+}
+
+/* Build shaping cache file path: <cache_dir>/shape_<font_hash>_<text_hash>_<fontsize>.hbsc */
+static int build_shape_cache_path(char *buf, size_t bufsize, const char *cache_dir,
+                                  uint64_t font_hash, uint64_t text_hash, unsigned int fontsize)
+{
+    int ret = snprintf(buf, bufsize, "%s/shape_%016" PRIx64 "_%016" PRIx64 "_%u.hbsc",
+                       cache_dir, font_hash, text_hash, fontsize);
+    return (ret > 0 && (size_t)ret < bufsize) ? 0 : -1;
+}
+
+/**
+ * Cached shaping data - stored separately from HarfbuzzData since
+ * the hb_buffer_t pointers are not valid across runs.
+ */
+typedef struct ShapeCacheEntry {
+    uint32_t glyph_count;
+    uint32_t *codepoints;   /* glyph codepoints */
+    uint32_t *clusters;     /* cluster indices */
+    int32_t *x_advances;
+    int32_t *y_advances;
+    int32_t *x_offsets;
+    int32_t *y_offsets;
+} ShapeCacheEntry;
+
+static void shape_cache_entry_free(ShapeCacheEntry *entry)
+{
+    if (entry) {
+        av_freep(&entry->codepoints);
+        av_freep(&entry->clusters);
+        av_freep(&entry->x_advances);
+        av_freep(&entry->y_advances);
+        av_freep(&entry->x_offsets);
+        av_freep(&entry->y_offsets);
+        entry->glyph_count = 0;
+    }
+}
+
+/* Write shaping results to disk cache */
+static int shape_cache_write(const char *path, hb_glyph_info_t *info,
+                             hb_glyph_position_t *pos, unsigned int glyph_count)
+{
+    FILE *f;
+    uint32_t header[3];
+
+    f = fopen(path, "wb");
+    if (!f)
+        return -1;
+
+    header[0] = SHAPE_CACHE_MAGIC;
+    header[1] = SHAPE_CACHE_VERSION;
+    header[2] = glyph_count;
+
+    if (fwrite(header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+
+    /* Write glyph data: codepoint, cluster, x_advance, y_advance, x_offset, y_offset */
+    for (unsigned int i = 0; i < glyph_count; i++) {
+        uint32_t glyph_data[2];
+        int32_t pos_data[4];
+
+        glyph_data[0] = info[i].codepoint;
+        glyph_data[1] = info[i].cluster;
+        pos_data[0] = pos[i].x_advance;
+        pos_data[1] = pos[i].y_advance;
+        pos_data[2] = pos[i].x_offset;
+        pos_data[3] = pos[i].y_offset;
+
+        if (fwrite(glyph_data, sizeof(glyph_data), 1, f) != 1 ||
+            fwrite(pos_data, sizeof(pos_data), 1, f) != 1) {
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/* Read shaping results from disk cache; returns 0 on success, -1 on failure */
+static int shape_cache_read(const char *path, ShapeCacheEntry *entry)
+{
+    FILE *f;
+    uint32_t header[3];
+
+    memset(entry, 0, sizeof(*entry));
+
+    f = fopen(path, "rb");
+    if (!f)
+        return -1;
+
+    if (fread(header, sizeof(header), 1, f) != 1)
+        goto fail;
+
+    if (header[0] != SHAPE_CACHE_MAGIC || header[1] != SHAPE_CACHE_VERSION)
+        goto fail;
+
+    entry->glyph_count = header[2];
+    if (entry->glyph_count == 0) {
+        fclose(f);
+        return 0;
+    }
+
+    /* Allocate arrays */
+    entry->codepoints = av_malloc_array(entry->glyph_count, sizeof(*entry->codepoints));
+    entry->clusters = av_malloc_array(entry->glyph_count, sizeof(*entry->clusters));
+    entry->x_advances = av_malloc_array(entry->glyph_count, sizeof(*entry->x_advances));
+    entry->y_advances = av_malloc_array(entry->glyph_count, sizeof(*entry->y_advances));
+    entry->x_offsets = av_malloc_array(entry->glyph_count, sizeof(*entry->x_offsets));
+    entry->y_offsets = av_malloc_array(entry->glyph_count, sizeof(*entry->y_offsets));
+
+    if (!entry->codepoints || !entry->clusters || !entry->x_advances ||
+        !entry->y_advances || !entry->x_offsets || !entry->y_offsets)
+        goto fail;
+
+    /* Read glyph data */
+    for (unsigned int i = 0; i < entry->glyph_count; i++) {
+        uint32_t glyph_data[2];
+        int32_t pos_data[4];
+
+        if (fread(glyph_data, sizeof(glyph_data), 1, f) != 1 ||
+            fread(pos_data, sizeof(pos_data), 1, f) != 1)
+            goto fail;
+
+        entry->codepoints[i] = glyph_data[0];
+        entry->clusters[i] = glyph_data[1];
+        entry->x_advances[i] = pos_data[0];
+        entry->y_advances[i] = pos_data[1];
+        entry->x_offsets[i] = pos_data[2];
+        entry->y_offsets[i] = pos_data[3];
+    }
+
+    fclose(f);
+    return 0;
+
+fail:
+    shape_cache_entry_free(entry);
+    fclose(f);
+    return -1;
+}
+
 static void hb_destroy(HarfbuzzData *hb);
+static void harfbuzz_warmup(hb_font_t *hb_font);
 
 static int glyph_cmp(const void *key, const void *b)
 {
@@ -1468,6 +1625,9 @@ static av_cold int init(AVFilterContext *ctx)
     if ((err = update_fontsize(ctx)) < 0)
         return err;
 
+    /* Warm up HarfBuzz to parse OpenType tables upfront */
+    harfbuzz_warmup(s->hb_font);
+
     // Always init the stroker, may be needed if borderw is set via command
     if (FT_Stroker_New(s->library, &s->stroker)) {
         av_log(ctx, AV_LOG_ERROR, "Could not init FT stroker\n");
@@ -1860,9 +2020,118 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     return 0;
 }
 
-// Shapes a line of text using libharfbuzz
-static int shape_text_hb(DrawTextContext *s, HarfbuzzData* hb, const char* text, int textLen)
+/**
+ * Warm up HarfBuzz by shaping a representative string.
+ * This triggers parsing of OpenType tables (GSUB/GPOS) upfront,
+ * avoiding cold-start latency on the first real hb_shape() call.
+ */
+static void harfbuzz_warmup(hb_font_t *hb_font)
 {
+    hb_buffer_t *buf;
+    /* Representative ASCII string covering uppercase, lowercase, and digits
+     * to trigger common OpenType feature lookups (kerning, ligatures, etc.) */
+    static const char warmup_text[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    buf = hb_buffer_create();
+    if (!hb_buffer_allocation_successful(buf)) {
+        hb_buffer_destroy(buf);
+        return;
+    }
+
+    hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
+    hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
+    hb_buffer_set_language(buf, hb_language_from_string("en", -1));
+    hb_buffer_add_utf8(buf, warmup_text, sizeof(warmup_text) - 1, 0, -1);
+
+    /* This call parses GSUB/GPOS tables and caches them internally */
+    hb_shape(hb_font, buf, NULL, 0);
+
+    hb_buffer_destroy(buf);
+}
+
+/**
+ * Populate HarfbuzzData from a cached ShapeCacheEntry.
+ * Allocates owned arrays that will be freed by hb_destroy().
+ */
+static int hb_from_cache(HarfbuzzData *hb, const ShapeCacheEntry *entry)
+{
+    hb_glyph_info_t *info;
+    hb_glyph_position_t *pos;
+
+    /* Free any existing owned arrays */
+    if (hb->owns_arrays) {
+        av_freep(&hb->glyph_info);
+        av_freep(&hb->glyph_pos);
+    }
+
+    hb->glyph_count = entry->glyph_count;
+    if (entry->glyph_count == 0) {
+        hb->glyph_info = NULL;
+        hb->glyph_pos = NULL;
+        hb->owns_arrays = 0;
+        return 0;
+    }
+
+    info = av_malloc_array(entry->glyph_count, sizeof(*info));
+    pos = av_malloc_array(entry->glyph_count, sizeof(*pos));
+    if (!info || !pos) {
+        av_free(info);
+        av_free(pos);
+        return AVERROR(ENOMEM);
+    }
+
+    for (unsigned int i = 0; i < entry->glyph_count; i++) {
+        memset(&info[i], 0, sizeof(info[i]));
+        info[i].codepoint = entry->codepoints[i];
+        info[i].cluster = entry->clusters[i];
+
+        memset(&pos[i], 0, sizeof(pos[i]));
+        pos[i].x_advance = entry->x_advances[i];
+        pos[i].y_advance = entry->y_advances[i];
+        pos[i].x_offset = entry->x_offsets[i];
+        pos[i].y_offset = entry->y_offsets[i];
+    }
+
+    hb->glyph_info = info;
+    hb->glyph_pos = pos;
+    hb->owns_arrays = 1;
+    return 0;
+}
+
+// Shapes a line of text using libharfbuzz, with optional disk caching
+static int shape_text_hb(AVFilterContext *ctx, DrawTextContext *s, HarfbuzzData* hb,
+                         const char* text, int textLen)
+{
+    char cache_path[512];
+    uint64_t text_hash = 0;
+    int use_cache = s->glyph_cache_dir && s->glyph_cache_initialized;
+
+    /* Try to load from disk cache */
+    if (use_cache) {
+        ShapeCacheEntry entry;
+        text_hash = compute_text_hash(text, textLen);
+
+        if (build_shape_cache_path(cache_path, sizeof(cache_path), s->glyph_cache_dir,
+                                   s->font_hash, text_hash, s->fontsize) == 0) {
+            if (shape_cache_read(cache_path, &entry) == 0) {
+                int ret = hb_from_cache(hb, &entry);
+                shape_cache_entry_free(&entry);
+                if (ret == 0) {
+                    av_log(ctx, AV_LOG_DEBUG, "Shape cache: hit text_hash=%016" PRIx64 " size=%u glyphs=%u\n",
+                           text_hash, s->fontsize, hb->glyph_count);
+                    return 0;  /* Cache hit */
+                }
+            }
+        }
+    }
+
+    /* Cache miss or caching disabled - do normal shaping */
+    if (hb->owns_arrays) {
+        av_freep(&hb->glyph_info);
+        av_freep(&hb->glyph_pos);
+        hb->owns_arrays = 0;
+    }
+
     if (hb->buf) {
         hb_buffer_reset(hb->buf);
     } else {
@@ -1881,6 +2150,20 @@ static int shape_text_hb(DrawTextContext *s, HarfbuzzData* hb, const char* text,
     hb->glyph_info = hb_buffer_get_glyph_infos(hb->buf, &hb->glyph_count);
     hb->glyph_pos = hb_buffer_get_glyph_positions(hb->buf, &hb->glyph_count);
 
+    /* Save to disk cache */
+    if (use_cache && hb->glyph_count > 0) {
+        if (build_shape_cache_path(cache_path, sizeof(cache_path), s->glyph_cache_dir,
+                                   s->font_hash, text_hash, s->fontsize) == 0) {
+            if (shape_cache_write(cache_path, hb->glyph_info, hb->glyph_pos, hb->glyph_count) == 0) {
+                av_log(ctx, AV_LOG_DEBUG, "Shape cache: miss+saved text_hash=%016" PRIx64 " size=%u glyphs=%u\n",
+                       text_hash, s->fontsize, hb->glyph_count);
+            } else {
+                av_log(ctx, AV_LOG_DEBUG, "Shape cache: miss text_hash=%016" PRIx64 " size=%u glyphs=%u (save failed)\n",
+                       text_hash, s->fontsize, hb->glyph_count);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -1890,8 +2173,15 @@ static void hb_destroy(HarfbuzzData *hb)
         hb_buffer_destroy(hb->buf);
         hb->buf = NULL;
     }
-    hb->glyph_info = NULL;
-    hb->glyph_pos = NULL;
+    if (hb->owns_arrays) {
+        av_freep(&hb->glyph_info);
+        av_freep(&hb->glyph_pos);
+        hb->owns_arrays = 0;
+    } else {
+        hb->glyph_info = NULL;
+        hb->glyph_pos = NULL;
+    }
+    hb->glyph_count = 0;
 }
 
 /**
@@ -1995,7 +2285,7 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
     // Evaluate the width of the space character if needed to replace tabs
     if (s->tab_count > 0 && !s->blank_advance64) {
         HarfbuzzData hb_data = {0};
-        ret = shape_text_hb(s, &hb_data, " ", 1);
+        ret = shape_text_hb(ctx, s, &hb_data, " ", 1);
         if (ret != 0) {
             return ret;
         }
@@ -2097,7 +2387,7 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         }
 
         // Shape the line (reuses existing hb_data.buf via hb_buffer_reset — Issue 5)
-        ret = shape_text_hb(s, hb, line_buf, cur_line->text_len);
+        ret = shape_text_hb(ctx, s, hb, line_buf, cur_line->text_len);
         if (ret != 0) {
             goto done;
         }
