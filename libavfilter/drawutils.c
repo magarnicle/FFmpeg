@@ -23,12 +23,227 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/avutil.h"
+#include "libavutil/cpu.h"
 #include "libavutil/csp.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/pixdesc.h"
 #include "colorspace.h"
 #include "drawutils.h"
 #include "formats.h"
+
+#if ARCH_X86 && HAVE_AVX2_INLINE
+#include <immintrin.h>
+
+/*
+ * Blend one row of 16-bit luma pixels (hsub=0, vsub=0, pixelstep=2) using
+ * an 8-bit grayscale mask.  Formula per pixel:
+ *   out = ((0x10001 - a) * v + a * src) >> 16,  a = mask[xm+x] * alpha
+ * Safe for pixel depths < 16 bit (intermediates fit in uint32).
+ */
+/* Shared 4-pixel SSE4.1 blend kernel (128-bit): called from both luma and chroma. */
+#define BLEND4_SSE(dst4, src4, alpha4, v10001_4, v32, a32)             \
+    do {                                                                 \
+        __m128i _tau = _mm_sub_epi32(v10001_4, a32);                   \
+        __m128i _res = _mm_srli_epi32(                                  \
+                           _mm_add_epi32(_mm_mullo_epi32(_tau, v32),    \
+                                         _mm_mullo_epi32(a32, src4)),   \
+                           16);                                          \
+        _mm_storel_epi64((__m128i *)(dst4),                             \
+                         _mm_packus_epi32(_res, _res));                 \
+    } while (0)
+
+__attribute__((target("avx2")))
+static void blend_line16_luma_avx2(uint16_t *dst, unsigned src, unsigned alpha,
+                                    const uint8_t *mask, int xm, int w)
+{
+    const __m256i vsrc    = _mm256_set1_epi32(src);
+    const __m256i valpha  = _mm256_set1_epi32(alpha);
+    const __m256i v10001  = _mm256_set1_epi32(0x10001);
+    const __m128i vsrc4   = _mm_set1_epi32(src);
+    const __m128i valpha4 = _mm_set1_epi32(alpha);
+    const __m128i v10001_4= _mm_set1_epi32(0x10001);
+    int x = 0;
+
+    for (; x <= w - 8; x += 8) {
+        __m256i v32  = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(dst + x)));
+        __m256i m32  = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(mask + xm + x)));
+        __m256i a32  = _mm256_mullo_epi32(m32, valpha);
+        __m256i tau  = _mm256_sub_epi32(v10001, a32);
+        __m256i res  = _mm256_srli_epi32(
+                           _mm256_add_epi32(_mm256_mullo_epi32(tau, v32),
+                                            _mm256_mullo_epi32(a32, vsrc)),
+                           16);
+        __m128i out  = _mm_packus_epi32(_mm256_castsi256_si128(res),
+                                         _mm256_extracti128_si256(res, 1));
+        _mm_storeu_si128((__m128i *)(dst + x), out);
+    }
+    if (x <= w - 4) {
+        __m128i v32 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(dst + x)));
+        __m128i m32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int *)(mask + xm + x)));
+        __m128i a32 = _mm_mullo_epi32(m32, valpha4);
+        BLEND4_SSE(dst + x, vsrc4, valpha4, v10001_4, v32, a32);
+        x += 4;
+    }
+    for (; x < w; x++) {
+        unsigned a = mask[xm + x] * alpha;
+        unsigned v = dst[x];
+        dst[x] = ((0x10001 - a) * v + a * src) >> 16;
+    }
+}
+
+/*
+ * Blend one row of 16-bit 4:2:2 chroma pixels (hsub=1, vsub=0, pixelstep=2).
+ * Each chroma pixel averages two horizontally adjacent mask bytes.
+ */
+__attribute__((target("avx2")))
+static void blend_line16_chroma422_avx2(uint16_t *dst, unsigned src, unsigned alpha,
+                                         const uint8_t *mask, int xm, int w)
+{
+    const __m256i vsrc    = _mm256_set1_epi32(src);
+    const __m256i valpha  = _mm256_set1_epi32(alpha);
+    const __m256i v10001  = _mm256_set1_epi32(0x10001);
+    const __m128i vsrc4   = _mm_set1_epi32(src);
+    const __m128i valpha4 = _mm_set1_epi32(alpha);
+    const __m128i v10001_4= _mm_set1_epi32(0x10001);
+    const __m128i ones8   = _mm_set1_epi8(1);
+    int x = 0;
+
+    for (; x <= w - 8; x += 8) {
+        /* Sum adjacent mask byte pairs: _mm_maddubs_epi16 with coeff=1 */
+        __m128i m16b = _mm_loadu_si128((const __m128i *)(mask + xm + x * 2));
+        __m128i sums = _mm_maddubs_epi16(m16b, ones8);   /* 8 x uint16 sums */
+        __m256i s32  = _mm256_cvtepu16_epi32(sums);
+        /* a = (sum >> 1) * alpha */
+        __m256i a32  = _mm256_mullo_epi32(_mm256_srli_epi32(s32, 1), valpha);
+        __m256i v32  = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(dst + x)));
+        __m256i tau  = _mm256_sub_epi32(v10001, a32);
+        __m256i res  = _mm256_srli_epi32(
+                           _mm256_add_epi32(_mm256_mullo_epi32(tau, v32),
+                                            _mm256_mullo_epi32(a32, vsrc)),
+                           16);
+        __m128i out  = _mm_packus_epi32(_mm256_castsi256_si128(res),
+                                         _mm256_extracti128_si256(res, 1));
+        _mm_storeu_si128((__m128i *)(dst + x), out);
+    }
+    if (x <= w - 4) {
+        /* 4-pixel SSE4.1 path for chroma remainder */
+        __m128i m8b  = _mm_loadl_epi64((const __m128i *)(mask + xm + x * 2));
+        __m128i sums = _mm_maddubs_epi16(m8b, ones8);    /* 4 x uint16 sums (lo 64 bits) */
+        __m128i s32  = _mm_cvtepu16_epi32(sums);
+        __m128i a32  = _mm_mullo_epi32(_mm_srli_epi32(s32, 1), valpha4);
+        __m128i v32  = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(dst + x)));
+        BLEND4_SSE(dst + x, vsrc4, valpha4, v10001_4, v32, a32);
+        x += 4;
+    }
+    for (; x < w; x++) {
+        unsigned t = mask[xm + x*2] + mask[xm + x*2 + 1];
+        unsigned a = (t >> 1) * alpha;
+        unsigned v = dst[x];
+        dst[x] = ((0x10001 - a) * v + a * src) >> 16;
+    }
+}
+#if HAVE_AVX512_INLINE
+/*
+ * AVX-512 variants: 16 pixels per iteration.
+ * Requires avx512f (for _mm512_cvtepu8/16_epi32, _mm512_cvtusepi32_epi16)
+ * and avx512bw (for _mm256_maddubs_epi16 within the chroma path).
+ */
+__attribute__((target("avx512f,avx512bw")))
+static void blend_line16_luma_avx512(uint16_t *dst, unsigned src, unsigned alpha,
+                                      const uint8_t *mask, int xm, int w)
+{
+    const __m512i vsrc512   = _mm512_set1_epi32(src);
+    const __m512i valpha512 = _mm512_set1_epi32(alpha);
+    const __m512i v10001_512= _mm512_set1_epi32(0x10001);
+    const __m256i vsrc256   = _mm256_set1_epi32(src);
+    const __m256i valpha256 = _mm256_set1_epi32(alpha);
+    const __m256i v10001_256= _mm256_set1_epi32(0x10001);
+    int x = 0;
+
+    for (; x <= w - 16; x += 16) {
+        __m512i v32 = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(dst + x)));
+        __m512i m32 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(mask + xm + x)));
+        __m512i a32 = _mm512_mullo_epi32(m32, valpha512);
+        __m512i tau = _mm512_sub_epi32(v10001_512, a32);
+        __m512i res = _mm512_srli_epi32(
+                          _mm512_add_epi32(_mm512_mullo_epi32(tau, v32),
+                                           _mm512_mullo_epi32(a32, vsrc512)),
+                          16);
+        _mm256_storeu_si256((__m256i *)(dst + x), _mm512_cvtusepi32_epi16(res));
+    }
+    for (; x <= w - 8; x += 8) {
+        __m256i v32 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(dst + x)));
+        __m256i m32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(mask + xm + x)));
+        __m256i a32 = _mm256_mullo_epi32(m32, valpha256);
+        __m256i tau = _mm256_sub_epi32(v10001_256, a32);
+        __m256i res = _mm256_srli_epi32(
+                          _mm256_add_epi32(_mm256_mullo_epi32(tau, v32),
+                                           _mm256_mullo_epi32(a32, vsrc256)),
+                          16);
+        _mm_storeu_si128((__m128i *)(dst + x),
+                         _mm_packus_epi32(_mm256_castsi256_si128(res),
+                                          _mm256_extracti128_si256(res, 1)));
+    }
+    for (; x < w; x++) {
+        unsigned a = mask[xm + x] * alpha;
+        unsigned v = dst[x];
+        dst[x] = ((0x10001 - a) * v + a * src) >> 16;
+    }
+}
+
+__attribute__((target("avx512f,avx512bw")))
+static void blend_line16_chroma422_avx512(uint16_t *dst, unsigned src, unsigned alpha,
+                                           const uint8_t *mask, int xm, int w)
+{
+    const __m512i vsrc512    = _mm512_set1_epi32(src);
+    const __m512i valpha512  = _mm512_set1_epi32(alpha);
+    const __m512i v10001_512 = _mm512_set1_epi32(0x10001);
+    const __m256i vsrc256    = _mm256_set1_epi32(src);
+    const __m256i valpha256  = _mm256_set1_epi32(alpha);
+    const __m256i v10001_256 = _mm256_set1_epi32(0x10001);
+    const __m256i ones8_256  = _mm256_set1_epi8(1);
+    const __m128i ones8_128  = _mm_set1_epi8(1);
+    int x = 0;
+
+    for (; x <= w - 16; x += 16) {
+        /* Sum 32 adjacent mask byte pairs → 16 uint16 sums */
+        __m256i m32b = _mm256_loadu_si256((const __m256i *)(mask + xm + x * 2));
+        __m256i sums = _mm256_maddubs_epi16(m32b, ones8_256);  /* 16 x uint16 */
+        __m512i s32  = _mm512_cvtepu16_epi32(sums);
+        __m512i a32  = _mm512_mullo_epi32(_mm512_srli_epi32(s32, 1), valpha512);
+        __m512i v32  = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(dst + x)));
+        __m512i tau  = _mm512_sub_epi32(v10001_512, a32);
+        __m512i res  = _mm512_srli_epi32(
+                           _mm512_add_epi32(_mm512_mullo_epi32(tau, v32),
+                                            _mm512_mullo_epi32(a32, vsrc512)),
+                           16);
+        _mm256_storeu_si256((__m256i *)(dst + x), _mm512_cvtusepi32_epi16(res));
+    }
+    for (; x <= w - 8; x += 8) {
+        __m128i m16b = _mm_loadu_si128((const __m128i *)(mask + xm + x * 2));
+        __m128i sums = _mm_maddubs_epi16(m16b, ones8_128);
+        __m256i s32  = _mm256_cvtepu16_epi32(sums);
+        __m256i a32  = _mm256_mullo_epi32(_mm256_srli_epi32(s32, 1), valpha256);
+        __m256i v32  = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(dst + x)));
+        __m256i tau  = _mm256_sub_epi32(v10001_256, a32);
+        __m256i res  = _mm256_srli_epi32(
+                           _mm256_add_epi32(_mm256_mullo_epi32(tau, v32),
+                                            _mm256_mullo_epi32(a32, vsrc256)),
+                           16);
+        _mm_storeu_si128((__m128i *)(dst + x),
+                         _mm_packus_epi32(_mm256_castsi256_si128(res),
+                                          _mm256_extracti128_si256(res, 1)));
+    }
+    for (; x < w; x++) {
+        unsigned t = mask[xm + x*2] + mask[xm + x*2 + 1];
+        unsigned a = (t >> 1) * alpha;
+        unsigned v = dst[x];
+        dst[x] = ((0x10001 - a) * v + a * src) >> 16;
+    }
+}
+#endif /* HAVE_AVX512_INLINE */
+
+#endif /* ARCH_X86 && HAVE_AVX2_INLINE */
 
 enum { RED = 0, GREEN, BLUE, ALPHA };
 
@@ -626,14 +841,83 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                     m += mask_linesize << draw->vsub[plane];
                 }
             } else {
-                for (int y = 0; y < h_sub; y++) {
-                    blend_line_hv16(p, draw->pixelstep[plane],
-                                    color->comp[plane].u16[index], alpha,
-                                    m, mask_linesize, l2depth, w_sub,
-                                    draw->hsub[plane], draw->vsub[plane],
-                                    xm0, left, right, 1 << draw->vsub[plane]);
-                    p += dst_linesize[plane];
-                    m += mask_linesize << draw->vsub[plane];
+                int simd_used = 0;
+#if ARCH_X86 && HAVE_AVX2_INLINE
+                if (l2depth == 3 && depth < 16 &&
+                    draw->pixelstep[plane] == 2 &&
+                    draw->vsub[plane] == 0) {
+                    unsigned cpu = av_get_cpu_flags();
+#if HAVE_AVX512_INLINE
+#define BLEND16_LINE_LUMA(fn)                                               \
+    do {                                                                     \
+        for (int y = 0; y < h_sub; y++) {                                   \
+            fn((uint16_t *)p, src16, alpha, m, xm0, w_sub);                 \
+            p += dst_linesize[plane];                                        \
+            m += mask_linesize;                                              \
+        }                                                                    \
+    } while (0)
+#define BLEND16_LINE_CHROMA(fn)                                              \
+    do {                                                                     \
+        for (int y = 0; y < h_sub; y++) {                                   \
+            uint16_t *dstp = (uint16_t *)p;                                  \
+            const uint8_t *mp = m;                                           \
+            int xm = xm0;                                                    \
+            if (left) {                                                      \
+                unsigned a = (mp[xm] * alpha) >> 1;                         \
+                unsigned v = dstp[0];                                        \
+                dstp[0] = ((0x10001 - a) * v + a * src16) >> 16;            \
+                dstp++; xm++;                                                \
+            }                                                                \
+            fn(dstp, src16, alpha, mp, xm, w_sub);                          \
+            if (right) {                                                     \
+                dstp += w_sub; xm += w_sub * 2;                             \
+                unsigned a = (mp[xm] * alpha) >> 1;                         \
+                unsigned v = dstp[0];                                        \
+                dstp[0] = ((0x10001 - a) * v + a * src16) >> 16;            \
+            }                                                                \
+            p += dst_linesize[plane];                                        \
+            m += mask_linesize;                                              \
+        }                                                                    \
+    } while (0)
+                    unsigned src16 = color->comp[plane].u16[index];
+                    if (cpu & AV_CPU_FLAG_AVX512) {
+                        simd_used = 1;
+                        if (draw->hsub[plane] == 0)
+                            BLEND16_LINE_LUMA(blend_line16_luma_avx512);
+                        else if (draw->hsub[plane] == 1)
+                            BLEND16_LINE_CHROMA(blend_line16_chroma422_avx512);
+                        else
+                            simd_used = 0;
+                    }
+                    if (!simd_used && (cpu & AV_CPU_FLAG_AVX2)) {
+#else
+                    unsigned src16 = color->comp[plane].u16[index];
+                    if (cpu & AV_CPU_FLAG_AVX2) {
+#endif
+                        if (draw->hsub[plane] == 0) {
+                            simd_used = 1;
+                            BLEND16_LINE_LUMA(blend_line16_luma_avx2);
+                        } else if (draw->hsub[plane] == 1) {
+                            simd_used = 1;
+                            BLEND16_LINE_CHROMA(blend_line16_chroma422_avx2);
+                        }
+                    }
+#if HAVE_AVX512_INLINE
+#undef BLEND16_LINE_LUMA
+#undef BLEND16_LINE_CHROMA
+#endif
+                }
+#endif /* ARCH_X86 && HAVE_AVX2_INLINE */
+                if (!simd_used) {
+                    for (int y = 0; y < h_sub; y++) {
+                        blend_line_hv16(p, draw->pixelstep[plane],
+                                        color->comp[plane].u16[index], alpha,
+                                        m, mask_linesize, l2depth, w_sub,
+                                        draw->hsub[plane], draw->vsub[plane],
+                                        xm0, left, right, 1 << draw->vsub[plane]);
+                        p += dst_linesize[plane];
+                        m += mask_linesize << draw->vsub[plane];
+                    }
                 }
             }
             if (bottom) {
