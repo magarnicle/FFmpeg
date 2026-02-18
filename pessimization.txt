@@ -6,7 +6,7 @@ opportunities, but things that any reasonable programmer would agree are
 avoidable overhead. Listed in rough order of impact.
 
 STATUS: Issues 1, 2, 3 have been fixed in this working tree.
-        Issues 5, 6, 7, 9 have been fixed in this working tree.
+        Issues 4, 5, 6, 7, 8, 9, 10, 11 have been fixed in this working tree.
 
 ---
 
@@ -74,7 +74,7 @@ Issue 3: strcpy/strcat without bounds in detection bbox path
 
 Issue 4: X expression evaluated twice unconditionally
   Location: draw_text(), ~line 2023 (original)
-  Status: not fixed
+  Status: FIXED
 
   After evaluating x and y expressions, x is evaluated a second time:
 
@@ -155,7 +155,7 @@ Issue 7: Tab range scanned for every non-visible line
 
 Issue 8: POS_CEIL(line->width64, 64) recomputed at multiple call sites
   Location: draw_glyphs(), draw_text(), ~lines 1469, 1794, 1796, 1963 (original)
-  Status: not fixed
+  Status: FIXED
 
   The integer pixel width of a line (POS_CEIL(line->width64, 64)) is computed
   multiple times for the same line at different call sites within the same
@@ -186,7 +186,7 @@ Issue 9: Per-glyph FFMIN/FFMAX for metrics that could be cached per line
 
 Issue 10: stat() syscall on every frame when canvas_tile_reload is set
   Location: filter_frame(), ~line 2292 (original)
-  Status: not fixed
+  Status: FIXED
 
   When the canvas_tile_reload option is enabled:
 
@@ -212,3 +212,4 @@ Issue 11: hb_destroy() calls hb_font_destroy/hb_buffer_destroy unconditionally
   to tolerate NULL, so this was not a crash, but it was a needless call.
   After fix #2 removed font from HarfbuzzData, this issue is moot for the
   font; the buffer path should still guard on NULL.
+  Status: FIXED (buf path now guards on NULL)

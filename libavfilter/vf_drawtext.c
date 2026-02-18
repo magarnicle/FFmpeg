@@ -190,6 +190,7 @@ typedef struct TextLine {
     int offset_right64;             ///< maximum offset between the origin and
                                     ///  the rightmost pixel of the last glyph
     int width64;                    ///< width of the line
+    int width_px;                   ///< pixel width of the line: POS_CEIL(width64, 64)
     HarfbuzzData hb_data;           ///< libharfbuzz data of this text line
     GlyphInfo* glyphs;              ///< array of glyphs in this text line
     int glyphs_alloc;               ///< allocated capacity of glyphs[] in GlyphInfo units
@@ -1481,7 +1482,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
             continue;
         }
 
-        line_w = POS_CEIL(line->width64, 64);
+        line_w = line->width_px;
         for (g = 0; g < line->hb_data.glyph_count; ++g) {
             info = &line->glyphs[g];
             glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
@@ -1570,8 +1571,10 @@ static int shape_text_hb(DrawTextContext *s, HarfbuzzData* hb, const char* text,
 
 static void hb_destroy(HarfbuzzData *hb)
 {
-    hb_buffer_destroy(hb->buf);
-    hb->buf = NULL;
+    if (hb->buf) {
+        hb_buffer_destroy(hb->buf);
+        hb->buf = NULL;
+    }
     hb->glyph_info = NULL;
     hb->glyph_pos = NULL;
 }
@@ -1698,7 +1701,8 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
             // Null stale interior pointers so they aren't accidentally dereferenced.
             cur_line->hb_data.glyph_info = NULL;
             cur_line->hb_data.glyph_pos  = NULL;
-            cur_line->width64 = 0;
+            cur_line->width64  = 0;
+            cur_line->width_px = 0;
             // Issue 7: O(1) skip — no need to scan tab_clusters for this line
             // because first_tab_idx/line_tab_count were pre-computed per line.
             continue;
@@ -1774,7 +1778,8 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
                     w64 += hb->glyph_pos[t].x_advance;
                 }
             }
-            cur_line->width64 = w64;
+            cur_line->width64  = w64;
+            cur_line->width_px = POS_CEIL(w64, 64);
 
             // Update global metrics from cached per-line values.
             cur_min_y64 = cur_line->line_min_y64;
@@ -1837,6 +1842,7 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
             }
 
             cur_line->width64          = w64;
+            cur_line->width_px         = POS_CEIL(w64, 64);
             cur_line->line_min_y64     = line_min_y64_new;
             cur_line->line_max_y64     = line_max_y64_new;
             cur_line->line_min_x64     = line_min_x64_new;
@@ -2080,9 +2086,11 @@ continue_count1:
         s->var_values[VAR_Y] = s->y;
     } else {
         s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, &s->prng);
+        double prev_y = s->var_values[VAR_Y];
         s->y = s->var_values[VAR_Y] = av_expr_eval(s->y_pexpr, s->var_values, &s->prng);
-        /* It is necessary if x is expressed from y  */
-        s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, &s->prng);
+        /* Re-evaluate x only if y changed, in case x is expressed from y */
+        if (s->var_values[VAR_Y] != prev_y)
+            s->x = s->var_values[VAR_X] = av_expr_eval(s->x_pexpr, s->var_values, &s->prng);
     }
 
     /* Re-evaluate canvas expressions with final metrics if needed */
@@ -2357,8 +2365,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             s->text_version++;
         }
 
-        // Reload text file when canvas_tile_reload is enabled and file has changed
-        if (s->canvas_tile_reload && s->textfile) {
+        // Reload text file when canvas_tile_reload is enabled and file has changed.
+        // Throttle stat() to once per 30 frames to avoid per-frame syscall overhead.
+        if (s->canvas_tile_reload && s->textfile && !(inl->frame_count_out % 30)) {
             struct stat file_stat;
             if (stat(s->textfile, &file_stat) == 0 &&
                 file_stat.st_mtime != s->canvas_tile_reload_mtime) {
