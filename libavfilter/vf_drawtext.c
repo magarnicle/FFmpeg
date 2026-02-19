@@ -590,6 +590,9 @@ static void glyph_hash_free_borders(GlyphHash *hash)
 #define SHAPE_CACHE_MAGIC 0x48435348  /* "HSCH" - HarfBuzz Shape Cache */
 #define SHAPE_CACHE_VERSION 1
 
+#define WORD_CACHE_MAGIC 0x44524F57  /* "WORD" */
+#define WORD_CACHE_VERSION 1
+
 /* Compute a 64-bit FNV-1a hash of a file's contents */
 static uint64_t compute_file_hash(const char *path)
 {
@@ -1185,8 +1188,317 @@ static int create_hb_font_mmap(AVFilterContext *ctx, DrawTextContext *s)
     return 0;
 }
 
+/**
+ * Cached rendered word bitmap.
+ * Contains the pre-composited grayscale bitmap for a word,
+ * allowing us to skip shaping and glyph rendering for repeated words.
+ */
+typedef struct WordBitmap {
+    uint8_t *buffer;        ///< grayscale bitmap data
+    int width;              ///< bitmap width in pixels
+    int height;             ///< bitmap height in pixels
+    int pitch;              ///< bytes per row
+    int left;               ///< left bearing (x offset from origin)
+    int top;                ///< top bearing (y offset from baseline)
+    int advance;            ///< horizontal advance to next word
+} WordBitmap;
+
+/**
+ * Compute a hash of the rendering style parameters.
+ * Used as part of the word cache key to ensure style changes invalidate cache.
+ */
+static uint64_t compute_style_hash(unsigned int fontsize, int borderw,
+                                   const uint8_t *fontcolor_rgba,
+                                   const uint8_t *bordercolor_rgba)
+{
+    uint64_t hash = 0xcbf29ce484222325ULL;  /* FNV offset basis */
+    uint8_t buf[16];
+
+    /* Pack style params into a buffer */
+    buf[0] = (fontsize >> 0) & 0xFF;
+    buf[1] = (fontsize >> 8) & 0xFF;
+    buf[2] = (fontsize >> 16) & 0xFF;
+    buf[3] = (fontsize >> 24) & 0xFF;
+    buf[4] = (borderw >> 0) & 0xFF;
+    buf[5] = (borderw >> 8) & 0xFF;
+    buf[6] = fontcolor_rgba[0];
+    buf[7] = fontcolor_rgba[1];
+    buf[8] = fontcolor_rgba[2];
+    buf[9] = fontcolor_rgba[3];
+    buf[10] = bordercolor_rgba[0];
+    buf[11] = bordercolor_rgba[1];
+    buf[12] = bordercolor_rgba[2];
+    buf[13] = bordercolor_rgba[3];
+    buf[14] = 0;
+    buf[15] = 0;
+
+    for (int i = 0; i < 16; i++) {
+        hash ^= buf[i];
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+/**
+ * Build word cache path: <cache_dir>/word_<font_hash>_<style_hash>_<text_hash>.wcch
+ */
+static int build_word_cache_path(char *buf, size_t bufsize, const char *cache_dir,
+                                 uint64_t font_hash, uint64_t style_hash, uint64_t text_hash)
+{
+    int ret = snprintf(buf, bufsize, "%s/word_%016" PRIx64 "_%016" PRIx64 "_%016" PRIx64 ".wcch",
+                       cache_dir, font_hash, style_hash, text_hash);
+    return (ret > 0 && (size_t)ret < bufsize) ? 0 : -1;
+}
+
+/**
+ * Write a rendered word bitmap to disk cache.
+ * Format: magic(4) | version(4) | width(4) | height(4) | pitch(4) | left(4) | top(4) | advance(4) | data
+ */
+static int word_cache_write(const char *path, const WordBitmap *word)
+{
+    FILE *f;
+    uint32_t header[8];
+    size_t data_size;
+
+    f = fopen(path, "wb");
+    if (!f)
+        return -1;
+
+    header[0] = WORD_CACHE_MAGIC;
+    header[1] = WORD_CACHE_VERSION;
+    header[2] = word->width;
+    header[3] = word->height;
+    header[4] = word->pitch;
+    header[5] = (uint32_t)word->left;
+    header[6] = (uint32_t)word->top;
+    header[7] = (uint32_t)word->advance;
+
+    if (fwrite(header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+
+    data_size = (size_t)word->height * (size_t)word->pitch;
+    if (data_size > 0 && word->buffer) {
+        if (fwrite(word->buffer, 1, data_size, f) != data_size) {
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/**
+ * Read a rendered word bitmap from disk cache.
+ * Returns 0 on success, -1 on failure.
+ */
+static int word_cache_read(const char *path, WordBitmap *word)
+{
+    FILE *f;
+    uint32_t header[8];
+    size_t data_size;
+
+    memset(word, 0, sizeof(*word));
+
+    f = fopen(path, "rb");
+    if (!f)
+        return -1;
+
+    if (fread(header, sizeof(header), 1, f) != 1)
+        goto fail;
+
+    if (header[0] != WORD_CACHE_MAGIC || header[1] != WORD_CACHE_VERSION)
+        goto fail;
+
+    word->width = header[2];
+    word->height = header[3];
+    word->pitch = header[4];
+    word->left = (int32_t)header[5];
+    word->top = (int32_t)header[6];
+    word->advance = (int32_t)header[7];
+
+    data_size = (size_t)word->height * (size_t)word->pitch;
+    if (data_size > 0) {
+        word->buffer = av_malloc(data_size);
+        if (!word->buffer)
+            goto fail;
+
+        if (fread(word->buffer, 1, data_size, f) != data_size)
+            goto fail;
+    }
+
+    fclose(f);
+    return 0;
+
+fail:
+    av_freep(&word->buffer);
+    memset(word, 0, sizeof(*word));
+    fclose(f);
+    return -1;
+}
+
+static void word_bitmap_free(WordBitmap *word)
+{
+    if (word) {
+        av_freep(&word->buffer);
+        memset(word, 0, sizeof(*word));
+    }
+}
+
+/**
+ * Try to load a cached word/line bitmap from disk.
+ * Returns 0 on success (cache hit), -1 on miss/failure.
+ */
+static int word_cache_try_load(AVFilterContext *ctx, DrawTextContext *s,
+                               const char *text, int text_len,
+                               int borderw, WordBitmap *word)
+{
+    char path[512];
+    uint64_t text_hash, style_hash;
+
+    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
+        return -1;
+
+    text_hash = compute_text_hash(text, text_len);
+    style_hash = compute_style_hash(s->fontsize, borderw,
+                                    s->fontcolor.rgba, s->bordercolor.rgba);
+
+    if (build_word_cache_path(path, sizeof(path), s->glyph_cache_dir,
+                              s->font_hash, style_hash, text_hash) != 0)
+        return -1;
+
+    if (word_cache_read(path, word) == 0) {
+        av_log(ctx, AV_LOG_DEBUG, "Word cache: hit text_hash=%016" PRIx64 " size=%dx%d\n",
+               text_hash, word->width, word->height);
+        return 0;
+    }
+
+    return -1;
+}
+
+/**
+ * Save a rendered word/line bitmap to disk cache.
+ */
+static void word_cache_save(AVFilterContext *ctx, DrawTextContext *s,
+                            const char *text, int text_len,
+                            int borderw, const WordBitmap *word)
+{
+    char path[512];
+    uint64_t text_hash, style_hash;
+
+    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
+        return;
+
+    text_hash = compute_text_hash(text, text_len);
+    style_hash = compute_style_hash(s->fontsize, borderw,
+                                    s->fontcolor.rgba, s->bordercolor.rgba);
+
+    if (build_word_cache_path(path, sizeof(path), s->glyph_cache_dir,
+                              s->font_hash, style_hash, text_hash) != 0)
+        return;
+
+    if (word_cache_write(path, word) == 0) {
+        av_log(ctx, AV_LOG_DEBUG, "Word cache: saved text_hash=%016" PRIx64 " size=%dx%d (%d bytes)\n",
+               text_hash, word->width, word->height,
+               word->height * word->pitch);
+    }
+}
+
 static void hb_destroy(HarfbuzzData *hb);
 static void harfbuzz_warmup(hb_font_t *hb_font);
+static inline int get_subpixel_idx(int shift_x64, int shift_y64);
+
+/**
+ * Render a text line to a WordBitmap by compositing all glyph bitmaps.
+ * The bitmap is grayscale (8-bit alpha mask).
+ * Returns 0 on success, negative on failure.
+ */
+static int render_line_to_bitmap(DrawTextContext *s, TextLine *line,
+                                 int borderw, WordBitmap *out)
+{
+    int min_x = INT_MAX, max_x = INT_MIN;
+    int min_y = INT_MAX, max_y = INT_MIN;
+    int g, idx, x, y;
+    Glyph *glyph;
+    FT_BitmapGlyph b_glyph;
+    GlyphInfo *info;
+
+    memset(out, 0, sizeof(*out));
+
+    if (!line->is_shaped || line->hb_data.glyph_count == 0)
+        return 0;
+
+    /* First pass: compute bounding box */
+    for (g = 0; g < line->hb_data.glyph_count; g++) {
+        info = &line->glyphs[g];
+        glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
+        if (!glyph)
+            continue;
+
+        idx = get_subpixel_idx(info->shift_x64, info->shift_y64);
+        b_glyph = borderw ? glyph->border_bglyph[idx] : glyph->bglyph[idx];
+        if (!b_glyph)
+            continue;
+
+        x = info->x + b_glyph->left;
+        y = info->y - b_glyph->top;
+
+        min_x = FFMIN(min_x, x);
+        max_x = FFMAX(max_x, x + (int)b_glyph->bitmap.width);
+        min_y = FFMIN(min_y, y);
+        max_y = FFMAX(max_y, y + (int)b_glyph->bitmap.rows);
+    }
+
+    if (min_x >= max_x || min_y >= max_y)
+        return 0;  /* Empty line */
+
+    out->width = max_x - min_x;
+    out->height = max_y - min_y;
+    out->pitch = out->width;  /* 8-bit grayscale, no padding */
+    out->left = min_x;
+    out->top = -min_y;  /* Convert to top bearing */
+    out->advance = line->width64 >> 6;
+
+    out->buffer = av_mallocz((size_t)out->height * out->pitch);
+    if (!out->buffer)
+        return AVERROR(ENOMEM);
+
+    /* Second pass: composite glyphs into bitmap */
+    for (g = 0; g < line->hb_data.glyph_count; g++) {
+        info = &line->glyphs[g];
+        glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
+        if (!glyph)
+            continue;
+
+        idx = get_subpixel_idx(info->shift_x64, info->shift_y64);
+        b_glyph = borderw ? glyph->border_bglyph[idx] : glyph->bglyph[idx];
+        if (!b_glyph || b_glyph->bitmap.width == 0 || b_glyph->bitmap.rows == 0)
+            continue;
+
+        int gx = info->x + b_glyph->left - min_x;
+        int gy = info->y - b_glyph->top - min_y;
+        FT_Bitmap *bmp = &b_glyph->bitmap;
+
+        /* Composite glyph bitmap using max blending */
+        for (int row = 0; row < (int)bmp->rows; row++) {
+            if (gy + row < 0 || gy + row >= out->height)
+                continue;
+            uint8_t *dst = out->buffer + (gy + row) * out->pitch + gx;
+            uint8_t *src = bmp->buffer + row * bmp->pitch;
+            for (int col = 0; col < (int)bmp->width; col++) {
+                if (gx + col < 0 || gx + col >= out->width)
+                    continue;
+                /* Max blending for overlapping glyphs */
+                if (src[col] > dst[col])
+                    dst[col] = src[col];
+            }
+        }
+    }
+
+    return 0;
+}
 
 static int glyph_cmp(const void *key, const void *b)
 {
@@ -2217,10 +2529,60 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     for (tile_x = tile_x_start; tile_x <= tile_x_end; ++tile_x) {
     for (l = l_start; l <= l_end; ++l) {
         TextLine *line = &s->lines[l];
+        WordBitmap line_cache = {0};
+        int cache_hit = 0;
 
         /* Skip lines that weren't shaped (viewport optimization) */
         if (!line->is_shaped || line->glyphs == NULL) {
             continue;
+        }
+
+        /* Try to load line from word cache */
+        if (line->text_start && line->text_len > 0) {
+            cache_hit = (word_cache_try_load(ctx, s, line->text_start, line->text_len,
+                                             borderw, &line_cache) == 0);
+        }
+
+        if (cache_hit && line_cache.buffer) {
+            /* Cache hit - blit the cached line bitmap */
+            int lx = x + line_cache.left;
+            int ly = y - line_cache.top + offset_y;
+
+            if (use_canvas) {
+                lx -= canvas_x;
+                ly -= canvas_y;
+                if (canvas_tile) {
+                    lx += tile_x * tile_w;
+                    ly += tile_y * tile_h;
+                }
+            }
+
+            if (j_left && j_right) {
+                lx += (s->box_width - line->width_px) / 2;
+            } else if (j_right) {
+                lx += s->box_width - line->width_px;
+            }
+
+            /* Clip and blit */
+            int cdx = 0, cdy = 0;
+            int cw = line_cache.width, ch = line_cache.height;
+            if (lx < metrics->rect_x - s->bb_left) {
+                cdx = metrics->rect_x - s->bb_left - lx;
+                lx = metrics->rect_x - s->bb_left;
+            }
+            if (ly < metrics->rect_y - s->bb_top) {
+                cdy = metrics->rect_y - s->bb_top - ly;
+                ly = metrics->rect_y - s->bb_top;
+            }
+            if (cdx < cw && cdy < ch && lx < clip_x && ly < clip_y) {
+                cw = FFMIN(clip_x - lx, cw - cdx);
+                ch = FFMIN(clip_y - ly, ch - cdy);
+                ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
+                              line_cache.buffer + cdy * line_cache.pitch + cdx,
+                              line_cache.pitch, cw, ch, 3, 0, lx, ly);
+            }
+            word_bitmap_free(&line_cache);
+            continue;  /* Skip per-glyph rendering */
         }
 
         line_w = line->width_px;
@@ -2278,6 +2640,16 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
 
             ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
                 bitmap.buffer + pdx, bitmap.pitch, w1, h1, 3, 0, x1, y1);
+        }
+
+        /* Cache miss - save rendered line to cache for future use */
+        if (!cache_hit && line->text_start && line->text_len > 0 &&
+            s->glyph_cache_dir && s->glyph_cache_initialized) {
+            WordBitmap save_bmp = {0};
+            if (render_line_to_bitmap(s, line, borderw, &save_bmp) == 0 && save_bmp.buffer) {
+                word_cache_save(ctx, s, line->text_start, line->text_len, borderw, &save_bmp);
+                word_bitmap_free(&save_bmp);
+            }
         }
     }
     }
