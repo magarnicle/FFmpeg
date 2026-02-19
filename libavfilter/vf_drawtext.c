@@ -364,6 +364,10 @@ typedef struct DrawTextContext {
     // lines that leave the viewport (not all 30k+ lines) each frame.
     int prev_first_visible_line;    ///< first_visible_line from previous frame (-1 = none)
     int prev_last_visible_line;     ///< last_visible_line from previous frame  (-1 = none)
+
+    // Text expansion optimization: skip re-expanding static text
+    int text_is_static;             ///< 1 if EXP_NORMAL produced identical output to input
+    int text_static_checked_version;///< text_version when text_is_static was last evaluated
 } DrawTextContext;
 
 #define OFFSET(x) offsetof(DrawTextContext, x)
@@ -1440,6 +1444,11 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     int clip_x = 0, clip_y = 0;
     int use_canvas = canvas_w > 0 && canvas_h > 0;
     int tile_x, tile_y;  // for looping
+    int64_t t_start_glyphs = av_gettime_relative();
+    int64_t t_blend_total = 0, t_hash_total = 0, t_setup_total = 0;
+    int glyph_count = 0, blend_count = 0, skip_count = 0;
+    int total_blend_pixels = 0;
+    int small_glyph_count = 0, min_w = 9999, max_w = 0, min_h = 9999, max_h = 0;
 
     j_left = !!(s->text_align & TA_LEFT);
     j_right = !!(s->text_align & TA_RIGHT);
@@ -1499,12 +1508,15 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
 
         line_w = line->width_px;
         for (g = 0; g < line->hb_data.glyph_count; ++g) {
+            int64_t t_hash_start = av_gettime_relative();
             info = &line->glyphs[g];
             glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
             if (!glyph) {
                 return AVERROR(EINVAL);
             }
+            t_hash_total += av_gettime_relative() - t_hash_start;
 
+            int64_t t_setup_start = av_gettime_relative();
             idx = get_subpixel_idx(info->shift_x64, info->shift_y64);
             b_glyph = borderw ? glyph->border_bglyph[idx] : glyph->bglyph[idx];
             bitmap = b_glyph->bitmap;
@@ -1543,19 +1555,42 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
 
             // check if the glyph is empty or out of the clipping region
             if (dx >= w1 || dy >= h1 || x1 >= clip_x || y1 >= clip_y) {
+                t_setup_total += av_gettime_relative() - t_setup_start;
+                skip_count++;
                 continue;
             }
 
             pdx = dx + dy * bitmap.pitch;
             w1 = FFMIN(clip_x - x1, w1 - dx);
             h1 = FFMIN(clip_y - y1, h1 - dy);
+            t_setup_total += av_gettime_relative() - t_setup_start;
 
-            ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
-                bitmap.buffer + pdx, bitmap.pitch, w1, h1, 3, 0, x1, y1);
+            {
+                int64_t t_blend_start = av_gettime_relative();
+                ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
+                    bitmap.buffer + pdx, bitmap.pitch, w1, h1, 3, 0, x1, y1);
+                t_blend_total += av_gettime_relative() - t_blend_start;
+                blend_count++;
+                total_blend_pixels += w1 * h1;
+                if (w1 < 8) small_glyph_count++;
+                if (w1 < min_w) min_w = w1;
+                if (w1 > max_w) max_w = w1;
+                if (h1 < min_h) min_h = h1;
+                if (h1 > max_h) max_h = h1;
+            }
         }
+        glyph_count++;
     }
     }
     }
+
+    av_log(ctx, AV_LOG_DEBUG,
+           "TIMING draw_glyphs: total=%"PRId64"us | hash=%"PRId64"us setup=%"PRId64"us blend=%"PRId64"us | "
+           "blends=%d pixels=%d small_w=%d w=%d-%d h=%d-%d\n",
+           av_gettime_relative() - t_start_glyphs,
+           t_hash_total, t_setup_total, t_blend_total,
+           blend_count, total_blend_pixels, small_glyph_count,
+           min_w, max_w, min_h, max_h);
 
     return 0;
 }
@@ -1691,6 +1726,9 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
     int ret = 0;
     char *line_buf = NULL;
     int line_buf_size = 0;
+    int64_t t_measure_start = av_gettime_relative();
+    int64_t t_shape_total = 0, t_glyphload_total = 0;
+    int shape_count = 0, glyphload_count = 0, cache_hit_count = 0;
 
     // Evaluate the width of the space character if needed to replace tabs
     if (s->tab_count > 0 && !s->blank_advance64) {
@@ -1797,7 +1835,12 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         }
 
         // Shape the line (reuses existing hb_data.buf via hb_buffer_reset — Issue 5)
-        ret = shape_text_hb(s, hb, line_buf, cur_line->text_len);
+        {
+            int64_t t_shape_start = av_gettime_relative();
+            ret = shape_text_hb(s, hb, line_buf, cur_line->text_len);
+            t_shape_total += av_gettime_relative() - t_shape_start;
+            shape_count++;
+        }
         if (ret != 0) {
             goto done;
         }
@@ -1809,6 +1852,7 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
         // but cheap — no glyph cache lookup needed).
         if (cur_line->metrics_fontsize == s->fontsize) {
             // Cache hit — accumulate width, skip bbox work.
+            cache_hit_count++;
             int line_tab_idx = cur_line->first_tab_idx;
             int tab_end_idx  = cur_line->first_tab_idx + cur_line->line_tab_count;
             w64 = 0;
@@ -1859,7 +1903,12 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
                 if (is_tab)
                     ++line_tab_idx;
 
-                ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, -1, -1);
+                {
+                    int64_t t_gl_start = av_gettime_relative();
+                    ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, -1, -1);
+                    t_glyphload_total += av_gettime_relative() - t_gl_start;
+                    glyphload_count++;
+                }
                 if (ret != 0)
                     goto done;
 
@@ -1931,6 +1980,12 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics,
 
 done:
     av_free(line_buf);
+    av_log(ctx, AV_LOG_DEBUG,
+           "TIMING measure_text: total=%"PRId64"us shape=%"PRId64"us(%d) glyphload=%"PRId64"us(%d) cache_hits=%d\n",
+           av_gettime_relative() - t_measure_start,
+           t_shape_total, shape_count,
+           t_glyphload_total, glyphload_count,
+           cache_hit_count);
     return ret;
 }
 
@@ -1963,34 +2018,67 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     int preliminary_height;
     int first_visible_line, last_visible_line;
 
-    av_bprint_clear(bp);
+    // Timing variables
+    int64_t t_start, t_expand, t_lines, t_visible, t_measure, t_glyphload, t_box, t_shadow, t_border, t_text, t_total;
+    t_start = av_gettime_relative();
 
-    if (s->basetime != AV_NOPTS_VALUE)
-        now= frame->pts*av_q2d(ctx->inputs[0]->time_base) + s->basetime/1000000;
+    // Optimization: Skip text expansion when text is unchanged and static.
+    // This avoids copying multi-MB text files every frame (~11ms -> 0).
+    // For EXP_NORMAL, we check on first use whether the text contains any %{...}
+    // expressions; if not, we treat it like EXP_NONE.
+    int skip_expand = 0;
 
-    switch (s->exp_mode) {
-    case EXP_NONE:
-        av_bprintf(bp, "%s", s->text);
-        break;
-    case EXP_NORMAL:
-        if ((ret = ff_expand_text(&s->expand_text, s->text, &s->expanded_text)) < 0)
-            return ret;
-        break;
-    case EXP_STRFTIME:
-        localtime_r(&now, &ltime);
-        av_bprint_strftime(bp, s->text, &ltime);
-        break;
+    // Check if we can skip expansion
+    if (!s->tc_opt_string && s->lines_text_version == s->text_version && bp->len > 0) {
+        if (s->exp_mode == EXP_NONE) {
+            skip_expand = 1;
+        } else if (s->exp_mode == EXP_NORMAL &&
+                   s->text_static_checked_version == s->text_version &&
+                   s->text_is_static) {
+            skip_expand = 1;
+        }
     }
 
-    if (s->tc_opt_string) {
-        char tcbuf[AV_TIMECODE_STR_SIZE];
-        av_timecode_make_string(&s->tc, tcbuf, inl->frame_count_out);
+    if (!skip_expand) {
         av_bprint_clear(bp);
-        av_bprintf(bp, "%s%s", s->text, tcbuf);
+
+        if (s->basetime != AV_NOPTS_VALUE)
+            now= frame->pts*av_q2d(ctx->inputs[0]->time_base) + s->basetime/1000000;
+
+        switch (s->exp_mode) {
+        case EXP_NONE:
+            av_bprintf(bp, "%s", s->text);
+            break;
+        case EXP_NORMAL:
+            if ((ret = ff_expand_text(&s->expand_text, s->text, &s->expanded_text)) < 0)
+                return ret;
+            // Check if text is static (no expressions expanded)
+            if (s->text_static_checked_version != s->text_version) {
+                s->text_is_static = (bp->len == strlen((char *)s->text) &&
+                                     memcmp(bp->str, s->text, bp->len) == 0);
+                s->text_static_checked_version = s->text_version;
+                if (s->text_is_static)
+                    av_log(ctx, AV_LOG_DEBUG, "Text is static, will cache expansion\n");
+            }
+            break;
+        case EXP_STRFTIME:
+            localtime_r(&now, &ltime);
+            av_bprint_strftime(bp, s->text, &ltime);
+            break;
+        }
+
+        if (s->tc_opt_string) {
+            char tcbuf[AV_TIMECODE_STR_SIZE];
+            av_timecode_make_string(&s->tc, tcbuf, inl->frame_count_out);
+            av_bprint_clear(bp);
+            av_bprintf(bp, "%s%s", s->text, tcbuf);
+        }
+
+        if (!av_bprint_is_complete(bp))
+            return AVERROR(ENOMEM);
     }
 
-    if (!av_bprint_is_complete(bp))
-        return AVERROR(ENOMEM);
+    t_expand = av_gettime_relative();
 
     if (s->fontcolor_expr[0]) {
         /* If expression is set, evaluate and replace the static value */
@@ -2082,6 +2170,8 @@ continue_count1:
     }
     /* else: text unchanged, reuse cached line boundaries */
 
+    t_lines = av_gettime_relative();
+
     /* Calculate preliminary text height based on line count and font metrics */
     preliminary_height = POS_CEIL(line_height64 * s->line_count, 64);
 
@@ -2114,10 +2204,14 @@ continue_count1:
     av_log(ctx, AV_LOG_DEBUG, "Viewport optimization: lines %d-%d of %d visible (canvas_y=%d, canvas_h=%d)\n",
            first_visible_line, last_visible_line, s->line_count, s->canvas_y, s->canvas_h);
 
+    t_visible = av_gettime_relative();
+
     /* Phase 2: Shape only visible lines */
     if ((ret = measure_text(ctx, &metrics, first_visible_line, last_visible_line)) < 0) {
         return ret;
     }
+
+    t_measure = av_gettime_relative();
 
     s->max_glyph_h = POS_CEIL(metrics.max_y64 - metrics.min_y64, 64);
     s->max_glyph_w = POS_CEIL(metrics.max_x64 - metrics.min_x64, 64);
@@ -2302,6 +2396,8 @@ continue_count1:
         s->bb_bottom = borderoffset + (s->shadowy > 0 ? s->shadowy : 0) + 1;
     }
 
+    t_glyphload = av_gettime_relative();
+
     /* Check if the whole box is out of the frame */
     {
         int check_width = (s->canvas_w > 0 && s->canvas_h > 0) ? s->canvas_w : s->box_width;
@@ -2311,6 +2407,8 @@ continue_count1:
                         metrics.rect_x + check_width + s->bb_right <= 0 ||
                         metrics.rect_y + check_height + s->bb_bottom <= 0;
     }
+
+    t_box = t_shadow = t_border = t_text = av_gettime_relative();
 
     if (!is_outside) {
         /* draw box */
@@ -2328,6 +2426,7 @@ continue_count1:
                 frame->data, frame->linesize, width, height,
                 rec_x, rec_y, rec_width, rec_height);
         }
+        t_box = av_gettime_relative();
 
         if (s->shadowx || s->shadowy) {
             if ((ret = draw_glyphs(ctx, frame, &shadowcolor, &metrics,
@@ -2337,6 +2436,7 @@ continue_count1:
                 return ret;
             }
         }
+        t_shadow = av_gettime_relative();
 
         if (s->borderw) {
             if ((ret = draw_glyphs(ctx, frame, &bordercolor, &metrics,
@@ -2346,17 +2446,35 @@ continue_count1:
                 return ret;
             }
         }
+        t_border = av_gettime_relative();
 
         if ((ret = draw_glyphs(ctx, frame, &fontcolor, &metrics, 0, 0, 0,
                 s->canvas_x, s->canvas_y, s->canvas_w, s->canvas_h,
                 metrics.width, metrics.height, s->canvas_tile)) < 0) {
             return ret;
         }
+        t_text = av_gettime_relative();
     }
 
     // Issue 5: glyphs[] and hb_data.buf are kept alive across frames to avoid
     // per-frame malloc/free churn. They are freed when text changes (rebuild
     // path in draw_text) or at uninit time.
+
+    t_total = av_gettime_relative();
+
+    av_log(ctx, AV_LOG_DEBUG,
+           "TIMING draw_text: total=%"PRId64"us | expand=%"PRId64"us lines=%"PRId64"us visible=%"PRId64"us "
+           "measure=%"PRId64"us glyphload=%"PRId64"us box=%"PRId64"us shadow=%"PRId64"us border=%"PRId64"us text=%"PRId64"us\n",
+           t_total - t_start,
+           t_expand - t_start,
+           t_lines - t_expand,
+           t_visible - t_lines,
+           t_measure - t_visible,
+           t_glyphload - t_measure,
+           t_box - t_glyphload,
+           t_shadow - t_box,
+           t_border - t_shadow,
+           t_text - t_border);
 
     return 0;
 }

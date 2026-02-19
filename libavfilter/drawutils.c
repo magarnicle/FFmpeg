@@ -20,6 +20,7 @@
  */
 
 #include <string.h>
+#include <inttypes.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/avutil.h"
@@ -27,6 +28,8 @@
 #include "libavutil/csp.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/time.h"
+#include "libavutil/log.h"
 #include "colorspace.h"
 #include "drawutils.h"
 #include "formats.h"
@@ -778,6 +781,9 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
     int xm0, ym0, w_sub, h_sub, x_sub, y_sub, left, right, top, bottom;
     uint8_t *p;
     const uint8_t *m;
+    static int64_t s_blend8_time = 0, s_blend16_time = 0, s_blend16_simd_time = 0;
+    static int s_blend8_count = 0, s_blend16_count = 0, s_blend16_simd_count = 0;
+    static int s_log_counter = 0;
 
     nb_comp = draw->desc->nb_components -
         !!(draw->desc->flags & AV_PIX_FMT_FLAG_ALPHA && !(draw->flags & FF_DRAW_PROCESS_ALPHA));
@@ -831,6 +837,7 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                 m += top * mask_linesize;
             }
             if (depth <= 8) {
+                int64_t t8_start = av_gettime_relative();
                 for (int y = 0; y < h_sub; y++) {
                     blend_line_hv(p, draw->pixelstep[plane],
                                   color->comp[plane].u8[index], alpha,
@@ -840,8 +847,11 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                     p += dst_linesize[plane];
                     m += mask_linesize << draw->vsub[plane];
                 }
+                s_blend8_time += av_gettime_relative() - t8_start;
+                s_blend8_count++;
             } else {
                 int simd_used = 0;
+                int64_t t16_start = av_gettime_relative();
 #if ARCH_X86 && HAVE_AVX2_INLINE
                 if (l2depth == 3 && depth < 16 &&
                     draw->pixelstep[plane] == 2 &&
@@ -908,6 +918,10 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
 #endif
                 }
 #endif /* ARCH_X86 && HAVE_AVX2_INLINE */
+                if (simd_used) {
+                    s_blend16_simd_time += av_gettime_relative() - t16_start;
+                    s_blend16_simd_count++;
+                }
                 if (!simd_used) {
                     for (int y = 0; y < h_sub; y++) {
                         blend_line_hv16(p, draw->pixelstep[plane],
@@ -918,6 +932,8 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                         p += dst_linesize[plane];
                         m += mask_linesize << draw->vsub[plane];
                     }
+                    s_blend16_time += av_gettime_relative() - t16_start;
+                    s_blend16_count++;
                 }
             }
             if (bottom) {
@@ -936,6 +952,20 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                 }
             }
         }
+    }
+
+    // Log blend timing stats periodically (every 1000 calls) at DEBUG level
+    s_log_counter++;
+    if (s_log_counter >= 1000) {
+        av_log(NULL, AV_LOG_DEBUG,
+               "TIMING ff_blend_mask (per 1000 calls): "
+               "blend8=%"PRId64"us(%d) blend16_scalar=%"PRId64"us(%d) blend16_simd=%"PRId64"us(%d)\n",
+               s_blend8_time, s_blend8_count,
+               s_blend16_time, s_blend16_count,
+               s_blend16_simd_time, s_blend16_simd_count);
+        s_blend8_time = s_blend16_time = s_blend16_simd_time = 0;
+        s_blend8_count = s_blend16_count = s_blend16_simd_count = 0;
+        s_log_counter = 0;
     }
 }
 
