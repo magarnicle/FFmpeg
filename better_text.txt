@@ -1,0 +1,56 @@
+# Text Rendering Improvements for drawtext filter
+
+## Current Issues
+
+### 1. No Gamma-Correct Blending (Most Significant)
+The blending is performed in non-linear sRGB space:
+```c
+// drawutils.c:560
+*dst = (*dst * tau + asrc) >> 24;
+```
+
+This causes thin text to appear lighter than intended and creates visual artifacts at glyph edges. Proper text rendering requires blending in linear RGB space.
+
+### 2. Grayscale-Only Anti-Aliasing
+The filter uses `FT_RENDER_MODE_NORMAL` (vf_drawtext.c:2056, 2080), which is grayscale. LCD subpixel rendering (`FT_RENDER_MODE_LCD`) could provide ~3x horizontal resolution.
+
+### 3. No Stem Darkening
+FreeType's auto-hinter can apply stem darkening to make thin stems more legible, but this isn't enabled.
+
+## Suggested Improvements
+
+### Option A: Gamma-Correct Blending (Recommended)
+Add a lookup table for sRGB-to-linear and linear-to-sRGB conversion, then blend in linear space:
+
+```c
+// Approximate gamma: linear = srgb^2.2, but 2.0 is faster
+static inline unsigned srgb_to_linear(unsigned v) {
+    return (v * v) >> 8;  // Fast approximation
+}
+
+static inline unsigned linear_to_srgb(unsigned v) {
+    // Use a LUT or fast sqrt approximation
+    return ff_sqrt(v << 8);
+}
+
+// Modified blend:
+unsigned lin_dst = srgb_to_linear(*dst);
+unsigned lin_src = srgb_to_linear(src);
+unsigned lin_result = (lin_dst * tau + lin_src * alpha) >> 24;
+*dst = linear_to_srgb(lin_result);
+```
+
+### Option B: Add `blend_mode` Option
+Add an option to select blending behavior:
+- `normal` - current behavior (fast)
+- `gamma` - gamma-correct blending (higher quality)
+
+### Option C: Pre-multiply Alpha with Gamma Correction
+Apply gamma correction when generating the glyph bitmap rather than at blend time.
+
+## Implementation Notes
+
+- The blending code is in libavfilter/drawutils.c (blend_line, blend_pixel functions)
+- Glyph rendering is in libavfilter/vf_drawtext.c (FT_Glyph_To_Bitmap calls)
+- AVX2/AVX512 SIMD paths in drawutils.c would also need updating for gamma-correct blending
+- Consider using precomputed 256-entry LUTs for sRGB<->linear conversion to minimize performance impact

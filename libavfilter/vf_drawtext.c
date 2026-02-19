@@ -263,6 +263,15 @@ typedef struct TextMetrics {
     int rect_y;                     ///< y position of the box
 } TextMetrics;
 
+#define WORD_CACHE_HASH_SIZE 512
+
+/** In-memory hash table for word bitmap cache (forward declaration) */
+typedef struct WordCacheHash {
+    struct WordCacheEntry *buckets[WORD_CACHE_HASH_SIZE];
+    int entry_count;        ///< total number of entries
+    size_t total_bytes;     ///< total bitmap memory used
+} WordCacheHash;
+
 typedef struct DrawTextContext {
     const AVClass *class;
     int exp_mode;                   ///< expansion mode to use for the text
@@ -380,6 +389,9 @@ typedef struct DrawTextContext {
     char *font_path;                ///< resolved font file path (for cache keying)
     uint64_t font_hash;             ///< hash of fontfile content for cache keying
     int glyph_cache_initialized;    ///< 1 if font_hash computed and cache ready
+
+    // In-memory word bitmap cache
+    WordCacheHash word_cache;       ///< in-memory cache for rendered word bitmaps
 } DrawTextContext;
 
 #define OFFSET(x) offsetof(DrawTextContext, x)
@@ -1203,6 +1215,14 @@ typedef struct WordBitmap {
     int advance;            ///< horizontal advance to next word
 } WordBitmap;
 
+/** Entry in the in-memory word bitmap cache */
+typedef struct WordCacheEntry {
+    uint64_t text_hash;     ///< hash of word text
+    uint64_t style_hash;    ///< hash of style parameters (fontsize, colors, etc)
+    WordBitmap bitmap;      ///< cached rendered bitmap
+    struct WordCacheEntry *next;  ///< next entry in hash bucket chain
+} WordCacheEntry;
+
 /**
  * Compute a hash of the rendering style parameters.
  * Used as part of the word cache key to ensure style changes invalidate cache.
@@ -1347,6 +1367,100 @@ static void word_bitmap_free(WordBitmap *word)
     }
 }
 
+/* ======================== In-memory word cache ======================== */
+
+static inline uint32_t word_cache_hash_func(uint64_t text_hash, uint64_t style_hash)
+{
+    /* Combine both hashes and map to bucket index */
+    return (uint32_t)((text_hash ^ style_hash) % WORD_CACHE_HASH_SIZE);
+}
+
+/**
+ * Find a word bitmap in the in-memory cache.
+ * Returns pointer to cached entry, or NULL if not found.
+ */
+static WordCacheEntry *word_mem_cache_find(WordCacheHash *cache,
+                                           uint64_t text_hash, uint64_t style_hash)
+{
+    uint32_t idx = word_cache_hash_func(text_hash, style_hash);
+    WordCacheEntry *e = cache->buckets[idx];
+    while (e) {
+        if (e->text_hash == text_hash && e->style_hash == style_hash)
+            return e;
+        e = e->next;
+    }
+    return NULL;
+}
+
+/**
+ * Insert a word bitmap into the in-memory cache.
+ * Takes ownership of the bitmap buffer.
+ */
+static void word_mem_cache_insert(WordCacheHash *cache,
+                                  uint64_t text_hash, uint64_t style_hash,
+                                  const WordBitmap *bitmap)
+{
+    WordCacheEntry *entry;
+    uint32_t idx;
+
+    if (!bitmap || !bitmap->buffer)
+        return;
+
+    /* Check if already exists */
+    if (word_mem_cache_find(cache, text_hash, style_hash))
+        return;
+
+    entry = av_mallocz(sizeof(*entry));
+    if (!entry)
+        return;
+
+    entry->text_hash = text_hash;
+    entry->style_hash = style_hash;
+
+    /* Copy the bitmap data */
+    entry->bitmap.width = bitmap->width;
+    entry->bitmap.height = bitmap->height;
+    entry->bitmap.pitch = bitmap->pitch;
+    entry->bitmap.left = bitmap->left;
+    entry->bitmap.top = bitmap->top;
+    entry->bitmap.advance = bitmap->advance;
+
+    size_t buf_size = (size_t)bitmap->height * bitmap->pitch;
+    entry->bitmap.buffer = av_malloc(buf_size);
+    if (!entry->bitmap.buffer) {
+        av_free(entry);
+        return;
+    }
+    memcpy(entry->bitmap.buffer, bitmap->buffer, buf_size);
+
+    /* Insert at head of bucket */
+    idx = word_cache_hash_func(text_hash, style_hash);
+    entry->next = cache->buckets[idx];
+    cache->buckets[idx] = entry;
+
+    cache->entry_count++;
+    cache->total_bytes += buf_size;
+}
+
+/**
+ * Free all entries in the in-memory word cache.
+ */
+static void word_mem_cache_free(WordCacheHash *cache)
+{
+    for (int i = 0; i < WORD_CACHE_HASH_SIZE; i++) {
+        WordCacheEntry *e = cache->buckets[i];
+        while (e) {
+            WordCacheEntry *next = e->next;
+            av_freep(&e->bitmap.buffer);
+            av_free(e);
+            e = next;
+        }
+        cache->buckets[i] = NULL;
+    }
+    cache->entry_count = 0;
+    cache->total_bytes = 0;
+}
+
 /**
  * Try to load a cached word/line bitmap from disk.
  * Returns 0 on success (cache hit), -1 on miss/failure.
@@ -1357,21 +1471,47 @@ static int word_cache_try_load(AVFilterContext *ctx, DrawTextContext *s,
 {
     char path[512];
     uint64_t text_hash, style_hash;
-
-    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
-        return -1;
+    WordCacheEntry *mem_entry;
 
     text_hash = compute_text_hash(text, text_len);
     style_hash = compute_style_hash(s->fontsize, borderw,
                                     s->fontcolor.rgba, s->bordercolor.rgba);
+
+    /* Check in-memory cache first (fastest) */
+    mem_entry = word_mem_cache_find(&s->word_cache, text_hash, style_hash);
+    if (mem_entry && mem_entry->bitmap.buffer) {
+        /* Copy bitmap data to output */
+        word->width = mem_entry->bitmap.width;
+        word->height = mem_entry->bitmap.height;
+        word->pitch = mem_entry->bitmap.pitch;
+        word->left = mem_entry->bitmap.left;
+        word->top = mem_entry->bitmap.top;
+        word->advance = mem_entry->bitmap.advance;
+
+        size_t buf_size = (size_t)word->height * word->pitch;
+        word->buffer = av_malloc(buf_size);
+        if (!word->buffer)
+            return -1;
+        memcpy(word->buffer, mem_entry->bitmap.buffer, buf_size);
+
+        av_log(ctx, AV_LOG_DEBUG, "Word cache: memory hit text_hash=%016" PRIx64 " size=%dx%d\n",
+               text_hash, word->width, word->height);
+        return 0;
+    }
+
+    /* Check disk cache */
+    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
+        return -1;
 
     if (build_word_cache_path(path, sizeof(path), s->glyph_cache_dir,
                               s->font_hash, style_hash, text_hash) != 0)
         return -1;
 
     if (word_cache_read(path, word) == 0) {
-        av_log(ctx, AV_LOG_DEBUG, "Word cache: hit text_hash=%016" PRIx64 " size=%dx%d\n",
+        av_log(ctx, AV_LOG_DEBUG, "Word cache: disk hit text_hash=%016" PRIx64 " size=%dx%d\n",
                text_hash, word->width, word->height);
+        /* Promote to in-memory cache for faster future access */
+        word_mem_cache_insert(&s->word_cache, text_hash, style_hash, word);
         return 0;
     }
 
@@ -1388,19 +1528,26 @@ static void word_cache_save(AVFilterContext *ctx, DrawTextContext *s,
     char path[512];
     uint64_t text_hash, style_hash;
 
-    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
-        return;
-
     text_hash = compute_text_hash(text, text_len);
     style_hash = compute_style_hash(s->fontsize, borderw,
                                     s->fontcolor.rgba, s->bordercolor.rgba);
+
+    /* Always add to in-memory cache */
+    word_mem_cache_insert(&s->word_cache, text_hash, style_hash, word);
+    av_log(ctx, AV_LOG_DEBUG, "Word cache: memory store text_hash=%016" PRIx64 " size=%dx%d (total=%d entries, %zu bytes)\n",
+           text_hash, word->width, word->height,
+           s->word_cache.entry_count, s->word_cache.total_bytes);
+
+    /* Also save to disk cache if enabled */
+    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
+        return;
 
     if (build_word_cache_path(path, sizeof(path), s->glyph_cache_dir,
                               s->font_hash, style_hash, text_hash) != 0)
         return;
 
     if (word_cache_write(path, word) == 0) {
-        av_log(ctx, AV_LOG_DEBUG, "Word cache: saved text_hash=%016" PRIx64 " size=%dx%d (%d bytes)\n",
+        av_log(ctx, AV_LOG_DEBUG, "Word cache: disk store text_hash=%016" PRIx64 " size=%dx%d (%d bytes)\n",
                text_hash, word->width, word->height,
                word->height * word->pitch);
     }
@@ -2304,6 +2451,7 @@ static av_cold void uninit(AVFilterContext *ctx)
     s->canvas_w_pexpr = s->canvas_h_pexpr = s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
     glyph_hash_free(&s->glyph_hash);
+    word_mem_cache_free(&s->word_cache);
 
     if (s->lines) {
         for (int l = 0; l < s->line_count; l++) {
@@ -2604,8 +2752,6 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
 
                             if (cache_hit && word_cache.buffer) {
                                 /* Cache hit - blit cached word */
-                                av_log(ctx, AV_LOG_DEBUG, "Word cache HIT: '%.*s' (%dx%d)\n",
-                                       word_len, text + word_start_char, word_cache.width, word_cache.height);
                                 int wx = x + word_x_offset + word_cache.left + base_x_offset;
                                 int wy = y - word_cache.top + offset_y;
 
@@ -2638,8 +2784,6 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
                                 word_bitmap_free(&word_cache);
                             } else {
                                 /* Cache miss - render glyphs and save to cache */
-                                av_log(ctx, AV_LOG_DEBUG, "Word cache MISS: '%.*s' (glyphs=%d)\n",
-                                       word_len, text + word_start_char, glyph_count);
                                 for (int wg = word_start_glyph; wg < word_end_glyph; wg++) {
                                     GlyphInfo *winfo = &line->glyphs[wg];
                                     Glyph *wglyph = glyph_hash_find(&s->glyph_hash, winfo->code, s->fontsize);
