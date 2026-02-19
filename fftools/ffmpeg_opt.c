@@ -84,7 +84,7 @@ int auto_conversion_filters = 1;
 int64_t stats_period = 500000;
 
 char *glyph_cache_path = NULL;
-int preload_cache = 1;
+int preload_cache = 0;
 
 static int file_overwrite     = 0;
 static int no_file_overwrite  = 0;
@@ -2171,7 +2171,7 @@ const OptionDef options[] = {
         "directory for shared drawtext glyph cache", "path" },
     { "preload_cache", OPT_TYPE_BOOL, OPT_EXPERT,
         { &preload_cache },
-        "preload glyph cache into memory at startup (default: enabled)" },
+        "preload glyph cache into memory at startup (default: disabled)" },
 
     // deprecated options
 #if FFMPEG_OPT_ADRIFT_THRESHOLD
