@@ -7204,7 +7204,8 @@ enabled fontconfig        && enable libfontconfig
 enabled libfontconfig     && require_pkg_config libfontconfig fontconfig "fontconfig/fontconfig.h" FcInit
 enabled libfreetype       && require_pkg_config libfreetype freetype2 "ft2build.h FT_FREETYPE_H" FT_Init_FreeType
 enabled libfribidi        && require_pkg_config libfribidi fribidi fribidi.h fribidi_version_info
-enabled libharfbuzz       && require_pkg_config libharfbuzz harfbuzz hb.h hb_buffer_create
+enabled libharfbuzz       && require_pkg_config libharfbuzz harfbuzz hb.h hb_buffer_create &&
+                             require_pkg_config libharfbuzz "harfbuzz-subset" hb-subset.h hb_subset_input_create_or_fail
 if enabled libglslang; then
     spvremap="-lSPVRemapper"
     require_headers "glslang/build_info.h" && { test_cpp_condition glslang/build_info.h "GLSLANG_VERSION_MAJOR >= 16" && spvremap="" ; }

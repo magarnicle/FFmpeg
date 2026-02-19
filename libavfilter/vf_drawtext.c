@@ -78,6 +78,7 @@
 
 #include <hb.h>
 #include <hb-ft.h>
+#include <hb-subset.h>
 
 // Ceiling operation for positive integers division
 #define POS_CEIL(x, y) ((x)/(y) + ((x)%(y) != 0))
@@ -366,6 +367,8 @@ typedef struct DrawTextContext {
     int blank_advance64;            ///< the size of the space character
     int tab_warning_printed;        ///< ensure the tab warning to be printed only once
     hb_font_t *hb_font;             ///< shared HarfBuzz font (owned by context, not per-line)
+    hb_blob_t *hb_blob;             ///< memory-mapped font blob (for faster loading)
+    hb_face_t *hb_face;             ///< HarfBuzz face created from blob
 
     // Tracks which lines were visible last frame so we can clear only the
     // lines that leave the viewport (not all 30k+ lines) each frame.
@@ -934,6 +937,254 @@ fail:
     return -1;
 }
 
+/**
+ * Build subset font cache path: <cache_dir>/subset_<font_hash>.ttf
+ */
+static int build_subset_cache_path(char *buf, size_t bufsize, const char *cache_dir,
+                                   uint64_t font_hash)
+{
+    int ret = snprintf(buf, bufsize, "%s/subset_%016" PRIx64 ".ttf",
+                       cache_dir, font_hash);
+    return (ret > 0 && (size_t)ret < bufsize) ? 0 : -1;
+}
+
+/**
+ * Collect all unique codepoints from text for subsetting.
+ */
+static hb_set_t *collect_codepoints_from_text(const char *text)
+{
+    hb_set_t *codepoints = hb_set_create();
+    const uint8_t *p = (const uint8_t *)text;
+
+    if (!codepoints)
+        return NULL;
+
+    while (*p) {
+        hb_codepoint_t cp;
+
+        /* Decode UTF-8 */
+        if ((*p & 0x80) == 0) {
+            cp = *p++;
+        } else if ((*p & 0xE0) == 0xC0 && p[1]) {
+            cp = ((*p & 0x1F) << 6) | (p[1] & 0x3F);
+            p += 2;
+        } else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
+            cp = ((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+            p += 3;
+        } else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) {
+            cp = ((*p & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+            p += 4;
+        } else {
+            /* Invalid UTF-8, skip byte */
+            p++;
+            continue;
+        }
+
+        hb_set_add(codepoints, cp);
+    }
+
+    /* Always include space and common punctuation */
+    hb_set_add(codepoints, ' ');
+    hb_set_add(codepoints, '.');
+    hb_set_add(codepoints, ',');
+    hb_set_add(codepoints, ':');
+    hb_set_add(codepoints, ';');
+    hb_set_add(codepoints, '!');
+    hb_set_add(codepoints, '?');
+    hb_set_add(codepoints, '-');
+    hb_set_add(codepoints, '\'');
+    hb_set_add(codepoints, '"');
+    hb_set_add(codepoints, '0');
+    hb_set_add(codepoints, '1');
+    hb_set_add(codepoints, '2');
+    hb_set_add(codepoints, '3');
+    hb_set_add(codepoints, '4');
+    hb_set_add(codepoints, '5');
+    hb_set_add(codepoints, '6');
+    hb_set_add(codepoints, '7');
+    hb_set_add(codepoints, '8');
+    hb_set_add(codepoints, '9');
+
+    return codepoints;
+}
+
+/**
+ * Create a subset font containing only the needed codepoints.
+ * Returns 0 on success, negative on failure.
+ */
+static int create_subset_font(AVFilterContext *ctx, const char *input_path,
+                              const char *output_path, const char *text)
+{
+    hb_blob_t *input_blob = NULL;
+    hb_face_t *input_face = NULL;
+    hb_subset_input_t *input = NULL;
+    hb_face_t *subset_face = NULL;
+    hb_blob_t *subset_blob = NULL;
+    hb_set_t *codepoints = NULL;
+    FILE *f = NULL;
+    const char *data;
+    unsigned int length;
+    int ret = -1;
+
+    /* Load input font with mmap */
+    input_blob = hb_blob_create_from_file_or_fail(input_path);
+    if (!input_blob) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: could not load font file '%s'\n", input_path);
+        goto cleanup;
+    }
+
+    input_face = hb_face_create(input_blob, 0);
+    if (!input_face || hb_face_get_glyph_count(input_face) == 0) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: could not create face from '%s'\n", input_path);
+        goto cleanup;
+    }
+
+    /* Collect codepoints from text */
+    codepoints = collect_codepoints_from_text(text);
+    if (!codepoints) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: could not collect codepoints\n");
+        goto cleanup;
+    }
+
+    av_log(ctx, AV_LOG_DEBUG, "Font subset: collected %u unique codepoints from text\n",
+           hb_set_get_population(codepoints));
+
+    /* Create subset input */
+    input = hb_subset_input_create_or_fail();
+    if (!input) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: could not create subset input\n");
+        goto cleanup;
+    }
+
+    /* Set codepoints to keep */
+    hb_set_union(hb_subset_input_unicode_set(input), codepoints);
+
+    /* Keep all OpenType features for proper shaping */
+    hb_set_clear(hb_subset_input_set(input, HB_SUBSET_SETS_DROP_TABLE_TAG));
+
+    /* Create subset */
+    subset_face = hb_subset_or_fail(input_face, input);
+    if (!subset_face) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: subsetting failed\n");
+        goto cleanup;
+    }
+
+    /* Get subset blob */
+    subset_blob = hb_face_reference_blob(subset_face);
+    if (!subset_blob) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: could not get subset blob\n");
+        goto cleanup;
+    }
+
+    data = hb_blob_get_data(subset_blob, &length);
+    if (!data || length == 0) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: empty subset data\n");
+        goto cleanup;
+    }
+
+    /* Write to file */
+    f = fopen(output_path, "wb");
+    if (!f) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: could not create output file '%s'\n", output_path);
+        goto cleanup;
+    }
+
+    if (fwrite(data, 1, length, f) != length) {
+        av_log(ctx, AV_LOG_WARNING, "Font subset: write error\n");
+        fclose(f);
+        goto cleanup;
+    }
+
+    fclose(f);
+    f = NULL;
+
+    av_log(ctx, AV_LOG_INFO, "Font subset: created %s (%u bytes, %u codepoints)\n",
+           output_path, length, hb_set_get_population(codepoints));
+    ret = 0;
+
+cleanup:
+    if (subset_blob) hb_blob_destroy(subset_blob);
+    if (subset_face) hb_face_destroy(subset_face);
+    if (input) hb_subset_input_destroy(input);
+    if (codepoints) hb_set_destroy(codepoints);
+    if (input_face) hb_face_destroy(input_face);
+    if (input_blob) hb_blob_destroy(input_blob);
+    return ret;
+}
+
+/**
+ * Create HarfBuzz font using memory-mapped blob for faster loading.
+ * Optionally uses a cached subset font if available.
+ */
+static int create_hb_font_mmap(AVFilterContext *ctx, DrawTextContext *s)
+{
+    const char *font_path = s->font_path;
+    char subset_path[512];
+    int use_subset = 0;
+
+    /* Check for cached subset font */
+    if (s->glyph_cache_dir && s->glyph_cache_initialized && s->text) {
+        if (build_subset_cache_path(subset_path, sizeof(subset_path),
+                                    s->glyph_cache_dir, s->font_hash) == 0) {
+            struct stat st;
+            if (stat(subset_path, &st) == 0 && S_ISREG(st.st_mode)) {
+                /* Subset font exists, use it */
+                font_path = subset_path;
+                use_subset = 1;
+                av_log(ctx, AV_LOG_DEBUG, "HarfBuzz: using cached subset font '%s'\n", subset_path);
+            } else {
+                /* Create subset font for future runs */
+                if (create_subset_font(ctx, s->font_path, subset_path, s->text) == 0) {
+                    font_path = subset_path;
+                    use_subset = 1;
+                }
+            }
+        }
+    }
+
+    /* Create memory-mapped blob */
+    s->hb_blob = hb_blob_create_from_file_or_fail(font_path);
+    if (!s->hb_blob) {
+        av_log(ctx, AV_LOG_WARNING, "HarfBuzz: could not mmap font '%s', falling back to FreeType\n",
+               font_path);
+        /* Fall back to FreeType-based HarfBuzz font */
+        s->hb_font = hb_ft_font_create_referenced(s->face);
+        return s->hb_font ? 0 : AVERROR(ENOMEM);
+    }
+
+    av_log(ctx, AV_LOG_DEBUG, "HarfBuzz: loaded font via mmap (%s, %u bytes)\n",
+           use_subset ? "subset" : "full",
+           hb_blob_get_length(s->hb_blob));
+
+    /* Create face from blob */
+    s->hb_face = hb_face_create(s->hb_blob, 0);
+    if (!s->hb_face || hb_face_get_glyph_count(s->hb_face) == 0) {
+        av_log(ctx, AV_LOG_WARNING, "HarfBuzz: could not create face from blob, falling back to FreeType\n");
+        hb_blob_destroy(s->hb_blob);
+        s->hb_blob = NULL;
+        s->hb_font = hb_ft_font_create_referenced(s->face);
+        return s->hb_font ? 0 : AVERROR(ENOMEM);
+    }
+
+    /* Create font from face */
+    s->hb_font = hb_font_create(s->hb_face);
+    if (!s->hb_font) {
+        hb_face_destroy(s->hb_face);
+        hb_blob_destroy(s->hb_blob);
+        s->hb_face = NULL;
+        s->hb_blob = NULL;
+        return AVERROR(ENOMEM);
+    }
+
+    /* Set scale to match FreeType (26.6 fixed point) */
+    hb_font_set_scale(s->hb_font, s->fontsize * 64, s->fontsize * 64);
+
+    /* Enable OpenType features */
+    hb_ot_font_set_funcs(s->hb_font);
+
+    return 0;
+}
+
 static void hb_destroy(HarfbuzzData *hb);
 static void harfbuzz_warmup(hb_font_t *hb_font);
 
@@ -960,8 +1211,15 @@ static av_cold int set_fontsize(AVFilterContext *ctx, unsigned int fontsize)
     }
 
     // Whenever the underlying FT_Face changes, HarfBuzz has to be notified.
-    if (s->hb_font)
-        hb_ft_font_changed(s->hb_font);
+    if (s->hb_font) {
+        if (s->hb_blob) {
+            /* Using mmap-based font - update scale directly */
+            hb_font_set_scale(s->hb_font, fontsize * 64, fontsize * 64);
+        } else {
+            /* Using FreeType-based font */
+            hb_ft_font_changed(s->hb_font);
+        }
+    }
 
     s->fontsize = fontsize;
 
@@ -1618,11 +1876,11 @@ static av_cold int init(AVFilterContext *ctx)
         }
     }
 
-    s->hb_font = hb_ft_font_create_referenced(s->face);
-    if (!s->hb_font)
-        return AVERROR(ENOMEM);
-
     if ((err = update_fontsize(ctx)) < 0)
+        return err;
+
+    /* Create HarfBuzz font using memory-mapped blob (and optionally subset font) */
+    if ((err = create_hb_font_mmap(ctx, s)) < 0)
         return err;
 
     /* Warm up HarfBuzz to parse OpenType tables upfront */
@@ -1721,6 +1979,14 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     hb_font_destroy(s->hb_font);
     s->hb_font = NULL;
+    if (s->hb_face) {
+        hb_face_destroy(s->hb_face);
+        s->hb_face = NULL;
+    }
+    if (s->hb_blob) {
+        hb_blob_destroy(s->hb_blob);
+        s->hb_blob = NULL;
+    }
     FT_Done_Face(s->face);
     FT_Stroker_Done(s->stroker);
     FT_Done_FreeType(s->library);
