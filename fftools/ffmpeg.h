@@ -783,6 +783,9 @@ extern char *print_graphs_file;
 extern char *print_graphs_format;
 extern int auto_conversion_filters;
 
+extern char *glyph_cache_path;
+extern int preload_cache;
+
 extern const AVIOInterruptCB int_cb;
 
 extern const OptionDef options[];

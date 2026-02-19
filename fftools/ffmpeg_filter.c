@@ -40,6 +40,10 @@
 #include "libavutil/time.h"
 #include "libavutil/timestamp.h"
 
+/* Forward declaration for shared glyph cache (defined in vf_drawtext.c) */
+struct SharedWordCache;
+extern struct SharedWordCache *drawtext_get_shared_cache(const char *dir, int preload, void *log_ctx);
+
 typedef struct FilterGraphPriv {
     FilterGraph      fg;
 
@@ -2129,6 +2133,11 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
     fgt->graph = avfilter_graph_alloc();
     if (!fgt->graph)
         return AVERROR(ENOMEM);
+
+    /* Set up shared glyph cache for drawtext filters if configured */
+    if (glyph_cache_path && glyph_cache_path[0]) {
+        fgt->graph->opaque = drawtext_get_shared_cache(glyph_cache_path, preload_cache, fg);
+    }
 
     if (simple) {
         OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[0]);

@@ -83,6 +83,8 @@ char *print_graphs_format = NULL;
 int auto_conversion_filters = 1;
 int64_t stats_period = 500000;
 
+char *glyph_cache_path = NULL;
+int preload_cache = 1;
 
 static int file_overwrite     = 0;
 static int no_file_overwrite  = 0;
@@ -2163,6 +2165,13 @@ const OptionDef options[] = {
     { "filter_hw_device", OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_filter_hw_device },
         "set hardware device used when filtering", "device" },
+
+    { "glyph_cache", OPT_TYPE_STRING, OPT_EXPERT,
+        { &glyph_cache_path },
+        "directory for shared drawtext glyph cache", "path" },
+    { "preload_cache", OPT_TYPE_BOOL, OPT_EXPERT,
+        { &preload_cache },
+        "preload glyph cache into memory at startup (default: enabled)" },
 
     // deprecated options
 #if FFMPEG_OPT_ADRIFT_THRESHOLD

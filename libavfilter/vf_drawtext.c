@@ -41,6 +41,7 @@
 #include <unistd.h>
 #endif
 #include <fenv.h>
+#include <dirent.h>
 
 #if CONFIG_LIBFONTCONFIG
 #include <fontconfig/fontconfig.h>
@@ -59,6 +60,7 @@
 #include "libavutil/time_internal.h"
 #include "libavutil/tree.h"
 #include "libavutil/lfg.h"
+#include "libavutil/thread.h"
 #include "libavutil/detection_bbox.h"
 #include "avfilter.h"
 #include "drawutils.h"
@@ -272,6 +274,25 @@ typedef struct WordCacheHash {
     size_t total_bytes;     ///< total bitmap memory used
 } WordCacheHash;
 
+/**
+ * Shared word cache for multiple drawtext filter instances.
+ * Thread-safe and reference-counted.
+ */
+typedef struct SharedWordCache {
+    AVMutex mutex;              ///< protects all fields below
+    WordCacheHash hash;         ///< the shared cache hash table
+    char *cache_dir;            ///< disk cache directory (owned)
+    int preloaded;              ///< 1 if disk cache was loaded
+    int refcount;               ///< reference count
+} SharedWordCache;
+
+/** Global shared cache instance (singleton) */
+static SharedWordCache *g_shared_cache = NULL;
+static AVMutex g_shared_cache_mutex = AV_MUTEX_INITIALIZER;
+
+/* Forward declaration for shared cache accessor (called from fftools) */
+SharedWordCache *drawtext_get_shared_cache(const char *dir, int preload, void *log_ctx);
+
 typedef struct DrawTextContext {
     const AVClass *class;
     int exp_mode;                   ///< expansion mode to use for the text
@@ -391,7 +412,8 @@ typedef struct DrawTextContext {
     int glyph_cache_initialized;    ///< 1 if font_hash computed and cache ready
 
     // In-memory word bitmap cache
-    WordCacheHash word_cache;       ///< in-memory cache for rendered word bitmaps
+    WordCacheHash word_cache;       ///< in-memory cache for rendered word bitmaps (local)
+    SharedWordCache *shared_cache;  ///< shared cache (NULL if using local cache)
 } DrawTextContext;
 
 #define OFFSET(x) offsetof(DrawTextContext, x)
@@ -1461,9 +1483,201 @@ static void word_mem_cache_free(WordCacheHash *cache)
     cache->total_bytes = 0;
 }
 
+/* ==================== Shared Word Cache Functions ==================== */
+
+/**
+ * Preload all .wcch files from a cache directory into the shared cache.
+ * Parses filenames like: word_<font_hash>_<style_hash>_<text_hash>.wcch
+ * Must be called with cache->mutex held.
+ */
+static int shared_cache_preload_locked(SharedWordCache *cache, const char *dir, void *log_ctx)
+{
+    DIR *d;
+    struct dirent *entry;
+    int loaded = 0;
+    char path[512];
+
+    d = opendir(dir);
+    if (!d) {
+        av_log(log_ctx, AV_LOG_WARNING, "Failed to open glyph cache directory: %s\n", dir);
+        return 0;
+    }
+
+    while ((entry = readdir(d)) != NULL) {
+        uint64_t font_hash, style_hash, text_hash;
+        WordBitmap bitmap = {0};
+
+        /* Parse filename: word_<font>_<style>_<text>.wcch */
+        if (sscanf(entry->d_name, "word_%016" SCNx64 "_%016" SCNx64 "_%016" SCNx64 ".wcch",
+                   &font_hash, &style_hash, &text_hash) != 3)
+            continue;
+
+        snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+
+        if (word_cache_read(path, &bitmap) == 0) {
+            word_mem_cache_insert(&cache->hash, text_hash, style_hash, &bitmap);
+            av_freep(&bitmap.buffer);  /* word_mem_cache_insert copies the buffer */
+            loaded++;
+        }
+    }
+
+    closedir(d);
+    return loaded;
+}
+
+/**
+ * Get or create the global shared word cache.
+ * Thread-safe singleton accessor.
+ * @param dir    Cache directory path
+ * @param preload  If true, preload existing .wcch files into memory
+ * @param log_ctx  Logging context
+ * @return Shared cache with incremented refcount, or NULL on error
+ */
+SharedWordCache *drawtext_get_shared_cache(const char *dir, int preload, void *log_ctx)
+{
+    SharedWordCache *cache;
+
+    ff_mutex_lock(&g_shared_cache_mutex);
+
+    if (g_shared_cache) {
+        /* Existing cache - just increment refcount */
+        g_shared_cache->refcount++;
+        cache = g_shared_cache;
+        ff_mutex_unlock(&g_shared_cache_mutex);
+        return cache;
+    }
+
+    /* Create new shared cache */
+    cache = av_mallocz(sizeof(*cache));
+    if (!cache) {
+        ff_mutex_unlock(&g_shared_cache_mutex);
+        return NULL;
+    }
+
+    ff_mutex_init(&cache->mutex, NULL);
+    cache->cache_dir = av_strdup(dir);
+    if (!cache->cache_dir) {
+        ff_mutex_destroy(&cache->mutex);
+        av_free(cache);
+        ff_mutex_unlock(&g_shared_cache_mutex);
+        return NULL;
+    }
+
+    cache->refcount = 1;
+    cache->preloaded = 0;
+
+    /* Preload if requested */
+    if (preload && dir && dir[0]) {
+        int loaded;
+        ff_mutex_lock(&cache->mutex);
+        loaded = shared_cache_preload_locked(cache, dir, log_ctx);
+        cache->preloaded = 1;
+        ff_mutex_unlock(&cache->mutex);
+        av_log(log_ctx, AV_LOG_INFO, "Preloaded %d entries from glyph cache: %s\n", loaded, dir);
+    }
+
+    g_shared_cache = cache;
+    ff_mutex_unlock(&g_shared_cache_mutex);
+
+    return cache;
+}
+
+/**
+ * Increment shared cache reference count.
+ */
+static void shared_cache_ref(SharedWordCache *cache)
+{
+    if (!cache)
+        return;
+    ff_mutex_lock(&g_shared_cache_mutex);
+    cache->refcount++;
+    ff_mutex_unlock(&g_shared_cache_mutex);
+}
+
+/**
+ * Decrement shared cache reference count and free if zero.
+ */
+static void shared_cache_unref(SharedWordCache **pcache)
+{
+    SharedWordCache *cache;
+    int refcount;
+
+    if (!pcache || !*pcache)
+        return;
+
+    cache = *pcache;
+    *pcache = NULL;
+
+    ff_mutex_lock(&g_shared_cache_mutex);
+    cache->refcount--;
+    refcount = cache->refcount;
+
+    if (refcount == 0) {
+        /* Last reference - clean up */
+        g_shared_cache = NULL;
+    }
+    ff_mutex_unlock(&g_shared_cache_mutex);
+
+    if (refcount == 0) {
+        ff_mutex_lock(&cache->mutex);
+        word_mem_cache_free(&cache->hash);
+        ff_mutex_unlock(&cache->mutex);
+        ff_mutex_destroy(&cache->mutex);
+        av_freep(&cache->cache_dir);
+        av_free(cache);
+    }
+}
+
+/**
+ * Thread-safe lookup in shared cache.
+ * Returns pointer to cached entry or NULL if not found.
+ * Note: The returned pointer is valid only while the cache exists.
+ */
+static WordCacheEntry *shared_cache_find(SharedWordCache *cache,
+                                         uint64_t text_hash, uint64_t style_hash)
+{
+    WordCacheEntry *entry;
+
+    if (!cache)
+        return NULL;
+
+    ff_mutex_lock(&cache->mutex);
+    entry = word_mem_cache_find(&cache->hash, text_hash, style_hash);
+    ff_mutex_unlock(&cache->mutex);
+
+    return entry;
+}
+
+/**
+ * Thread-safe insert into shared cache.
+ * Makes a copy of the bitmap data.
+ */
+static void shared_cache_insert(SharedWordCache *cache,
+                                uint64_t text_hash, uint64_t style_hash,
+                                const WordBitmap *bitmap)
+{
+    if (!cache)
+        return;
+
+    ff_mutex_lock(&cache->mutex);
+    word_mem_cache_insert(&cache->hash, text_hash, style_hash, bitmap);
+    ff_mutex_unlock(&cache->mutex);
+}
+
+/**
+ * Get the cache directory from shared cache.
+ */
+static const char *shared_cache_get_dir(SharedWordCache *cache)
+{
+    return cache ? cache->cache_dir : NULL;
+}
+
+/* ==================== End Shared Word Cache Functions ==================== */
+
 /**
  * Try to load a cached word/line bitmap from disk.
  * Returns 0 on success (cache hit), -1 on miss/failure.
+ * Checks shared cache first if available, then local cache.
  */
 static int word_cache_try_load(AVFilterContext *ctx, DrawTextContext *s,
                                const char *text, int text_len,
@@ -1472,46 +1686,75 @@ static int word_cache_try_load(AVFilterContext *ctx, DrawTextContext *s,
     char path[512];
     uint64_t text_hash, style_hash;
     WordCacheEntry *mem_entry;
+    const char *cache_dir;
 
     text_hash = compute_text_hash(text, text_len);
     style_hash = compute_style_hash(s->fontsize, borderw,
                                     s->fontcolor.rgba, s->bordercolor.rgba);
 
-    /* Check in-memory cache first (fastest) */
-    mem_entry = word_mem_cache_find(&s->word_cache, text_hash, style_hash);
-    if (mem_entry && mem_entry->bitmap.buffer) {
-        /* Copy bitmap data to output */
-        word->width = mem_entry->bitmap.width;
-        word->height = mem_entry->bitmap.height;
-        word->pitch = mem_entry->bitmap.pitch;
-        word->left = mem_entry->bitmap.left;
-        word->top = mem_entry->bitmap.top;
-        word->advance = mem_entry->bitmap.advance;
+    /* Check shared cache first if available */
+    if (s->shared_cache) {
+        mem_entry = shared_cache_find(s->shared_cache, text_hash, style_hash);
+        if (mem_entry && mem_entry->bitmap.buffer) {
+            /* Copy bitmap data to output */
+            word->width = mem_entry->bitmap.width;
+            word->height = mem_entry->bitmap.height;
+            word->pitch = mem_entry->bitmap.pitch;
+            word->left = mem_entry->bitmap.left;
+            word->top = mem_entry->bitmap.top;
+            word->advance = mem_entry->bitmap.advance;
 
-        size_t buf_size = (size_t)word->height * word->pitch;
-        word->buffer = av_malloc(buf_size);
-        if (!word->buffer)
-            return -1;
-        memcpy(word->buffer, mem_entry->bitmap.buffer, buf_size);
+            size_t buf_size = (size_t)word->height * word->pitch;
+            word->buffer = av_malloc(buf_size);
+            if (!word->buffer)
+                return -1;
+            memcpy(word->buffer, mem_entry->bitmap.buffer, buf_size);
 
-        av_log(ctx, AV_LOG_DEBUG, "Word cache: memory hit text_hash=%016" PRIx64 " size=%dx%d\n",
-               text_hash, word->width, word->height);
-        return 0;
+            av_log(ctx, AV_LOG_DEBUG, "Word cache: shared memory hit text_hash=%016" PRIx64 " size=%dx%d\n",
+                   text_hash, word->width, word->height);
+            return 0;
+        }
+    } else {
+        /* Check local in-memory cache (fastest) */
+        mem_entry = word_mem_cache_find(&s->word_cache, text_hash, style_hash);
+        if (mem_entry && mem_entry->bitmap.buffer) {
+            /* Copy bitmap data to output */
+            word->width = mem_entry->bitmap.width;
+            word->height = mem_entry->bitmap.height;
+            word->pitch = mem_entry->bitmap.pitch;
+            word->left = mem_entry->bitmap.left;
+            word->top = mem_entry->bitmap.top;
+            word->advance = mem_entry->bitmap.advance;
+
+            size_t buf_size = (size_t)word->height * word->pitch;
+            word->buffer = av_malloc(buf_size);
+            if (!word->buffer)
+                return -1;
+            memcpy(word->buffer, mem_entry->bitmap.buffer, buf_size);
+
+            av_log(ctx, AV_LOG_DEBUG, "Word cache: memory hit text_hash=%016" PRIx64 " size=%dx%d\n",
+                   text_hash, word->width, word->height);
+            return 0;
+        }
     }
 
-    /* Check disk cache */
-    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
+    /* Check disk cache - use shared cache dir if available, else local */
+    cache_dir = s->shared_cache ? shared_cache_get_dir(s->shared_cache) : s->glyph_cache_dir;
+    if (!cache_dir || !s->glyph_cache_initialized)
         return -1;
 
-    if (build_word_cache_path(path, sizeof(path), s->glyph_cache_dir,
+    if (build_word_cache_path(path, sizeof(path), cache_dir,
                               s->font_hash, style_hash, text_hash) != 0)
         return -1;
 
     if (word_cache_read(path, word) == 0) {
         av_log(ctx, AV_LOG_DEBUG, "Word cache: disk hit text_hash=%016" PRIx64 " size=%dx%d\n",
                text_hash, word->width, word->height);
-        /* Promote to in-memory cache for faster future access */
-        word_mem_cache_insert(&s->word_cache, text_hash, style_hash, word);
+        /* Promote to in-memory cache (shared or local) for faster future access */
+        if (s->shared_cache)
+            shared_cache_insert(s->shared_cache, text_hash, style_hash, word);
+        else
+            word_mem_cache_insert(&s->word_cache, text_hash, style_hash, word);
         return 0;
     }
 
@@ -1519,7 +1762,8 @@ static int word_cache_try_load(AVFilterContext *ctx, DrawTextContext *s,
 }
 
 /**
- * Save a rendered word/line bitmap to disk cache.
+ * Save a rendered word/line bitmap to cache.
+ * Uses shared cache if available, otherwise local cache.
  */
 static void word_cache_save(AVFilterContext *ctx, DrawTextContext *s,
                             const char *text, int text_len,
@@ -1527,22 +1771,30 @@ static void word_cache_save(AVFilterContext *ctx, DrawTextContext *s,
 {
     char path[512];
     uint64_t text_hash, style_hash;
+    const char *cache_dir;
 
     text_hash = compute_text_hash(text, text_len);
     style_hash = compute_style_hash(s->fontsize, borderw,
                                     s->fontcolor.rgba, s->bordercolor.rgba);
 
-    /* Always add to in-memory cache */
-    word_mem_cache_insert(&s->word_cache, text_hash, style_hash, word);
-    av_log(ctx, AV_LOG_DEBUG, "Word cache: memory store text_hash=%016" PRIx64 " size=%dx%d (total=%d entries, %zu bytes)\n",
-           text_hash, word->width, word->height,
-           s->word_cache.entry_count, s->word_cache.total_bytes);
+    /* Add to in-memory cache (shared or local) */
+    if (s->shared_cache) {
+        shared_cache_insert(s->shared_cache, text_hash, style_hash, word);
+        av_log(ctx, AV_LOG_DEBUG, "Word cache: shared memory store text_hash=%016" PRIx64 " size=%dx%d\n",
+               text_hash, word->width, word->height);
+    } else {
+        word_mem_cache_insert(&s->word_cache, text_hash, style_hash, word);
+        av_log(ctx, AV_LOG_DEBUG, "Word cache: memory store text_hash=%016" PRIx64 " size=%dx%d (total=%d entries, %zu bytes)\n",
+               text_hash, word->width, word->height,
+               s->word_cache.entry_count, s->word_cache.total_bytes);
+    }
 
     /* Also save to disk cache if enabled */
-    if (!s->glyph_cache_dir || !s->glyph_cache_initialized)
+    cache_dir = s->shared_cache ? shared_cache_get_dir(s->shared_cache) : s->glyph_cache_dir;
+    if (!cache_dir || !s->glyph_cache_initialized)
         return;
 
-    if (build_word_cache_path(path, sizeof(path), s->glyph_cache_dir,
+    if (build_word_cache_path(path, sizeof(path), cache_dir,
                               s->font_hash, style_hash, text_hash) != 0)
         return;
 
@@ -2451,7 +2703,13 @@ static av_cold void uninit(AVFilterContext *ctx)
     s->canvas_w_pexpr = s->canvas_h_pexpr = s->canvas_x_pexpr = s->canvas_y_pexpr = NULL;
 
     glyph_hash_free(&s->glyph_hash);
-    word_mem_cache_free(&s->word_cache);
+
+    /* Free cache - shared or local */
+    if (s->shared_cache) {
+        shared_cache_unref(&s->shared_cache);
+    } else {
+        word_mem_cache_free(&s->word_cache);
+    }
 
     if (s->lines) {
         for (int l = 0; l < s->line_count; l++) {
@@ -2488,6 +2746,13 @@ static int config_input(AVFilterLink *inlink)
     DrawTextContext *s = ctx->priv;
     char *expr;
     int ret;
+
+    /* Check if a shared cache is available from the graph */
+    if (!s->shared_cache && ctx->graph && ctx->graph->opaque) {
+        s->shared_cache = ctx->graph->opaque;
+        shared_cache_ref(s->shared_cache);
+        av_log(ctx, AV_LOG_DEBUG, "Using shared glyph cache from graph\n");
+    }
 
     ret = ff_draw_init_from_link(&s->dc, inlink, FF_DRAW_PROCESS_ALPHA);
     if (ret < 0) {
