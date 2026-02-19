@@ -174,6 +174,17 @@ typedef struct HarfbuzzData {
     hb_glyph_position_t* glyph_pos;
 } HarfbuzzData;
 
+/** A segment of text for optimized expansion.
+ *  Static segments (no %{...}) are cached; dynamic segments are expanded each frame.
+ */
+typedef struct TextSegment {
+    const char *start;              ///< pointer to start of segment in source text
+    int len;                        ///< byte length of this segment
+    int is_dynamic;                 ///< 1 if contains %{...}, 0 if static
+    char *cached_expansion;         ///< cached expansion result (NULL if not cached)
+    int cached_len;                 ///< length of cached expansion
+} TextSegment;
+
 /** Information about a single glyph in a text line */
 typedef struct GlyphInfo {
     uint32_t code;                  ///< the glyph code point
@@ -368,7 +379,15 @@ typedef struct DrawTextContext {
     // Text expansion optimization: skip re-expanding static text
     int text_is_static;             ///< 1 if EXP_NORMAL produced identical output to input
     int text_static_checked_version;///< text_version when text_is_static was last evaluated
+
+    // Segmented text expansion: split text into static/dynamic segments
+    TextSegment *segments;          ///< array of text segments
+    int segment_count;              ///< number of segments
+    int segments_text_version;      ///< text_version when segments were parsed
 } DrawTextContext;
+
+// Forward declaration for segment cleanup
+static void free_segments(DrawTextContext *s);
 
 #define OFFSET(x) offsetof(DrawTextContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
@@ -1265,6 +1284,8 @@ static av_cold void uninit(AVFilterContext *ctx)
     }
     av_freep(&s->tab_clusters);
 
+    free_segments(s);
+
     hb_font_destroy(s->hb_font);
     s->hb_font = NULL;
     FT_Done_Face(s->face);
@@ -1655,6 +1676,244 @@ static void calculate_visible_lines(int line_count, int line_height64,
 }
 
 /**
+ * Free text segments array.
+ */
+static void free_segments(DrawTextContext *s)
+{
+    if (s->segments) {
+        for (int i = 0; i < s->segment_count; i++) {
+            av_freep(&s->segments[i].cached_expansion);
+        }
+        av_freep(&s->segments);
+    }
+    s->segment_count = 0;
+}
+
+/**
+ * Parse text into segments, separating static regions from dynamic %{...} regions.
+ * Static segments can be cached; dynamic segments must be expanded each frame.
+ *
+ * Text format: "static text %{func:args} more static %{func2} end"
+ * Produces segments: ["static text ", "%{func:args}", " more static ", "%{func2}", " end"]
+ */
+static int parse_text_segments(AVFilterContext *ctx)
+{
+    DrawTextContext *s = ctx->priv;
+    const char *text = (const char *)s->text;
+    const char *p = text;
+    const char *segment_start = text;
+    int segment_alloc = 16;
+    int in_escape = 0;
+
+    free_segments(s);
+
+    if (!text || !*text)
+        return 0;
+
+    s->segments = av_mallocz(segment_alloc * sizeof(TextSegment));
+    if (!s->segments)
+        return AVERROR(ENOMEM);
+
+    while (*p) {
+        if (in_escape) {
+            in_escape = 0;
+            p++;
+            continue;
+        }
+
+        if (*p == '\\' && p[1]) {
+            in_escape = 1;
+            p++;
+            continue;
+        }
+
+        if (*p == '%' && p[1] == '{') {
+            // End the current static segment (if any)
+            if (p > segment_start) {
+                if (s->segment_count >= segment_alloc) {
+                    segment_alloc *= 2;
+                    TextSegment *new_segs = av_realloc(s->segments, segment_alloc * sizeof(TextSegment));
+                    if (!new_segs) {
+                        free_segments(s);
+                        return AVERROR(ENOMEM);
+                    }
+                    s->segments = new_segs;
+                }
+                s->segments[s->segment_count].start = segment_start;
+                s->segments[s->segment_count].len = p - segment_start;
+                s->segments[s->segment_count].is_dynamic = 0;
+                s->segments[s->segment_count].cached_expansion = NULL;
+                s->segments[s->segment_count].cached_len = 0;
+                s->segment_count++;
+            }
+
+            // Find the end of the %{...} expression
+            const char *expr_start = p;
+            p += 2; // skip "%{"
+            int brace_depth = 1;
+            while (*p && brace_depth > 0) {
+                if (*p == '\\' && p[1]) {
+                    p += 2;
+                    continue;
+                }
+                if (*p == '{') brace_depth++;
+                else if (*p == '}') brace_depth--;
+                p++;
+            }
+
+            // Add the dynamic segment
+            if (s->segment_count >= segment_alloc) {
+                segment_alloc *= 2;
+                TextSegment *new_segs = av_realloc(s->segments, segment_alloc * sizeof(TextSegment));
+                if (!new_segs) {
+                    free_segments(s);
+                    return AVERROR(ENOMEM);
+                }
+                s->segments = new_segs;
+            }
+            s->segments[s->segment_count].start = expr_start;
+            s->segments[s->segment_count].len = p - expr_start;
+            s->segments[s->segment_count].is_dynamic = 1;
+            s->segments[s->segment_count].cached_expansion = NULL;
+            s->segments[s->segment_count].cached_len = 0;
+            s->segment_count++;
+
+            segment_start = p;
+            continue;
+        }
+
+        p++;
+    }
+
+    // Add final static segment (if any)
+    if (p > segment_start) {
+        if (s->segment_count >= segment_alloc) {
+            segment_alloc *= 2;
+            TextSegment *new_segs = av_realloc(s->segments, segment_alloc * sizeof(TextSegment));
+            if (!new_segs) {
+                free_segments(s);
+                return AVERROR(ENOMEM);
+            }
+            s->segments = new_segs;
+        }
+        s->segments[s->segment_count].start = segment_start;
+        s->segments[s->segment_count].len = p - segment_start;
+        s->segments[s->segment_count].is_dynamic = 0;
+        s->segments[s->segment_count].cached_expansion = NULL;
+        s->segments[s->segment_count].cached_len = 0;
+        s->segment_count++;
+    }
+
+    s->segments_text_version = s->text_version;
+
+    {
+        int dynamic_count = 0;
+        for (int i = 0; i < s->segment_count; i++)
+            dynamic_count += s->segments[i].is_dynamic;
+        av_log(ctx, AV_LOG_DEBUG, "Parsed %d text segments (%d static, %d dynamic)\n",
+               s->segment_count, s->segment_count - dynamic_count, dynamic_count);
+    }
+
+    return 0;
+}
+
+/**
+ * Expand text using segmented approach: static segments are cached,
+ * dynamic segments are expanded each frame.
+ */
+static int expand_text_segmented(AVFilterContext *ctx, AVBPrint *bp)
+{
+    DrawTextContext *s = ctx->priv;
+    int ret;
+    AVBPrint tmp_bp;
+
+    av_bprint_clear(bp);
+
+    // If no segments parsed yet or text changed, parse now
+    if (s->segments_text_version != s->text_version) {
+        if ((ret = parse_text_segments(ctx)) < 0)
+            return ret;
+    }
+
+    // If no segments, nothing to expand
+    if (!s->segments || s->segment_count == 0)
+        return 0;
+
+    av_bprint_init(&tmp_bp, 256, AV_BPRINT_SIZE_UNLIMITED);
+
+    for (int i = 0; i < s->segment_count; i++) {
+        TextSegment *seg = &s->segments[i];
+
+        if (!seg->is_dynamic) {
+            // Static segment: use cached expansion or expand once
+            if (!seg->cached_expansion) {
+                // Expand the static segment once (handles escape sequences)
+                char *seg_text = av_strndup(seg->start, seg->len);
+                if (!seg_text) {
+                    av_bprint_finalize(&tmp_bp, NULL);
+                    return AVERROR(ENOMEM);
+                }
+
+                av_bprint_clear(&tmp_bp);
+                // Process escape sequences only (no %{} in static segments)
+                const char *p = seg_text;
+                while (*p) {
+                    if (*p == '\\' && p[1]) {
+                        av_bprint_chars(&tmp_bp, p[1], 1);
+                        p += 2;
+                    } else {
+                        av_bprint_chars(&tmp_bp, *p, 1);
+                        p++;
+                    }
+                }
+                av_free(seg_text);
+
+                if (!av_bprint_is_complete(&tmp_bp)) {
+                    av_bprint_finalize(&tmp_bp, NULL);
+                    return AVERROR(ENOMEM);
+                }
+
+                seg->cached_expansion = av_strdup(tmp_bp.str);
+                seg->cached_len = tmp_bp.len;
+                if (!seg->cached_expansion) {
+                    av_bprint_finalize(&tmp_bp, NULL);
+                    return AVERROR(ENOMEM);
+                }
+            }
+
+            // Append cached result
+            av_bprint_append_data(bp, seg->cached_expansion, seg->cached_len);
+        } else {
+            // Dynamic segment: expand each frame
+            char *seg_text = av_strndup(seg->start, seg->len);
+            if (!seg_text) {
+                av_bprint_finalize(&tmp_bp, NULL);
+                return AVERROR(ENOMEM);
+            }
+
+            av_bprint_clear(&tmp_bp);
+            ret = ff_expand_text(&s->expand_text, seg_text, &tmp_bp);
+            av_free(seg_text);
+
+            if (ret < 0) {
+                av_bprint_finalize(&tmp_bp, NULL);
+                return ret;
+            }
+
+            // Append expanded result
+            av_bprint_append_data(bp, tmp_bp.str, tmp_bp.len);
+        }
+    }
+
+    av_bprint_finalize(&tmp_bp, NULL);
+
+    if (!av_bprint_is_complete(bp))
+        return AVERROR(ENOMEM);
+
+    return 0;
+}
+
+/**
  * Count lines and tabs in text without doing expensive shaping.
  * Stores line boundaries (text_start, text_len) in pre-allocated lines array.
  * Returns line count and tab count for preliminary height calculation.
@@ -2023,12 +2282,12 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     t_start = av_gettime_relative();
 
     // Optimization: Skip text expansion when text is unchanged and static.
-    // This avoids copying multi-MB text files every frame (~11ms -> 0).
-    // For EXP_NORMAL, we check on first use whether the text contains any %{...}
-    // expressions; if not, we treat it like EXP_NONE.
+    // For EXP_NONE, skip if text hasn't changed.
+    // For EXP_NORMAL with dynamic expressions, use segmented expansion which
+    // caches static portions and only re-expands dynamic %{...} portions.
     int skip_expand = 0;
 
-    // Check if we can skip expansion
+    // Check if we can skip expansion entirely (fully static text)
     if (!s->tc_opt_string && s->lines_text_version == s->text_version && bp->len > 0) {
         if (s->exp_mode == EXP_NONE) {
             skip_expand = 1;
@@ -2040,25 +2299,34 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     }
 
     if (!skip_expand) {
-        av_bprint_clear(bp);
-
         if (s->basetime != AV_NOPTS_VALUE)
             now= frame->pts*av_q2d(ctx->inputs[0]->time_base) + s->basetime/1000000;
 
         switch (s->exp_mode) {
         case EXP_NONE:
+            av_bprint_clear(bp);
             av_bprintf(bp, "%s", s->text);
             break;
         case EXP_NORMAL:
-            if ((ret = ff_expand_text(&s->expand_text, s->text, &s->expanded_text)) < 0)
+            // Use segmented expansion: caches static text, only expands dynamic %{...}
+            if ((ret = expand_text_segmented(ctx, bp)) < 0)
                 return ret;
-            // Check if text is static (no expressions expanded)
+            // Check if text is fully static (no dynamic segments)
             if (s->text_static_checked_version != s->text_version) {
-                s->text_is_static = (bp->len == strlen((char *)s->text) &&
-                                     memcmp(bp->str, s->text, bp->len) == 0);
+                int has_dynamic = 0;
+                for (int i = 0; i < s->segment_count; i++) {
+                    if (s->segments[i].is_dynamic) {
+                        has_dynamic = 1;
+                        break;
+                    }
+                }
+                s->text_is_static = !has_dynamic;
                 s->text_static_checked_version = s->text_version;
                 if (s->text_is_static)
-                    av_log(ctx, AV_LOG_DEBUG, "Text is static, will cache expansion\n");
+                    av_log(ctx, AV_LOG_DEBUG, "Text is fully static, will skip expansion\n");
+                else
+                    av_log(ctx, AV_LOG_DEBUG, "Text has %d segments, using segmented expansion\n",
+                           s->segment_count);
             }
             break;
         case EXP_STRFTIME:
