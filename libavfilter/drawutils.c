@@ -65,6 +65,10 @@ static void blend_line16_luma_avx2(uint16_t *dst, unsigned src, unsigned alpha,
     int x = 0;
 
     for (; x <= w - 8; x += 8) {
+        /* Skip fully transparent 8-pixel blocks */
+        uint64_t m8 = *(const uint64_t *)(mask + xm + x);
+        if (!m8)
+            continue;
         __m256i v32  = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(dst + x)));
         __m256i m32  = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(mask + xm + x)));
         __m256i a32  = _mm256_mullo_epi32(m32, valpha);
@@ -78,14 +82,20 @@ static void blend_line16_luma_avx2(uint16_t *dst, unsigned src, unsigned alpha,
         _mm_storeu_si128((__m128i *)(dst + x), out);
     }
     if (x <= w - 4) {
-        __m128i v32 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(dst + x)));
-        __m128i m32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int *)(mask + xm + x)));
-        __m128i a32 = _mm_mullo_epi32(m32, valpha4);
-        BLEND4_SSE(dst + x, vsrc4, valpha4, v10001_4, v32, a32);
+        uint32_t m4 = *(const uint32_t *)(mask + xm + x);
+        if (m4) {
+            __m128i v32 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(dst + x)));
+            __m128i m32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(m4));
+            __m128i a32 = _mm_mullo_epi32(m32, valpha4);
+            BLEND4_SSE(dst + x, vsrc4, valpha4, v10001_4, v32, a32);
+        }
         x += 4;
     }
     for (; x < w; x++) {
-        unsigned a = mask[xm + x] * alpha;
+        uint8_t m1 = mask[xm + x];
+        if (!m1)
+            continue;
+        unsigned a = m1 * alpha;
         unsigned v = dst[x];
         dst[x] = ((0x10001 - a) * v + a * src) >> 16;
     }
@@ -109,8 +119,11 @@ static void blend_line16_chroma422_avx2(uint16_t *dst, unsigned src, unsigned al
     int x = 0;
 
     for (; x <= w - 8; x += 8) {
-        /* Sum adjacent mask byte pairs: _mm_maddubs_epi16 with coeff=1 */
+        /* Skip fully transparent 8-pixel blocks (16 mask bytes for chroma) */
         __m128i m16b = _mm_loadu_si128((const __m128i *)(mask + xm + x * 2));
+        if (_mm_testz_si128(m16b, m16b))
+            continue;
+        /* Sum adjacent mask byte pairs: _mm_maddubs_epi16 with coeff=1 */
         __m128i sums = _mm_maddubs_epi16(m16b, ones8);   /* 8 x uint16 sums */
         __m256i s32  = _mm256_cvtepu16_epi32(sums);
         /* a = (sum >> 1) * alpha */
@@ -126,17 +139,23 @@ static void blend_line16_chroma422_avx2(uint16_t *dst, unsigned src, unsigned al
         _mm_storeu_si128((__m128i *)(dst + x), out);
     }
     if (x <= w - 4) {
-        /* 4-pixel SSE4.1 path for chroma remainder */
-        __m128i m8b  = _mm_loadl_epi64((const __m128i *)(mask + xm + x * 2));
-        __m128i sums = _mm_maddubs_epi16(m8b, ones8);    /* 4 x uint16 sums (lo 64 bits) */
-        __m128i s32  = _mm_cvtepu16_epi32(sums);
-        __m128i a32  = _mm_mullo_epi32(_mm_srli_epi32(s32, 1), valpha4);
-        __m128i v32  = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(dst + x)));
-        BLEND4_SSE(dst + x, vsrc4, valpha4, v10001_4, v32, a32);
+        /* 4-pixel SSE4.1 path for chroma remainder (8 mask bytes) */
+        uint64_t m8 = *(const uint64_t *)(mask + xm + x * 2);
+        if (m8) {
+            __m128i m8b  = _mm_loadl_epi64((const __m128i *)(mask + xm + x * 2));
+            __m128i sums = _mm_maddubs_epi16(m8b, ones8);    /* 4 x uint16 sums (lo 64 bits) */
+            __m128i s32  = _mm_cvtepu16_epi32(sums);
+            __m128i a32  = _mm_mullo_epi32(_mm_srli_epi32(s32, 1), valpha4);
+            __m128i v32  = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(dst + x)));
+            BLEND4_SSE(dst + x, vsrc4, valpha4, v10001_4, v32, a32);
+        }
         x += 4;
     }
     for (; x < w; x++) {
-        unsigned t = mask[xm + x*2] + mask[xm + x*2 + 1];
+        uint8_t m0 = mask[xm + x*2], m1 = mask[xm + x*2 + 1];
+        if (!(m0 | m1))
+            continue;
+        unsigned t = m0 + m1;
         unsigned a = (t >> 1) * alpha;
         unsigned v = dst[x];
         dst[x] = ((0x10001 - a) * v + a * src) >> 16;
@@ -161,8 +180,12 @@ static void blend_line16_luma_avx512(uint16_t *dst, unsigned src, unsigned alpha
     int x = 0;
 
     for (; x <= w - 16; x += 16) {
+        /* Skip fully transparent 16-pixel blocks */
+        __m128i m16 = _mm_loadu_si128((const __m128i *)(mask + xm + x));
+        if (_mm_testz_si128(m16, m16))
+            continue;
         __m512i v32 = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(dst + x)));
-        __m512i m32 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(mask + xm + x)));
+        __m512i m32 = _mm512_cvtepu8_epi32(m16);
         __m512i a32 = _mm512_mullo_epi32(m32, valpha512);
         __m512i tau = _mm512_sub_epi32(v10001_512, a32);
         __m512i res = _mm512_srli_epi32(
@@ -172,6 +195,10 @@ static void blend_line16_luma_avx512(uint16_t *dst, unsigned src, unsigned alpha
         _mm256_storeu_si256((__m256i *)(dst + x), _mm512_cvtusepi32_epi16(res));
     }
     for (; x <= w - 8; x += 8) {
+        /* Skip fully transparent 8-pixel blocks */
+        uint64_t m8 = *(const uint64_t *)(mask + xm + x);
+        if (!m8)
+            continue;
         __m256i v32 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(dst + x)));
         __m256i m32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(mask + xm + x)));
         __m256i a32 = _mm256_mullo_epi32(m32, valpha256);
@@ -185,7 +212,10 @@ static void blend_line16_luma_avx512(uint16_t *dst, unsigned src, unsigned alpha
                                           _mm256_extracti128_si256(res, 1)));
     }
     for (; x < w; x++) {
-        unsigned a = mask[xm + x] * alpha;
+        uint8_t m1 = mask[xm + x];
+        if (!m1)
+            continue;
+        unsigned a = m1 * alpha;
         unsigned v = dst[x];
         dst[x] = ((0x10001 - a) * v + a * src) >> 16;
     }
@@ -206,8 +236,11 @@ static void blend_line16_chroma422_avx512(uint16_t *dst, unsigned src, unsigned 
     int x = 0;
 
     for (; x <= w - 16; x += 16) {
-        /* Sum 32 adjacent mask byte pairs → 16 uint16 sums */
+        /* Skip fully transparent 16-pixel blocks (32 mask bytes for chroma) */
         __m256i m32b = _mm256_loadu_si256((const __m256i *)(mask + xm + x * 2));
+        if (_mm256_testz_si256(m32b, m32b))
+            continue;
+        /* Sum 32 adjacent mask byte pairs → 16 uint16 sums */
         __m256i sums = _mm256_maddubs_epi16(m32b, ones8_256);  /* 16 x uint16 */
         __m512i s32  = _mm512_cvtepu16_epi32(sums);
         __m512i a32  = _mm512_mullo_epi32(_mm512_srli_epi32(s32, 1), valpha512);
@@ -220,7 +253,10 @@ static void blend_line16_chroma422_avx512(uint16_t *dst, unsigned src, unsigned 
         _mm256_storeu_si256((__m256i *)(dst + x), _mm512_cvtusepi32_epi16(res));
     }
     for (; x <= w - 8; x += 8) {
+        /* Skip fully transparent 8-pixel blocks (16 mask bytes for chroma) */
         __m128i m16b = _mm_loadu_si128((const __m128i *)(mask + xm + x * 2));
+        if (_mm_testz_si128(m16b, m16b))
+            continue;
         __m128i sums = _mm_maddubs_epi16(m16b, ones8_128);
         __m256i s32  = _mm256_cvtepu16_epi32(sums);
         __m256i a32  = _mm256_mullo_epi32(_mm256_srli_epi32(s32, 1), valpha256);
@@ -235,7 +271,10 @@ static void blend_line16_chroma422_avx512(uint16_t *dst, unsigned src, unsigned 
                                           _mm256_extracti128_si256(res, 1)));
     }
     for (; x < w; x++) {
-        unsigned t = mask[xm + x*2] + mask[xm + x*2 + 1];
+        uint8_t m0 = mask[xm + x*2], m1 = mask[xm + x*2 + 1];
+        if (!(m0 | m1))
+            continue;
+        unsigned t = m0 + m1;
         unsigned a = (t >> 1) * alpha;
         unsigned v = dst[x];
         dst[x] = ((0x10001 - a) * v + a * src) >> 16;
@@ -683,7 +722,7 @@ static void blend_pixel16(uint8_t *dst, unsigned src, unsigned alpha,
     unsigned xmmod = 7 >> l2depth;
     unsigned mbits = (1 << (1 << l2depth)) - 1;
     unsigned mmult = 255 / mbits;
-    uint16_t value = AV_RL16(dst);
+    uint16_t value;
 
     for (unsigned y = 0; y < h; y++) {
         unsigned xm = xm0;
@@ -695,6 +734,9 @@ static void blend_pixel16(uint8_t *dst, unsigned src, unsigned alpha,
         mask += mask_linesize;
     }
     alpha = (t >> shift) * alpha;
+    if (!alpha)
+        return;
+    value = AV_RL16(dst);
     AV_WL16(dst, ((0x10001 - alpha) * value + alpha * src) >> 16);
 }
 
@@ -718,6 +760,8 @@ static void blend_pixel(uint8_t *dst, unsigned src, unsigned alpha,
         mask += mask_linesize;
     }
     alpha = (t >> shift) * alpha;
+    if (!alpha)
+        return;
     *dst = ((0x1010101 - alpha) * *dst + alpha * src) >> 24;
 }
 
