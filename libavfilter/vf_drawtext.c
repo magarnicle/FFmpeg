@@ -1411,12 +1411,21 @@ static void harfbuzz_warmup(hb_font_t *hb_font);
 static inline int get_subpixel_idx(int shift_x64, int shift_y64);
 
 /**
- * Render a text line to a WordBitmap by compositing all glyph bitmaps.
+ * Render a range of glyphs to a WordBitmap by compositing their bitmaps.
  * The bitmap is grayscale (8-bit alpha mask).
- * Returns 0 on success, negative on failure.
+ *
+ * @param s         DrawText context
+ * @param glyphs    Array of glyph info
+ * @param start     Start index in glyphs array
+ * @param count     Number of glyphs to render
+ * @param x_offset  X offset to subtract from glyph positions (for word-relative coords)
+ * @param borderw   Border width (0 for regular, >0 for border glyphs)
+ * @param out       Output bitmap
+ * @return 0 on success, negative on failure
  */
-static int render_line_to_bitmap(DrawTextContext *s, TextLine *line,
-                                 int borderw, WordBitmap *out)
+static int render_glyphs_to_bitmap(DrawTextContext *s, GlyphInfo *glyphs,
+                                   int start, int count, int x_offset,
+                                   int borderw, WordBitmap *out)
 {
     int min_x = INT_MAX, max_x = INT_MIN;
     int min_y = INT_MAX, max_y = INT_MIN;
@@ -1424,15 +1433,16 @@ static int render_line_to_bitmap(DrawTextContext *s, TextLine *line,
     Glyph *glyph;
     FT_BitmapGlyph b_glyph;
     GlyphInfo *info;
+    int advance = 0;
 
     memset(out, 0, sizeof(*out));
 
-    if (!line->is_shaped || line->hb_data.glyph_count == 0)
+    if (count <= 0)
         return 0;
 
     /* First pass: compute bounding box */
-    for (g = 0; g < line->hb_data.glyph_count; g++) {
-        info = &line->glyphs[g];
+    for (g = start; g < start + count; g++) {
+        info = &glyphs[g];
         glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
         if (!glyph)
             continue;
@@ -1442,7 +1452,7 @@ static int render_line_to_bitmap(DrawTextContext *s, TextLine *line,
         if (!b_glyph)
             continue;
 
-        x = info->x + b_glyph->left;
+        x = info->x - x_offset + b_glyph->left;
         y = info->y - b_glyph->top;
 
         min_x = FFMIN(min_x, x);
@@ -1451,23 +1461,38 @@ static int render_line_to_bitmap(DrawTextContext *s, TextLine *line,
         max_y = FFMAX(max_y, y + (int)b_glyph->bitmap.rows);
     }
 
+    /* Calculate advance (distance to next word) */
+    if (count > 0) {
+        GlyphInfo *last = &glyphs[start + count - 1];
+        GlyphInfo *first = &glyphs[start];
+        advance = last->x - first->x;
+        /* Add the width of the last glyph */
+        glyph = glyph_hash_find(&s->glyph_hash, last->code, s->fontsize);
+        if (glyph) {
+            idx = get_subpixel_idx(last->shift_x64, last->shift_y64);
+            b_glyph = borderw ? glyph->border_bglyph[idx] : glyph->bglyph[idx];
+            if (b_glyph)
+                advance += b_glyph->bitmap.width + b_glyph->left;
+        }
+    }
+
     if (min_x >= max_x || min_y >= max_y)
-        return 0;  /* Empty line */
+        return 0;  /* Empty word */
 
     out->width = max_x - min_x;
     out->height = max_y - min_y;
     out->pitch = out->width;  /* 8-bit grayscale, no padding */
     out->left = min_x;
     out->top = -min_y;  /* Convert to top bearing */
-    out->advance = line->width64 >> 6;
+    out->advance = advance;
 
     out->buffer = av_mallocz((size_t)out->height * out->pitch);
     if (!out->buffer)
         return AVERROR(ENOMEM);
 
     /* Second pass: composite glyphs into bitmap */
-    for (g = 0; g < line->hb_data.glyph_count; g++) {
-        info = &line->glyphs[g];
+    for (g = start; g < start + count; g++) {
+        info = &glyphs[g];
         glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
         if (!glyph)
             continue;
@@ -1477,7 +1502,7 @@ static int render_line_to_bitmap(DrawTextContext *s, TextLine *line,
         if (!b_glyph || b_glyph->bitmap.width == 0 || b_glyph->bitmap.rows == 0)
             continue;
 
-        int gx = info->x + b_glyph->left - min_x;
+        int gx = info->x - x_offset + b_glyph->left - min_x;
         int gy = info->y - b_glyph->top - min_y;
         FT_Bitmap *bmp = &b_glyph->bitmap;
 
@@ -2529,63 +2554,158 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     for (tile_x = tile_x_start; tile_x <= tile_x_end; ++tile_x) {
     for (l = l_start; l <= l_end; ++l) {
         TextLine *line = &s->lines[l];
-        WordBitmap line_cache = {0};
-        int cache_hit = 0;
 
         /* Skip lines that weren't shaped (viewport optimization) */
         if (!line->is_shaped || line->glyphs == NULL) {
             continue;
         }
 
-        /* Try to load line from word cache */
-        if (line->text_start && line->text_len > 0) {
-            cache_hit = (word_cache_try_load(ctx, s, line->text_start, line->text_len,
-                                             borderw, &line_cache) == 0);
-        }
+        line_w = line->width_px;
 
-        if (cache_hit && line_cache.buffer) {
-            /* Cache hit - blit the cached line bitmap */
-            int lx = x + line_cache.left;
-            int ly = y - line_cache.top + offset_y;
-
-            if (use_canvas) {
-                lx -= canvas_x;
-                ly -= canvas_y;
-                if (canvas_tile) {
-                    lx += tile_x * tile_w;
-                    ly += tile_y * tile_h;
-                }
-            }
+        /* Word-level caching: iterate over words in the line */
+        if (line->text_start && line->text_len > 0 && s->glyph_cache_dir && s->glyph_cache_initialized) {
+            const char *text = line->text_start;
+            int text_len = line->text_len;
+            int word_start_char = 0;  /* character index of word start */
+            int word_start_glyph = 0; /* glyph index of word start */
+            int glyph_idx = 0;
+            int base_x_offset = 0;    /* alignment offset */
 
             if (j_left && j_right) {
-                lx += (s->box_width - line->width_px) / 2;
+                base_x_offset = (s->box_width - line_w) / 2;
             } else if (j_right) {
-                lx += s->box_width - line->width_px;
+                base_x_offset = s->box_width - line_w;
             }
 
-            /* Clip and blit */
-            int cdx = 0, cdy = 0;
-            int cw = line_cache.width, ch = line_cache.height;
-            if (lx < metrics->rect_x - s->bb_left) {
-                cdx = metrics->rect_x - s->bb_left - lx;
-                lx = metrics->rect_x - s->bb_left;
+            /* Find words by scanning for spaces */
+            for (int char_idx = 0; char_idx <= text_len; char_idx++) {
+                int is_end = (char_idx == text_len);
+                int is_space = !is_end && (text[char_idx] == ' ' || text[char_idx] == '\t');
+
+                if (is_space || is_end) {
+                    int word_len = char_idx - word_start_char;
+
+                    if (word_len > 0) {
+                        /* Find glyph range for this word using cluster indices */
+                        int word_end_glyph = word_start_glyph;
+                        while (word_end_glyph < line->hb_data.glyph_count) {
+                            hb_glyph_info_t *hb_info = &line->hb_data.glyph_info[word_end_glyph];
+                            if ((int)hb_info->cluster >= line->cluster_offset + char_idx)
+                                break;
+                            word_end_glyph++;
+                        }
+
+                        int glyph_count = word_end_glyph - word_start_glyph;
+                        if (glyph_count > 0) {
+                            WordBitmap word_cache = {0};
+                            int word_x_offset = (word_start_glyph > 0) ? line->glyphs[word_start_glyph].x : 0;
+                            int cache_hit = (word_cache_try_load(ctx, s, text + word_start_char, word_len,
+                                                                 borderw, &word_cache) == 0);
+
+                            if (cache_hit && word_cache.buffer) {
+                                /* Cache hit - blit cached word */
+                                av_log(ctx, AV_LOG_DEBUG, "Word cache HIT: '%.*s' (%dx%d)\n",
+                                       word_len, text + word_start_char, word_cache.width, word_cache.height);
+                                int wx = x + word_x_offset + word_cache.left + base_x_offset;
+                                int wy = y - word_cache.top + offset_y;
+
+                                if (use_canvas) {
+                                    wx -= canvas_x;
+                                    wy -= canvas_y;
+                                    if (canvas_tile) {
+                                        wx += tile_x * tile_w;
+                                        wy += tile_y * tile_h;
+                                    }
+                                }
+
+                                int wdx = 0, wdy = 0;
+                                int ww = word_cache.width, wh = word_cache.height;
+                                if (wx < metrics->rect_x - s->bb_left) {
+                                    wdx = metrics->rect_x - s->bb_left - wx;
+                                    wx = metrics->rect_x - s->bb_left;
+                                }
+                                if (wy < metrics->rect_y - s->bb_top) {
+                                    wdy = metrics->rect_y - s->bb_top - wy;
+                                    wy = metrics->rect_y - s->bb_top;
+                                }
+                                if (wdx < ww && wdy < wh && wx < clip_x && wy < clip_y) {
+                                    ww = FFMIN(clip_x - wx, ww - wdx);
+                                    wh = FFMIN(clip_y - wy, wh - wdy);
+                                    ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
+                                                  word_cache.buffer + wdy * word_cache.pitch + wdx,
+                                                  word_cache.pitch, ww, wh, 3, 0, wx, wy);
+                                }
+                                word_bitmap_free(&word_cache);
+                            } else {
+                                /* Cache miss - render glyphs and save to cache */
+                                av_log(ctx, AV_LOG_DEBUG, "Word cache MISS: '%.*s' (glyphs=%d)\n",
+                                       word_len, text + word_start_char, glyph_count);
+                                for (int wg = word_start_glyph; wg < word_end_glyph; wg++) {
+                                    GlyphInfo *winfo = &line->glyphs[wg];
+                                    Glyph *wglyph = glyph_hash_find(&s->glyph_hash, winfo->code, s->fontsize);
+                                    if (!wglyph) continue;
+
+                                    int widx = get_subpixel_idx(winfo->shift_x64, winfo->shift_y64);
+                                    FT_BitmapGlyph wb_glyph = borderw ? wglyph->border_bglyph[widx] : wglyph->bglyph[widx];
+                                    if (!wb_glyph) continue;
+
+                                    FT_Bitmap wbitmap = wb_glyph->bitmap;
+                                    int wx1 = x + winfo->x + wb_glyph->left + base_x_offset;
+                                    int wy1 = y + winfo->y - wb_glyph->top + offset_y;
+
+                                    if (use_canvas) {
+                                        wx1 -= canvas_x;
+                                        wy1 -= canvas_y;
+                                        if (canvas_tile) {
+                                            wx1 += tile_x * tile_w;
+                                            wy1 += tile_y * tile_h;
+                                        }
+                                    }
+
+                                    int ww1 = wbitmap.width, wh1 = wbitmap.rows;
+                                    int wdx1 = 0, wdy1 = 0;
+                                    if (wx1 < metrics->rect_x - s->bb_left) {
+                                        wdx1 = metrics->rect_x - s->bb_left - wx1;
+                                        wx1 = metrics->rect_x - s->bb_left;
+                                    }
+                                    if (wy1 < metrics->rect_y - s->bb_top) {
+                                        wdy1 = metrics->rect_y - s->bb_top - wy1;
+                                        wy1 = metrics->rect_y - s->bb_top;
+                                    }
+                                    if (wdx1 < ww1 && wdy1 < wh1 && wx1 < clip_x && wy1 < clip_y) {
+                                        int wpdx = wdx1 + wdy1 * wbitmap.pitch;
+                                        ww1 = FFMIN(clip_x - wx1, ww1 - wdx1);
+                                        wh1 = FFMIN(clip_y - wy1, wh1 - wdy1);
+                                        ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
+                                                      wbitmap.buffer + wpdx, wbitmap.pitch, ww1, wh1, 3, 0, wx1, wy1);
+                                    }
+                                }
+
+                                /* Save word to cache */
+                                WordBitmap save_bmp = {0};
+                                if (render_glyphs_to_bitmap(s, line->glyphs, word_start_glyph, glyph_count,
+                                                           word_x_offset, borderw, &save_bmp) == 0 && save_bmp.buffer) {
+                                    word_cache_save(ctx, s, text + word_start_char, word_len, borderw, &save_bmp);
+                                    word_bitmap_free(&save_bmp);
+                                }
+                            }
+                        }
+                        word_start_glyph = word_end_glyph;
+                    }
+                    word_start_char = char_idx + 1;
+                    /* Skip past space glyphs */
+                    while (word_start_glyph < line->hb_data.glyph_count) {
+                        hb_glyph_info_t *hb_info = &line->hb_data.glyph_info[word_start_glyph];
+                        if ((int)hb_info->cluster >= line->cluster_offset + word_start_char)
+                            break;
+                        word_start_glyph++;
+                    }
+                }
             }
-            if (ly < metrics->rect_y - s->bb_top) {
-                cdy = metrics->rect_y - s->bb_top - ly;
-                ly = metrics->rect_y - s->bb_top;
-            }
-            if (cdx < cw && cdy < ch && lx < clip_x && ly < clip_y) {
-                cw = FFMIN(clip_x - lx, cw - cdx);
-                ch = FFMIN(clip_y - ly, ch - cdy);
-                ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
-                              line_cache.buffer + cdy * line_cache.pitch + cdx,
-                              line_cache.pitch, cw, ch, 3, 0, lx, ly);
-            }
-            word_bitmap_free(&line_cache);
-            continue;  /* Skip per-glyph rendering */
+            continue;  /* Skip legacy per-glyph loop */
         }
 
-        line_w = line->width_px;
+        /* Fallback: per-glyph rendering when caching is disabled */
         for (g = 0; g < line->hb_data.glyph_count; ++g) {
             info = &line->glyphs[g];
             glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
@@ -2640,16 +2760,6 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
 
             ff_blend_mask(&s->dc, color, frame->data, frame->linesize, clip_x, clip_y,
                 bitmap.buffer + pdx, bitmap.pitch, w1, h1, 3, 0, x1, y1);
-        }
-
-        /* Cache miss - save rendered line to cache for future use */
-        if (!cache_hit && line->text_start && line->text_len > 0 &&
-            s->glyph_cache_dir && s->glyph_cache_initialized) {
-            WordBitmap save_bmp = {0};
-            if (render_line_to_bitmap(s, line, borderw, &save_bmp) == 0 && save_bmp.buffer) {
-                word_cache_save(ctx, s, line->text_start, line->text_len, borderw, &save_bmp);
-                word_bitmap_free(&save_bmp);
-            }
         }
     }
     }
