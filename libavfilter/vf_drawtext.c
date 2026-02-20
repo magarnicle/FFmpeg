@@ -1517,6 +1517,24 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
         l_end   = s->prev_last_visible_line;
     }
 
+    // For horizontal viewport optimization: calculate the x range of visible glyphs.
+    // We use max_glyph_w as a conservative margin since we don't know exact glyph
+    // widths until after the hash lookup. For centered/right-aligned text, we add
+    // box_width to account for the alignment offset (which depends on line width).
+    // Note: alignment offset is only applied when j_right is set (right or center align).
+    int glyph_margin = s->max_glyph_w > 0 ? s->max_glyph_w : s->fontsize;
+    int align_margin = j_right ? s->box_width : 0;
+    int total_margin = glyph_margin + align_margin;
+    int visible_x_min = 0, visible_x_max = INT_MAX;
+    int use_horiz_culling = use_canvas && !canvas_tile;
+    if (use_horiz_culling) {
+        // Glyph screen position is: x + info->x - canvas_x (plus bearing and alignment offset)
+        // Visible when screen position is in [0, canvas_w]
+        // So info->x must be in [canvas_x - x - margin, canvas_x - x + canvas_w + margin]
+        visible_x_min = canvas_x - x - total_margin;
+        visible_x_max = canvas_x - x + canvas_w + total_margin;
+    }
+
     for (tile_y = tile_y_start; tile_y <= tile_y_end; ++tile_y) {
     for (tile_x = tile_x_start; tile_x <= tile_x_end; ++tile_x) {
     for (l = l_start; l <= l_end; ++l) {
@@ -1528,9 +1546,41 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
         }
 
         line_w = line->width_px;
-        for (g = 0; g < line->hb_data.glyph_count; ++g) {
-            int64_t t_hash_start = av_gettime_relative();
+
+        // Binary search to find the first potentially visible glyph
+        int g_start = 0;
+        int g_end = line->hb_data.glyph_count;
+        int glyph_count_line = line->hb_data.glyph_count;
+        if (use_horiz_culling && glyph_count_line > 0) {
+            // Binary search for first glyph with x >= visible_x_min
+            int lo = 0, hi = glyph_count_line;
+            while (lo < hi) {
+                int mid = lo + (hi - lo) / 2;
+                if (line->glyphs[mid].x < visible_x_min)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            g_start = lo;
+            // Binary search for first glyph with x > visible_x_max
+            lo = g_start;
+            hi = glyph_count_line;
+            while (lo < hi) {
+                int mid = lo + (hi - lo) / 2;
+                if (line->glyphs[mid].x <= visible_x_max)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            g_end = lo;
+            av_log(ctx, AV_LOG_DEBUG,
+                   "Horiz culling: canvas_x=%d visible_x=[%d,%d] glyphs=%d->%d of %d\n",
+                   canvas_x, visible_x_min, visible_x_max, g_start, g_end, glyph_count_line);
+        }
+
+        for (g = g_start; g < g_end; ++g) {
             info = &line->glyphs[g];
+            int64_t t_hash_start = av_gettime_relative();
             glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
             if (!glyph) {
                 return AVERROR(EINVAL);
