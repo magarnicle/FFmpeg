@@ -224,6 +224,9 @@ typedef struct TextSegment {
     int cached_len;                 ///< length of cached expansion
 } TextSegment;
 
+/** Forward declaration for Glyph caching */
+struct Glyph;
+
 /** Information about a single glyph in a text line */
 typedef struct GlyphInfo {
     uint32_t code;                  ///< the glyph code point
@@ -231,6 +234,8 @@ typedef struct GlyphInfo {
     int y;                          ///< the y position of the glyph
     int shift_x64;                  ///< the horizontal shift of the glyph in 26.6 units
     int shift_y64;                  ///< the vertical shift of the glyph in 26.6 units
+    struct Glyph *glyph;            ///< cached glyph pointer (avoids hash lookup in draw_glyphs)
+    int subpixel_idx;               ///< cached subpixel index
 } GlyphInfo;
 
 /** Information about a single line of text */
@@ -1503,7 +1508,7 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
     int g, l, x1, y1, w1, h1, idx;
     int dx = 0, dy = 0, pdx = 0;
     GlyphInfo *info;
-    Glyph dummy = { 0 }, *glyph;
+    Glyph *glyph;
     FT_Bitmap bitmap;
     FT_BitmapGlyph b_glyph;
     uint8_t j_left = 0, j_right = 0, j_top = 0, j_bottom = 0;
@@ -1618,12 +1623,12 @@ static int draw_glyphs(AVFilterContext *ctx, AVFrame *frame,
 
         for (g = g_start; g < g_end; ++g) {
             info = &line->glyphs[g];
-            glyph = glyph_hash_find(&s->glyph_hash, info->code, s->fontsize);
+            glyph = info->glyph;
             if (!glyph) {
                 return AVERROR(EINVAL);
             }
 
-            idx = get_subpixel_idx(info->shift_x64, info->shift_y64);
+            idx = info->subpixel_idx;
             b_glyph = borderw ? glyph->border_bglyph[idx] : glyph->bglyph[idx];
             bitmap = b_glyph->bitmap;
             x1 = x + info->x + b_glyph->left;
@@ -2699,6 +2704,8 @@ continue_count1:
             g_info->y = ((y64 + true_y) >> 6) + (shift_y64 > 0 ? 1 : 0);
             g_info->shift_x64 = shift_x64;
             g_info->shift_y64 = shift_y64;
+            g_info->glyph = glyph;
+            g_info->subpixel_idx = get_subpixel_idx(shift_x64, shift_y64);
 
             if (!is_tab) {
                 x += hb->glyph_pos[t].x_advance;
