@@ -222,6 +222,11 @@ typedef struct TextSegment {
     int is_dynamic;                 ///< 1 if contains %{...}, 0 if static
     char *cached_expansion;         ///< cached expansion result (NULL if not cached)
     int cached_len;                 ///< length of cached expansion
+    int dup_of;                     ///< index of segment with same expression (-1 = none)
+    // Per-frame cache for canonical dynamic segments (dup_of == -1)
+    int64_t frame_cached;           ///< frame when frame_expansion was cached (-1 = invalid)
+    char *frame_expansion;          ///< cached per-frame expansion (freed each new frame)
+    int frame_expansion_len;        ///< length of frame_expansion
 } TextSegment;
 
 /** Forward declaration for Glyph caching */
@@ -1820,6 +1825,7 @@ static void free_segments(DrawTextContext *s)
     if (s->segments) {
         for (int i = 0; i < s->segment_count; i++) {
             av_freep(&s->segments[i].cached_expansion);
+            av_freep(&s->segments[i].frame_expansion);
         }
         av_freep(&s->segments);
     }
@@ -1881,6 +1887,10 @@ static int parse_text_segments(AVFilterContext *ctx)
                 s->segments[s->segment_count].is_dynamic = 0;
                 s->segments[s->segment_count].cached_expansion = NULL;
                 s->segments[s->segment_count].cached_len = 0;
+                s->segments[s->segment_count].dup_of = -1;
+                s->segments[s->segment_count].frame_cached = -1;
+                s->segments[s->segment_count].frame_expansion = NULL;
+                s->segments[s->segment_count].frame_expansion_len = 0;
                 s->segment_count++;
             }
 
@@ -1913,6 +1923,23 @@ static int parse_text_segments(AVFilterContext *ctx)
             s->segments[s->segment_count].is_dynamic = 1;
             s->segments[s->segment_count].cached_expansion = NULL;
             s->segments[s->segment_count].cached_len = 0;
+
+            // Find duplicate: check if same expression exists in earlier segments
+            int expr_len = p - expr_start;
+            int dup = -1;
+            for (int j = 0; j < s->segment_count; j++) {
+                if (s->segments[j].is_dynamic &&
+                    s->segments[j].len == expr_len &&
+                    memcmp(s->segments[j].start, expr_start, expr_len) == 0) {
+                    // Found matching expression - point to canonical one (not another dup)
+                    dup = (s->segments[j].dup_of >= 0) ? s->segments[j].dup_of : j;
+                    break;
+                }
+            }
+            s->segments[s->segment_count].dup_of = dup;
+            s->segments[s->segment_count].frame_cached = -1;
+            s->segments[s->segment_count].frame_expansion = NULL;
+            s->segments[s->segment_count].frame_expansion_len = 0;
             s->segment_count++;
 
             segment_start = p;
@@ -1938,6 +1965,10 @@ static int parse_text_segments(AVFilterContext *ctx)
         s->segments[s->segment_count].is_dynamic = 0;
         s->segments[s->segment_count].cached_expansion = NULL;
         s->segments[s->segment_count].cached_len = 0;
+        s->segments[s->segment_count].dup_of = -1;
+        s->segments[s->segment_count].frame_cached = -1;
+        s->segments[s->segment_count].frame_expansion = NULL;
+        s->segments[s->segment_count].frame_expansion_len = 0;
         s->segment_count++;
     }
 
@@ -2021,24 +2052,51 @@ static int expand_text_segmented(AVFilterContext *ctx, AVBPrint *bp)
             // Append cached result
             av_bprint_append_data(bp, seg->cached_expansion, seg->cached_len);
         } else {
-            // Dynamic segment: expand each frame
-            char *seg_text = av_strndup(seg->start, seg->len);
-            if (!seg_text) {
-                av_bprint_finalize(&tmp_bp, NULL);
-                return AVERROR(ENOMEM);
+            // Dynamic segment: use per-frame cache with deduplication
+            FilterLink *inl = ff_filter_link(ctx->inputs[0]);
+            int64_t current_frame = inl->frame_count_out;
+            TextSegment *canonical;
+
+            if (seg->dup_of >= 0) {
+                // This is a duplicate - use the canonical segment's cached result
+                canonical = &s->segments[seg->dup_of];
+            } else {
+                // This is a canonical segment
+                canonical = seg;
             }
 
-            av_bprint_clear(&tmp_bp);
-            ret = ff_expand_text(&s->expand_text, seg_text, &tmp_bp);
-            av_free(seg_text);
+            // Check if canonical segment's cache is valid for this frame
+            if (canonical->frame_cached != current_frame) {
+                // Need to expand
+                char *seg_text = av_strndup(canonical->start, canonical->len);
+                if (!seg_text) {
+                    av_bprint_finalize(&tmp_bp, NULL);
+                    return AVERROR(ENOMEM);
+                }
 
-            if (ret < 0) {
-                av_bprint_finalize(&tmp_bp, NULL);
-                return ret;
+                av_bprint_clear(&tmp_bp);
+                ret = ff_expand_text(&s->expand_text, seg_text, &tmp_bp);
+                av_free(seg_text);
+
+                if (ret < 0) {
+                    av_bprint_finalize(&tmp_bp, NULL);
+                    return ret;
+                }
+
+                // Cache the result
+                av_free(canonical->frame_expansion);
+                canonical->frame_expansion = av_strdup(tmp_bp.str);
+                canonical->frame_expansion_len = tmp_bp.len;
+                canonical->frame_cached = current_frame;
+
+                if (!canonical->frame_expansion) {
+                    av_bprint_finalize(&tmp_bp, NULL);
+                    return AVERROR(ENOMEM);
+                }
             }
 
-            // Append expanded result
-            av_bprint_append_data(bp, tmp_bp.str, tmp_bp.len);
+            // Use the cached result
+            av_bprint_append_data(bp, canonical->frame_expansion, canonical->frame_expansion_len);
         }
     }
 
