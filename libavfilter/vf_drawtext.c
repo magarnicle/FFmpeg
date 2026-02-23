@@ -39,6 +39,45 @@
 #include <unistd.h>
 #endif
 #include <fenv.h>
+#include <stdio.h>
+#include <stdint.h>
+
+/* Detailed timing instrumentation for drawtext */
+#define DRAWTEXT_TIMING_ENABLED 1
+
+#if DRAWTEXT_TIMING_ENABLED
+static uint64_t dt_expand_ns = 0;
+static uint64_t dt_measure_ns = 0;
+static uint64_t dt_glyph_loop_ns = 0;
+static uint64_t dt_load_glyph_ns = 0;  // time inside load_glyph only
+static uint64_t dt_draw_glyphs_ns = 0;
+static uint64_t dt_call_count = 0;
+static uint64_t dt_glyph_count = 0;  // number of glyphs processed
+
+static inline uint64_t dt_get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+__attribute__((destructor))
+static void print_drawtext_timings(void) {
+    if (dt_call_count == 0) return;
+    fprintf(stderr, "\n=== DRAWTEXT DETAILED TIMING ===\n");
+    fprintf(stderr, "%-20s %12s %12s %8s\n", "Phase", "Total(ms)", "Avg(us)", "Pct");
+    fprintf(stderr, "%-20s %12s %12s %8s\n", "-----", "---------", "-------", "---");
+    uint64_t total = dt_expand_ns + dt_measure_ns + dt_glyph_loop_ns + dt_draw_glyphs_ns;
+    fprintf(stderr, "%-20s %12.2f %12.2f %7.1f%%\n", "text_expand", dt_expand_ns/1e6, dt_expand_ns/1e3/dt_call_count, 100.0*dt_expand_ns/total);
+    fprintf(stderr, "%-20s %12.2f %12.2f %7.1f%%\n", "measure_text", dt_measure_ns/1e6, dt_measure_ns/1e3/dt_call_count, 100.0*dt_measure_ns/total);
+    fprintf(stderr, "%-20s %12.2f %12.2f %7.1f%%\n", "glyph_loop", dt_glyph_loop_ns/1e6, dt_glyph_loop_ns/1e3/dt_call_count, 100.0*dt_glyph_loop_ns/total);
+    fprintf(stderr, "  - load_glyph      %12.2f %12.2f %7.1f%%\n", dt_load_glyph_ns/1e6, dt_glyph_count > 0 ? dt_load_glyph_ns/1e3/dt_glyph_count : 0, 100.0*dt_load_glyph_ns/total);
+    fprintf(stderr, "  - other_loop      %12.2f %12.2f %7.1f%%\n", (dt_glyph_loop_ns - dt_load_glyph_ns)/1e6, dt_glyph_count > 0 ? (dt_glyph_loop_ns - dt_load_glyph_ns)/1e3/dt_glyph_count : 0, 100.0*(dt_glyph_loop_ns - dt_load_glyph_ns)/total);
+    fprintf(stderr, "%-20s %12.2f %12.2f %7.1f%%\n", "draw_glyphs", dt_draw_glyphs_ns/1e6, dt_draw_glyphs_ns/1e3/dt_call_count, 100.0*dt_draw_glyphs_ns/total);
+    fprintf(stderr, "%-20s %12.2f %12.2f\n", "TOTAL", total/1e6, total/1e3/dt_call_count);
+    fprintf(stderr, "Calls: %lu, Glyphs: %lu\n", (unsigned long)dt_call_count, (unsigned long)dt_glyph_count);
+    fprintf(stderr, "================================\n");
+}
+#endif
 
 #if CONFIG_LIBFONTCONFIG
 #include <fontconfig/fontconfig.h>
@@ -375,6 +414,12 @@ typedef struct DrawTextContext {
     // lines that leave the viewport (not all 30k+ lines) each frame.
     int prev_first_visible_line;    ///< first_visible_line from previous frame (-1 = none)
     int prev_last_visible_line;     ///< last_visible_line from previous frame  (-1 = none)
+
+    // Glyph loop cache: skip recalculating glyph positions when unchanged
+    int glyphs_cached;              ///< 1 if glyph positions are valid from previous frame
+    int glyphs_cache_x64;           ///< x64 value when glyphs were cached
+    int glyphs_cache_y64;           ///< y64 value when glyphs were cached
+    int glyphs_cache_fontsize;      ///< fontsize when glyphs were cached
 
     // Text expansion optimization: skip re-expanding static text
     int text_is_static;             ///< 1 if EXP_NORMAL produced identical output to input
@@ -1106,6 +1151,7 @@ static av_cold int init(AVFilterContext *ctx)
     s->default_fontsize = 16;
     s->prev_first_visible_line = -1;
     s->prev_last_visible_line  = -1;
+    s->glyphs_cached = 0;
 
     if (!s->fontfile && !CONFIG_LIBFONTCONFIG) {
         av_log(ctx, AV_LOG_ERROR, "No font filename provided\n");
@@ -2258,6 +2304,12 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     struct tm ltime;
     AVBPrint *bp = &s->expanded_text;
 
+#if DRAWTEXT_TIMING_ENABLED
+    uint64_t t_start = dt_get_time_ns();
+    uint64_t t_phase_start = t_start;
+    dt_call_count++;
+#endif
+
     FFDrawColor fontcolor;
     FFDrawColor shadowcolor;
     FFDrawColor bordercolor;
@@ -2425,6 +2477,7 @@ continue_count1:
         // Fresh lines array — no previous visible-line state is valid.
         s->prev_first_visible_line = -1;
         s->prev_last_visible_line  = -1;
+        s->glyphs_cached = 0;  // Invalidate glyph position cache
     }
     /* else: text unchanged, reuse cached line boundaries */
 
@@ -2460,10 +2513,20 @@ continue_count1:
     av_log(ctx, AV_LOG_TRACE, "Viewport optimization: lines %d-%d of %d visible (canvas_y=%d, canvas_h=%d)\n",
            first_visible_line, last_visible_line, s->line_count, s->canvas_y, s->canvas_h);
 
+#if DRAWTEXT_TIMING_ENABLED
+    dt_expand_ns += dt_get_time_ns() - t_phase_start;
+    t_phase_start = dt_get_time_ns();
+#endif
+
     /* Phase 2: Shape only visible lines */
     if ((ret = measure_text(ctx, &metrics, first_visible_line, last_visible_line)) < 0) {
         return ret;
     }
+
+#if DRAWTEXT_TIMING_ENABLED
+    dt_measure_ns += dt_get_time_ns() - t_phase_start;
+    t_phase_start = dt_get_time_ns();
+#endif
 
     s->max_glyph_h = POS_CEIL(metrics.max_y64 - metrics.min_y64, 64);
     s->max_glyph_w = POS_CEIL(metrics.max_x64 - metrics.min_x64, 64);
@@ -2566,6 +2629,21 @@ continue_count1:
         y64 = (int)(s->y * 64. + metrics.offset_top64);
     }
 
+    // Glyph loop cache optimization: skip recalculating glyph positions when unchanged.
+    // The glyph positions depend on x64, y64, fontsize, and visible line range.
+    // If all these match the previous frame, reuse the cached GlyphInfo arrays.
+    int can_skip_glyph_loop = s->glyphs_cached &&
+                              s->glyphs_cache_x64 == x64 &&
+                              s->glyphs_cache_y64 == y64 &&
+                              s->glyphs_cache_fontsize == s->fontsize &&
+                              s->prev_first_visible_line == first_visible_line &&
+                              s->prev_last_visible_line == last_visible_line;
+
+    if (can_skip_glyph_loop) {
+        // Skip the expensive glyph loop - positions are still valid
+        goto glyph_loop_done;
+    }
+
     // Jump directly to first visible line instead of iterating from line 0.
     // For uniform line height (the common case) y is strictly additive so
     // we can precompute its value without touching every line struct.
@@ -2605,7 +2683,14 @@ continue_count1:
             shift_x64 = (((x64 + true_x) >> 4) & 0b0011) << 4;
             shift_y64 = ((4 - (((y64 + true_y) >> 4) & 0b0011)) & 0b0011) << 4;
 
+#if DRAWTEXT_TIMING_ENABLED
+            uint64_t t_lg_start = dt_get_time_ns();
+#endif
             ret = load_glyph(ctx, &glyph, hb->glyph_info[t].codepoint, shift_x64, shift_y64);
+#if DRAWTEXT_TIMING_ENABLED
+            dt_load_glyph_ns += dt_get_time_ns() - t_lg_start;
+            dt_glyph_count++;
+#endif
             if (ret != 0) {
                 return ret;
             }
@@ -2627,6 +2712,19 @@ continue_count1:
         y += metrics.line_height64 + s->line_spacing * 64;
         x = 0;
     }
+
+    // Update glyph cache - positions are now valid for next frame
+    s->glyphs_cached = 1;
+    s->glyphs_cache_x64 = x64;
+    s->glyphs_cache_y64 = y64;
+    s->glyphs_cache_fontsize = s->fontsize;
+
+glyph_loop_done:
+
+#if DRAWTEXT_TIMING_ENABLED
+    dt_glyph_loop_ns += dt_get_time_ns() - t_phase_start;
+    t_phase_start = dt_get_time_ns();
+#endif
 
     metrics.rect_x = s->x;
     if (s->y_align == YA_BASELINE) {
@@ -2703,6 +2801,13 @@ continue_count1:
     // Issue 5: glyphs[] and hb_data.buf are kept alive across frames to avoid
     // per-frame malloc/free churn. They are freed when text changes (rebuild
     // path in draw_text) or at uninit time.
+
+#if DRAWTEXT_TIMING_ENABLED
+    {
+        uint64_t t_end = dt_get_time_ns();
+        dt_draw_glyphs_ns += t_end - t_phase_start;
+    }
+#endif
 
     return 0;
 }
