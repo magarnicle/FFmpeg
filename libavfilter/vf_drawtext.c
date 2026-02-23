@@ -434,6 +434,12 @@ typedef struct DrawTextContext {
     TextSegment *segments;          ///< array of text segments
     int segment_count;              ///< number of segments
     int segments_text_version;      ///< text_version when segments were parsed
+
+    // Per-frame time cache: avoid repeated localtime/gmtime calls
+    int64_t time_cache_frame;       ///< frame number when time was cached (-1 = invalid)
+    int64_t time_cache_unow;        ///< cached av_gettime() result
+    struct tm time_cache_localtime; ///< cached localtime result
+    struct tm time_cache_gmtime;    ///< cached gmtime result
 } DrawTextContext;
 
 // Forward declaration for segment cleanup
@@ -1088,9 +1094,38 @@ static int func_metadata(void *ctx, AVBPrint *bp, const char *function_name, uns
 
 static int func_strftime(void *ctx, AVBPrint *bp, const char *function_name, unsigned argc, char **argv)
 {
+    AVFilterContext *avctx = ctx;
+    DrawTextContext *s = avctx->priv;
+    FilterLink *inl = ff_filter_link(avctx->inputs[0]);
+    int64_t current_frame = inl->frame_count_out;
+    int is_localtime = !strcmp(function_name, "localtime");
     const char *strftime_fmt = argc ? argv[0] : NULL;
+    const char *fmt = strftime_fmt ? strftime_fmt : "%Y-%m-%d %H:%M:%S";
+    struct tm *tm;
 
-    return ff_print_time(ctx, bp, strftime_fmt, !strcmp(function_name, "localtime"));
+    // Check if cache is valid for this frame
+    if (s->time_cache_frame != current_frame) {
+        // Cache miss - get fresh time
+        s->time_cache_unow = av_gettime();
+        time_t now = s->time_cache_unow / 1000000;
+        localtime_r(&now, &s->time_cache_localtime);
+        gmtime_r(&now, &s->time_cache_gmtime);
+        s->time_cache_frame = current_frame;
+    }
+
+    // Use cached time
+    tm = is_localtime ? &s->time_cache_localtime : &s->time_cache_gmtime;
+
+    // Handle %N for fractional seconds (simplified - full version in ff_print_time)
+    if (strstr(fmt, "%N") || strstr(fmt, "%1N") || strstr(fmt, "%2N") ||
+        strstr(fmt, "%3N") || strstr(fmt, "%4N") || strstr(fmt, "%5N") || strstr(fmt, "%6N")) {
+        // Fall back to ff_print_time for %N handling (rare case)
+        return ff_print_time(ctx, bp, strftime_fmt, is_localtime);
+    }
+
+    // Fast path: use cached tm directly
+    av_bprint_strftime(bp, fmt, tm);
+    return 0;
 }
 
 static int func_eval_expr(void *ctx, AVBPrint *bp, const char *function_name, unsigned argc, char **argv)
@@ -1157,6 +1192,7 @@ static av_cold int init(AVFilterContext *ctx)
     s->prev_first_visible_line = -1;
     s->prev_last_visible_line  = -1;
     s->glyphs_cached = 0;
+    s->time_cache_frame = -1;
 
     if (!s->fontfile && !CONFIG_LIBFONTCONFIG) {
         av_log(ctx, AV_LOG_ERROR, "No font filename provided\n");
