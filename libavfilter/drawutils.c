@@ -244,6 +244,93 @@ static void blend_line16_chroma422_avx512(uint16_t *dst, unsigned src, unsigned 
         dst[x] = ((0x10001 - a) * v + a * src) >> 16;
     }
 }
+
+/*
+ * AVX-512 8-bit blend: packed format (pixelstep=3 or 4) with scatter
+ * Processes 16 pixels per iteration using gather/scatter.
+ */
+__attribute__((target("avx512f,avx512bw")))
+static void blend_line8_packed_avx512(uint8_t *dst, int dst_delta, unsigned src, unsigned alpha,
+                                       const uint8_t *mask, int xm, int w)
+{
+    const __m512i vsrc     = _mm512_set1_epi32(src);
+    const __m512i valpha   = _mm512_set1_epi32(alpha);
+    const __m512i v1010101 = _mm512_set1_epi32(0x1010101);
+    const __m512i vmask_ff = _mm512_set1_epi32(0xFF);
+    /* Gather/scatter indices for 16 pixels with given stride */
+    const __m512i vindex   = _mm512_setr_epi32(
+        0, dst_delta, 2*dst_delta, 3*dst_delta,
+        4*dst_delta, 5*dst_delta, 6*dst_delta, 7*dst_delta,
+        8*dst_delta, 9*dst_delta, 10*dst_delta, 11*dst_delta,
+        12*dst_delta, 13*dst_delta, 14*dst_delta, 15*dst_delta);
+    int x = 0;
+
+    /* Process 16 pixels at a time with AVX-512 gather/scatter */
+    for (; x <= w - 16; x += 16) {
+        /* Gather 16 destination bytes with stride */
+        __m512i v32 = _mm512_i32gather_epi32(vindex, dst + x * dst_delta, 1);
+        v32 = _mm512_and_si512(v32, vmask_ff);
+        /* Load 16 mask bytes, widen to 32-bit */
+        __m512i m32 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(mask + xm + x)));
+        /* a = mask * alpha */
+        __m512i a32 = _mm512_mullo_epi32(m32, valpha);
+        /* tau = 0x1010101 - a */
+        __m512i tau = _mm512_sub_epi32(v1010101, a32);
+        /* res = (tau * v + a * src) >> 24 */
+        __m512i res = _mm512_srli_epi32(
+                          _mm512_add_epi32(_mm512_mullo_epi32(tau, v32),
+                                           _mm512_mullo_epi32(a32, vsrc)),
+                          24);
+        /* Scatter results back with stride */
+        _mm512_i32scatter_epi32(dst + x * dst_delta, vindex, res, 1);
+    }
+    /* Scalar tail */
+    for (; x < w; x++) {
+        unsigned a = mask[xm + x] * alpha;
+        unsigned v = dst[x * dst_delta];
+        dst[x * dst_delta] = ((0x1010101 - a) * v + a * src) >> 24;
+    }
+}
+
+/*
+ * AVX-512 8-bit blend: planar/contiguous format (pixelstep=1)
+ * Processes 16 pixels per iteration.
+ */
+__attribute__((target("avx512f,avx512bw")))
+static void blend_line8_luma_avx512(uint8_t *dst, unsigned src, unsigned alpha,
+                                     const uint8_t *mask, int xm, int w)
+{
+    const __m512i vsrc     = _mm512_set1_epi32(src);
+    const __m512i valpha   = _mm512_set1_epi32(alpha);
+    const __m512i v1010101 = _mm512_set1_epi32(0x1010101);
+    int x = 0;
+
+    /* Process 16 pixels at a time with AVX-512 */
+    for (; x <= w - 16; x += 16) {
+        /* Load 16 destination bytes, widen to 32-bit */
+        __m512i v32 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(dst + x)));
+        /* Load 16 mask bytes, widen to 32-bit */
+        __m512i m32 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(mask + xm + x)));
+        /* a = mask * alpha */
+        __m512i a32 = _mm512_mullo_epi32(m32, valpha);
+        /* tau = 0x1010101 - a */
+        __m512i tau = _mm512_sub_epi32(v1010101, a32);
+        /* res = (tau * v + a * src) >> 24 */
+        __m512i res = _mm512_srli_epi32(
+                          _mm512_add_epi32(_mm512_mullo_epi32(tau, v32),
+                                           _mm512_mullo_epi32(a32, vsrc)),
+                          24);
+        /* Pack 32-bit results to 8-bit and store */
+        __m128i out = _mm512_cvtusepi32_epi8(res);
+        _mm_storeu_si128((__m128i *)(dst + x), out);
+    }
+    /* Scalar tail */
+    for (; x < w; x++) {
+        unsigned a = mask[xm + x] * alpha;
+        unsigned v = dst[x];
+        dst[x] = ((0x1010101 - a) * v + a * src) >> 24;
+    }
+}
 #endif /* HAVE_AVX512_INLINE */
 
 /*
@@ -961,9 +1048,30 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                     draw->hsub[plane] == 0 && draw->vsub[plane] == 0 &&
                     left == 0 && right == 0) {
                     unsigned cpu = av_get_cpu_flags();
-                    if (cpu & AV_CPU_FLAG_AVX2) {
-                        unsigned src8 = color->comp[plane].u8[index];
-                        int pstep = draw->pixelstep[plane];
+                    unsigned src8 = color->comp[plane].u8[index];
+                    int pstep = draw->pixelstep[plane];
+#if HAVE_AVX512_INLINE
+                    /* AVX-512 path: 16 pixels per iteration with scatter */
+                    if (cpu & AV_CPU_FLAG_AVX512) {
+                        if (pstep == 1) {
+                            simd8_used = 1;
+                            for (int y = 0; y < h_sub; y++) {
+                                blend_line8_luma_avx512(p, src8, alpha, m, xm0, w_sub);
+                                p += dst_linesize[plane];
+                                m += mask_linesize;
+                            }
+                        } else if (pstep == 3 || pstep == 4) {
+                            simd8_used = 1;
+                            for (int y = 0; y < h_sub; y++) {
+                                blend_line8_packed_avx512(p, pstep, src8, alpha, m, xm0, w_sub);
+                                p += dst_linesize[plane];
+                                m += mask_linesize;
+                            }
+                        }
+                    }
+#endif
+                    /* AVX2 fallback: 8 pixels per iteration */
+                    if (!simd8_used && (cpu & AV_CPU_FLAG_AVX2)) {
                         if (pstep == 1) {
                             simd8_used = 1;
                             for (int y = 0; y < h_sub; y++) {
