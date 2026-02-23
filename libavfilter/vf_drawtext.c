@@ -440,6 +440,12 @@ typedef struct DrawTextContext {
     int64_t time_cache_unow;        ///< cached av_gettime() result
     struct tm time_cache_localtime; ///< cached localtime result
     struct tm time_cache_gmtime;    ///< cached gmtime result
+
+    // Per-frame expression cache: avoid repeated formatting of frame-constant values
+    int64_t expr_cache_frame;       ///< frame number when expressions were cached (-1 = invalid)
+    char expr_cache_n[32];          ///< cached %{n} result
+    char expr_cache_pts[64];        ///< cached %{pts} result (default format)
+    char expr_cache_pict_type[4];   ///< cached %{pict_type} result
 } DrawTextContext;
 
 // Forward declaration for segment cleanup
@@ -1033,25 +1039,49 @@ static int string_to_array(const char *source, int *result, int result_size)
     return counter;
 }
 
+// Helper to update all per-frame expression caches at once
+static void update_expr_cache(DrawTextContext *s, int64_t frame)
+{
+    if (s->expr_cache_frame != frame) {
+        snprintf(s->expr_cache_n, sizeof(s->expr_cache_n), "%d", (int)s->var_values[VAR_N]);
+        snprintf(s->expr_cache_pts, sizeof(s->expr_cache_pts), "%f", s->var_values[VAR_T]);
+        s->expr_cache_pict_type[0] = av_get_picture_type_char(s->var_values[VAR_PICT_TYPE]);
+        s->expr_cache_pict_type[1] = '\0';
+        s->expr_cache_frame = frame;
+    }
+}
+
 static int func_pict_type(void *ctx, AVBPrint *bp, const char *function_name, unsigned argc, char **argv)
 {
-    DrawTextContext *s = ((AVFilterContext *)ctx)->priv;
+    AVFilterContext *avctx = ctx;
+    DrawTextContext *s = avctx->priv;
+    FilterLink *inl = ff_filter_link(avctx->inputs[0]);
 
-    av_bprintf(bp, "%c", av_get_picture_type_char(s->var_values[VAR_PICT_TYPE]));
+    update_expr_cache(s, inl->frame_count_out);
+    av_bprintf(bp, "%s", s->expr_cache_pict_type);
     return 0;
 }
 
 static int func_pts(void *ctx, AVBPrint *bp, const char *function_name, unsigned argc, char **argv)
 {
-    DrawTextContext *s = ((AVFilterContext *)ctx)->priv;
+    AVFilterContext *avctx = ctx;
+    DrawTextContext *s = avctx->priv;
+    FilterLink *inl = ff_filter_link(avctx->inputs[0]);
     const char *fmt;
     const char *strftime_fmt = NULL;
     const char *delta = NULL;
-    double pts = s->var_values[VAR_T];
 
     // argv: pts, FMT, [DELTA, 24HH | strftime_fmt]
 
     fmt = argc >= 1 ? argv[0] : "flt";
+
+    // Fast path: cache default format (no arguments) per frame
+    if (argc == 0) {
+        update_expr_cache(s, inl->frame_count_out);
+        av_bprintf(bp, "%s", s->expr_cache_pts);
+        return 0;
+    }
+
     if (argc >= 2) {
         delta = argv[1];
     }
@@ -1069,14 +1099,17 @@ static int func_pts(void *ctx, AVBPrint *bp, const char *function_name, unsigned
         }
     }
 
-    return ff_print_pts(ctx, bp, pts, delta, fmt, strftime_fmt);
+    return ff_print_pts(ctx, bp, s->var_values[VAR_T], delta, fmt, strftime_fmt);
 }
 
 static int func_frame_num(void *ctx, AVBPrint *bp, const char *function_name, unsigned argc, char **argv)
 {
-    DrawTextContext *s = ((AVFilterContext *)ctx)->priv;
+    AVFilterContext *avctx = ctx;
+    DrawTextContext *s = avctx->priv;
+    FilterLink *inl = ff_filter_link(avctx->inputs[0]);
 
-    av_bprintf(bp, "%d", (int)s->var_values[VAR_N]);
+    update_expr_cache(s, inl->frame_count_out);
+    av_bprintf(bp, "%s", s->expr_cache_n);
     return 0;
 }
 
@@ -1193,6 +1226,7 @@ static av_cold int init(AVFilterContext *ctx)
     s->prev_last_visible_line  = -1;
     s->glyphs_cached = 0;
     s->time_cache_frame = -1;
+    s->expr_cache_frame = -1;
 
     if (!s->fontfile && !CONFIG_LIBFONTCONFIG) {
         av_log(ctx, AV_LOG_ERROR, "No font filename provided\n");
