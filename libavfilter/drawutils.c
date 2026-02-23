@@ -246,6 +246,122 @@ static void blend_line16_chroma422_avx512(uint16_t *dst, unsigned src, unsigned 
 }
 #endif /* HAVE_AVX512_INLINE */
 
+/*
+ * Blend one row of 8-bit pixels using an 8-bit grayscale mask.
+ * Formula per pixel:
+ *   out = ((0x1010101 - a) * v + a * src) >> 24,  a = mask[xm+x] * alpha
+ * Requirements: l2depth=3 (8-bit mask), no subsampling (hsub=0, vsub=0)
+ */
+
+/* Packed format version (pixelstep=3 or 4, e.g., RGB24/RGBA) using gather */
+__attribute__((target("avx2")))
+static void blend_line8_packed_avx2(uint8_t *dst, int dst_delta, unsigned src, unsigned alpha,
+                                     const uint8_t *mask, int xm, int w)
+{
+    const __m256i vsrc     = _mm256_set1_epi32(src);
+    const __m256i valpha   = _mm256_set1_epi32(alpha);
+    const __m256i v1010101 = _mm256_set1_epi32(0x1010101);
+    /* Gather indices for 8 pixels with given stride */
+    const __m256i vindex   = _mm256_setr_epi32(0, dst_delta, 2*dst_delta, 3*dst_delta,
+                                                4*dst_delta, 5*dst_delta, 6*dst_delta, 7*dst_delta);
+    int x = 0;
+
+    /* Process 8 pixels at a time with AVX2 gather */
+    for (; x <= w - 8; x += 8) {
+        /* Gather 8 destination bytes with stride, each zero-extended to 32-bit */
+        __m256i v32 = _mm256_i32gather_epi32((const int *)(dst + x * dst_delta), vindex, 1);
+        v32 = _mm256_and_si256(v32, _mm256_set1_epi32(0xFF)); /* mask to low byte */
+        /* Load 8 mask bytes, widen to 32-bit */
+        __m256i m32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(mask + xm + x)));
+        /* a = mask * alpha */
+        __m256i a32 = _mm256_mullo_epi32(m32, valpha);
+        /* tau = 0x1010101 - a */
+        __m256i tau = _mm256_sub_epi32(v1010101, a32);
+        /* res = (tau * v + a * src) >> 24 */
+        __m256i res = _mm256_srli_epi32(
+                          _mm256_add_epi32(_mm256_mullo_epi32(tau, v32),
+                                           _mm256_mullo_epi32(a32, vsrc)),
+                          24);
+        /* Scatter results back - no AVX2 scatter, so extract and store individually */
+        /* Results are in the low byte of each 32-bit element */
+        uint32_t r[8];
+        _mm256_storeu_si256((__m256i *)r, res);
+        uint8_t *d = dst + x * dst_delta;
+        d[0]              = (uint8_t)r[0];
+        d[dst_delta]      = (uint8_t)r[1];
+        d[2*dst_delta]    = (uint8_t)r[2];
+        d[3*dst_delta]    = (uint8_t)r[3];
+        d[4*dst_delta]    = (uint8_t)r[4];
+        d[5*dst_delta]    = (uint8_t)r[5];
+        d[6*dst_delta]    = (uint8_t)r[6];
+        d[7*dst_delta]    = (uint8_t)r[7];
+    }
+    /* Scalar tail */
+    for (; x < w; x++) {
+        unsigned a = mask[xm + x] * alpha;
+        unsigned v = dst[x * dst_delta];
+        dst[x * dst_delta] = ((0x1010101 - a) * v + a * src) >> 24;
+    }
+}
+
+/* Contiguous format version (pixelstep=1, e.g., planar Y) */
+__attribute__((target("avx2")))
+static void blend_line8_luma_avx2(uint8_t *dst, unsigned src, unsigned alpha,
+                                   const uint8_t *mask, int xm, int w)
+{
+    const __m256i vsrc     = _mm256_set1_epi32(src);
+    const __m256i valpha   = _mm256_set1_epi32(alpha);
+    const __m256i v1010101 = _mm256_set1_epi32(0x1010101);
+    const __m128i vsrc4    = _mm_set1_epi32(src);
+    const __m128i valpha4  = _mm_set1_epi32(alpha);
+    const __m128i v1010101_4 = _mm_set1_epi32(0x1010101);
+    int x = 0;
+
+    /* Process 8 pixels at a time with AVX2 */
+    for (; x <= w - 8; x += 8) {
+        /* Load 8 destination bytes, widen to 32-bit */
+        __m256i v32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(dst + x)));
+        /* Load 8 mask bytes, widen to 32-bit */
+        __m256i m32 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(mask + xm + x)));
+        /* a = mask * alpha */
+        __m256i a32 = _mm256_mullo_epi32(m32, valpha);
+        /* tau = 0x1010101 - a */
+        __m256i tau = _mm256_sub_epi32(v1010101, a32);
+        /* res = (tau * v + a * src) >> 24 */
+        __m256i res = _mm256_srli_epi32(
+                          _mm256_add_epi32(_mm256_mullo_epi32(tau, v32),
+                                           _mm256_mullo_epi32(a32, vsrc)),
+                          24);
+        /* Pack 32-bit results back to 8-bit */
+        __m256i res16 = _mm256_packus_epi32(res, _mm256_setzero_si256());
+        __m256i res8  = _mm256_packus_epi16(res16, _mm256_setzero_si256());
+        /* Extract low 8 bytes and store */
+        _mm_storel_epi64((__m128i *)(dst + x),
+                         _mm256_castsi256_si128(_mm256_permute4x64_epi64(res8, 0xD8)));
+    }
+    /* Process 4 pixels with SSE4.1 */
+    if (x <= w - 4) {
+        __m128i v32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int *)(dst + x)));
+        __m128i m32 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*(const int *)(mask + xm + x)));
+        __m128i a32 = _mm_mullo_epi32(m32, valpha4);
+        __m128i tau = _mm_sub_epi32(v1010101_4, a32);
+        __m128i res = _mm_srli_epi32(
+                          _mm_add_epi32(_mm_mullo_epi32(tau, v32),
+                                        _mm_mullo_epi32(a32, vsrc4)),
+                          24);
+        __m128i res16 = _mm_packus_epi32(res, _mm_setzero_si128());
+        __m128i res8  = _mm_packus_epi16(res16, _mm_setzero_si128());
+        *(int *)(dst + x) = _mm_cvtsi128_si32(res8);
+        x += 4;
+    }
+    /* Scalar tail */
+    for (; x < w; x++) {
+        unsigned a = mask[xm + x] * alpha;
+        unsigned v = dst[x];
+        dst[x] = ((0x1010101 - a) * v + a * src) >> 24;
+    }
+}
+
 #endif /* ARCH_X86 && HAVE_AVX2_INLINE */
 
 enum { RED = 0, GREEN, BLUE, ALPHA };
@@ -837,15 +953,45 @@ void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
                 m += top * mask_linesize;
             }
             if (depth <= 8) {
+                int simd8_used = 0;
                 int64_t t8_start = av_gettime_relative();
-                for (int y = 0; y < h_sub; y++) {
-                    blend_line_hv(p, draw->pixelstep[plane],
-                                  color->comp[plane].u8[index], alpha,
-                                  m, mask_linesize, l2depth, w_sub,
-                                  draw->hsub[plane], draw->vsub[plane],
-                                  xm0, left, right, 1 << draw->vsub[plane]);
-                    p += dst_linesize[plane];
-                    m += mask_linesize << draw->vsub[plane];
+#if ARCH_X86 && HAVE_AVX2_INLINE
+                /* SIMD path for 8-bit: no subsampling, no edge partials */
+                if (l2depth == 3 &&
+                    draw->hsub[plane] == 0 && draw->vsub[plane] == 0 &&
+                    left == 0 && right == 0) {
+                    unsigned cpu = av_get_cpu_flags();
+                    if (cpu & AV_CPU_FLAG_AVX2) {
+                        unsigned src8 = color->comp[plane].u8[index];
+                        int pstep = draw->pixelstep[plane];
+                        if (pstep == 1) {
+                            simd8_used = 1;
+                            for (int y = 0; y < h_sub; y++) {
+                                blend_line8_luma_avx2(p, src8, alpha, m, xm0, w_sub);
+                                p += dst_linesize[plane];
+                                m += mask_linesize;
+                            }
+                        } else if (pstep == 3 || pstep == 4) {
+                            simd8_used = 1;
+                            for (int y = 0; y < h_sub; y++) {
+                                blend_line8_packed_avx2(p, pstep, src8, alpha, m, xm0, w_sub);
+                                p += dst_linesize[plane];
+                                m += mask_linesize;
+                            }
+                        }
+                    }
+                }
+#endif
+                if (!simd8_used) {
+                    for (int y = 0; y < h_sub; y++) {
+                        blend_line_hv(p, draw->pixelstep[plane],
+                                      color->comp[plane].u8[index], alpha,
+                                      m, mask_linesize, l2depth, w_sub,
+                                      draw->hsub[plane], draw->vsub[plane],
+                                      xm0, left, right, 1 << draw->vsub[plane]);
+                        p += dst_linesize[plane];
+                        m += mask_linesize << draw->vsub[plane];
+                    }
                 }
                 s_blend8_time += av_gettime_relative() - t8_start;
                 s_blend8_count++;
