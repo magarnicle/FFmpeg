@@ -2457,7 +2457,7 @@ continue_count1:
                                &first_visible_line, &last_visible_line);
     }
 
-    av_log(ctx, AV_LOG_DEBUG, "Viewport optimization: lines %d-%d of %d visible (canvas_y=%d, canvas_h=%d)\n",
+    av_log(ctx, AV_LOG_TRACE, "Viewport optimization: lines %d-%d of %d visible (canvas_y=%d, canvas_h=%d)\n",
            first_visible_line, last_visible_line, s->line_count, s->canvas_y, s->canvas_h);
 
     /* Phase 2: Shape only visible lines */
