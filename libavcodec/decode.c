@@ -21,8 +21,69 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
+#include <time.h>
 
 #include "config.h"
+
+/* Timing instrumentation for profiling */
+#define DECODE_TIMING_ENABLED 0
+
+#if DECODE_TIMING_ENABLED
+typedef struct DecoderTiming {
+    const char *name;
+    uint64_t total_ns;
+    uint64_t call_count;
+    uint64_t frame_count;
+} DecoderTiming;
+
+#define MAX_TIMED_DECODERS 64
+static DecoderTiming g_decoder_timings[MAX_TIMED_DECODERS];
+static int g_decoder_timing_count = 0;
+static int g_decoder_timing_initialized = 0;
+
+static inline uint64_t decode_get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static DecoderTiming* get_decoder_timing(const char *name) {
+    for (int i = 0; i < g_decoder_timing_count; i++) {
+        if (g_decoder_timings[i].name == name)
+            return &g_decoder_timings[i];
+    }
+    if (g_decoder_timing_count < MAX_TIMED_DECODERS) {
+        g_decoder_timings[g_decoder_timing_count].name = name;
+        g_decoder_timings[g_decoder_timing_count].total_ns = 0;
+        g_decoder_timings[g_decoder_timing_count].call_count = 0;
+        g_decoder_timings[g_decoder_timing_count].frame_count = 0;
+        return &g_decoder_timings[g_decoder_timing_count++];
+    }
+    return NULL;
+}
+
+__attribute__((destructor))
+static void print_decoder_timings(void) {
+    if (!g_decoder_timing_initialized) return;
+    fprintf(stderr, "\n=== DECODER TIMING SUMMARY ===\n");
+    fprintf(stderr, "%-20s %12s %12s %12s %12s\n", "Decoder", "Total(ms)", "Calls", "Frames", "Avg(us/fr)");
+    fprintf(stderr, "%-20s %12s %12s %12s %12s\n", "-------", "---------", "-----", "------", "---------");
+
+    uint64_t grand_total = 0;
+    for (int i = 0; i < g_decoder_timing_count; i++) {
+        DecoderTiming *t = &g_decoder_timings[i];
+        double total_ms = t->total_ns / 1000000.0;
+        double avg_us = t->frame_count > 0 ? (t->total_ns / 1000.0) / t->frame_count : 0;
+        fprintf(stderr, "%-20s %12.2f %12lu %12lu %12.2f\n",
+                t->name, total_ms, (unsigned long)t->call_count,
+                (unsigned long)t->frame_count, avg_us);
+        grand_total += t->total_ns;
+    }
+    fprintf(stderr, "%-20s %12.2f\n", "TOTAL", grand_total / 1000000.0);
+    fprintf(stderr, "==============================\n");
+}
+#endif
 
 #if CONFIG_ICONV
 # include <iconv.h>
@@ -441,7 +502,23 @@ static inline int decode_simple_internal(AVCodecContext *avctx, AVFrame *frame, 
 
     frame->pict_type = dc->initial_pict_type;
     frame->flags    |= dc->intra_only_flag;
+
+#if DECODE_TIMING_ENABLED
+    g_decoder_timing_initialized = 1;
+    uint64_t decode_start = decode_get_time_ns();
+#endif
+
     consumed = codec->cb.decode(avctx, frame, &got_frame, pkt);
+
+#if DECODE_TIMING_ENABLED
+    uint64_t decode_elapsed = decode_get_time_ns() - decode_start;
+    DecoderTiming *dtiming = get_decoder_timing(avctx->codec->name);
+    if (dtiming) {
+        dtiming->total_ns += decode_elapsed;
+        dtiming->call_count++;
+        if (got_frame) dtiming->frame_count++;
+    }
+#endif
 
     if (!(codec->caps_internal & FF_CODEC_CAP_SETS_PKT_DTS))
         frame->pkt_dts = pkt->dts;

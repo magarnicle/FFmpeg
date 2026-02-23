@@ -43,7 +43,7 @@
 #include <stdint.h>
 
 /* Detailed timing instrumentation for drawtext */
-#define DRAWTEXT_TIMING_ENABLED 1
+#define DRAWTEXT_TIMING_ENABLED 0
 
 #if DRAWTEXT_TIMING_ENABLED
 static uint64_t dt_expand_ns = 0;

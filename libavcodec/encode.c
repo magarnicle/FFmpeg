@@ -27,8 +27,69 @@
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/samplefmt.h"
+#include <stdio.h>
+#include <time.h>
 
 #include "avcodec.h"
+
+/* Timing instrumentation for profiling */
+#define ENCODE_TIMING_ENABLED 0
+
+#if ENCODE_TIMING_ENABLED
+typedef struct EncoderTiming {
+    const char *name;
+    uint64_t total_ns;
+    uint64_t call_count;
+    uint64_t frame_count;
+} EncoderTiming;
+
+#define MAX_TIMED_ENCODERS 64
+static EncoderTiming g_encoder_timings[MAX_TIMED_ENCODERS];
+static int g_encoder_timing_count = 0;
+static int g_encoder_timing_initialized = 0;
+
+static inline uint64_t encode_get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static EncoderTiming* get_encoder_timing(const char *name) {
+    for (int i = 0; i < g_encoder_timing_count; i++) {
+        if (g_encoder_timings[i].name == name)
+            return &g_encoder_timings[i];
+    }
+    if (g_encoder_timing_count < MAX_TIMED_ENCODERS) {
+        g_encoder_timings[g_encoder_timing_count].name = name;
+        g_encoder_timings[g_encoder_timing_count].total_ns = 0;
+        g_encoder_timings[g_encoder_timing_count].call_count = 0;
+        g_encoder_timings[g_encoder_timing_count].frame_count = 0;
+        return &g_encoder_timings[g_encoder_timing_count++];
+    }
+    return NULL;
+}
+
+__attribute__((destructor))
+static void print_encoder_timings(void) {
+    if (!g_encoder_timing_initialized) return;
+    fprintf(stderr, "\n=== ENCODER TIMING SUMMARY ===\n");
+    fprintf(stderr, "%-20s %12s %12s %12s %12s\n", "Encoder", "Total(ms)", "Calls", "Frames", "Avg(us/fr)");
+    fprintf(stderr, "%-20s %12s %12s %12s %12s\n", "-------", "---------", "-----", "------", "---------");
+
+    uint64_t grand_total = 0;
+    for (int i = 0; i < g_encoder_timing_count; i++) {
+        EncoderTiming *t = &g_encoder_timings[i];
+        double total_ms = t->total_ns / 1000000.0;
+        double avg_us = t->frame_count > 0 ? (t->total_ns / 1000.0) / t->frame_count : 0;
+        fprintf(stderr, "%-20s %12.2f %12lu %12lu %12.2f\n",
+                t->name, total_ms, (unsigned long)t->call_count,
+                (unsigned long)t->frame_count, avg_us);
+        grand_total += t->total_ns;
+    }
+    fprintf(stderr, "%-20s %12.2f\n", "TOTAL", grand_total / 1000000.0);
+    fprintf(stderr, "==============================\n");
+}
+#endif
 #include "avcodec_internal.h"
 #include "codec_desc.h"
 #include "codec_internal.h"
@@ -235,7 +296,23 @@ int ff_encode_encode_cb(AVCodecContext *avctx, AVPacket *avpkt,
     const FFCodec *const codec = ffcodec(avctx->codec);
     int ret;
 
+#if ENCODE_TIMING_ENABLED
+    g_encoder_timing_initialized = 1;
+    uint64_t encode_start = encode_get_time_ns();
+#endif
+
     ret = codec->cb.encode(avctx, avpkt, frame, got_packet);
+
+#if ENCODE_TIMING_ENABLED
+    uint64_t encode_elapsed = encode_get_time_ns() - encode_start;
+    EncoderTiming *etiming = get_encoder_timing(avctx->codec->name);
+    if (etiming) {
+        etiming->total_ns += encode_elapsed;
+        etiming->call_count++;
+        if (*got_packet) etiming->frame_count++;
+    }
+#endif
+
     emms_c();
     av_assert0(ret <= 0);
 

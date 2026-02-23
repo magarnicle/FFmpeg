@@ -22,6 +22,62 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
+#include <stdio.h>
+#include <time.h>
+
+/* Timing instrumentation for profiling */
+#define TIMING_ENABLED 0
+#define MAX_TIMED_FILTERS 256
+
+typedef struct FilterTiming {
+    const char *name;
+    uint64_t total_ns;
+    uint64_t call_count;
+} FilterTiming;
+
+static FilterTiming g_filter_timings[MAX_TIMED_FILTERS];
+static int g_filter_timing_count = 0;
+static int g_timing_initialized = 0;
+
+static inline uint64_t get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static FilterTiming* get_filter_timing(const char *name) {
+    for (int i = 0; i < g_filter_timing_count; i++) {
+        if (g_filter_timings[i].name == name)
+            return &g_filter_timings[i];
+    }
+    if (g_filter_timing_count < MAX_TIMED_FILTERS) {
+        g_filter_timings[g_filter_timing_count].name = name;
+        g_filter_timings[g_filter_timing_count].total_ns = 0;
+        g_filter_timings[g_filter_timing_count].call_count = 0;
+        return &g_filter_timings[g_filter_timing_count++];
+    }
+    return NULL;
+}
+
+__attribute__((destructor))
+static void print_filter_timings(void) {
+    if (!g_timing_initialized) return;
+    fprintf(stderr, "\n=== FILTER TIMING SUMMARY ===\n");
+    fprintf(stderr, "%-30s %12s %12s %12s\n", "Filter", "Total(ms)", "Calls", "Avg(us)");
+    fprintf(stderr, "%-30s %12s %12s %12s\n", "------", "---------", "-----", "-------");
+
+    uint64_t grand_total = 0;
+    for (int i = 0; i < g_filter_timing_count; i++) {
+        FilterTiming *t = &g_filter_timings[i];
+        double total_ms = t->total_ns / 1000000.0;
+        double avg_us = t->call_count > 0 ? (t->total_ns / 1000.0) / t->call_count : 0;
+        fprintf(stderr, "%-30s %12.2f %12lu %12.2f\n",
+                t->name, total_ms, (unsigned long)t->call_count, avg_us);
+        grand_total += t->total_ns;
+    }
+    fprintf(stderr, "%-30s %12.2f\n", "TOTAL", grand_total / 1000000.0);
+    fprintf(stderr, "=============================\n");
+}
 #include "libavutil/buffer.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
@@ -1452,6 +1508,11 @@ int ff_filter_activate(AVFilterContext *filter)
     const FFFilter *const fi = fffilter(filter->filter);
     int ret;
 
+#if TIMING_ENABLED
+    g_timing_initialized = 1;
+    uint64_t start = get_time_ns();
+#endif
+
     /* Generic timeline support is not yet implemented but should be easy */
     av_assert1(!(fi->p.flags & AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC &&
                  fi->activate));
@@ -1459,6 +1520,16 @@ int ff_filter_activate(AVFilterContext *filter)
     ret = fi->activate ? fi->activate(filter) : filter_activate_default(filter);
     if (ret == FFERROR_NOT_READY)
         ret = 0;
+
+#if TIMING_ENABLED
+    uint64_t elapsed = get_time_ns() - start;
+    FilterTiming *timing = get_filter_timing(filter->filter->name);
+    if (timing) {
+        timing->total_ns += elapsed;
+        timing->call_count++;
+    }
+#endif
+
     return ret;
 }
 
