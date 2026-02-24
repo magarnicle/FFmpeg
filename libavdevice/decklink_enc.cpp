@@ -304,21 +304,8 @@ static void *decklink_video_output_thread(void *arg)
         pthread_cond_broadcast(&vq->cond);
         pthread_mutex_unlock(&vq->mutex);
 
-        /* Log before scheduling to detect blocking */
-        int64_t before_schedule = av_gettime_relative();
-        int64_t pkt_pts = pkt.pts;
-
         ret = decklink_schedule_video_packet(avctx, &pkt);
         av_packet_unref(&pkt);
-
-        int64_t after_schedule = av_gettime_relative();
-        int64_t schedule_time_ms = (after_schedule - before_schedule) / 1000;
-
-        /* Warn if scheduling took too long (indicates blocking on buffer slots) */
-        if (schedule_time_ms > 100) {
-            av_log(avctx, AV_LOG_WARNING, "Video scheduling blocked for %"PRId64"ms (pts=%"PRId64", queue=%d pkts)\n",
-                   schedule_time_ms, pkt_pts, vq->nb_packets);
-        }
 
         frames_scheduled++;
 
