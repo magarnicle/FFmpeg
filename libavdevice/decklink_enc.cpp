@@ -240,7 +240,7 @@ public:
             av_log(NULL, AV_LOG_WARNING, "decklink schedule running result is not ok: %d\n", schedule_running);
         }
         if (!active){
-            av_log(NULL, AV_LOG_WARNING, "decklink active status is false - playback stopped?\n");
+            av_log(NULL, AV_LOG_INFO, "decklink active status is false - playback stopped?\n");
         }
 
         pthread_mutex_lock(&ctx->mutex);
