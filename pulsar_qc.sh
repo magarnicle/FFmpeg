@@ -180,7 +180,7 @@ QC_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -i "$INPUT" \
         [a1]silencedetect=noise=-60dB:d=10[aout];
         [a2]ebur128=peak=true:framelog=verbose,anullsink;
         [a3]clipdetect=n=1000,anullsink;
-        [a4]dualmonodetect=ratio=80,anullsink
+        [a4]dualmonodetect=ratio=99,anullsink
     " -map "[vout]" -map "[aout]" -f null - 2>&1)
 
 
