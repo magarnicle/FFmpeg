@@ -201,33 +201,46 @@ public:
         decklink_frame *frame = static_cast<decklink_frame *>(_frame);
         struct decklink_ctx *ctx = frame->_ctx;
 
+        /* Decode the result code for logging */
+        const char *result_str;
+        switch (result) {
+            case bmdOutputFrameCompleted: result_str = "completed"; break;
+            case bmdOutputFrameDisplayedLate: result_str = "displayed_late"; break;
+            case bmdOutputFrameDropped: result_str = "dropped"; break;
+            case bmdOutputFrameFlushed: result_str = "flushed"; break;
+            default: result_str = "unknown"; break;
+        }
+
         if (frame->_avframe) {
             av_frame_unref(frame->_avframe);
-            if (result > 0) {
-                av_log(NULL, AV_LOG_WARNING, "AV Frame was not displayed, result code: %d\n", result);
+            if (result != bmdOutputFrameCompleted) {
+                av_log(NULL, AV_LOG_WARNING, "AV Frame callback: result=%s (%d)\n", result_str, result);
             }
-        } else if (result > 0) {
-                av_log(NULL, AV_LOG_WARNING, "Non-AV Frame was not displayed, result code: %d\n", result);
-            }
+        } else if (result != bmdOutputFrameCompleted) {
+            av_log(NULL, AV_LOG_WARNING, "Non-AV Frame callback: result=%s (%d)\n", result_str, result);
+        }
         if (frame->_avpacket) {
             av_packet_unref(frame->_avpacket);
-            if (result > 0) {
-                av_log(NULL, AV_LOG_WARNING, "AV Packet was not displayed, result code: %d\n", result);
+            if (result != bmdOutputFrameCompleted) {
+                av_log(NULL, AV_LOG_WARNING, "AV Packet callback: result=%s (%d)\n", result_str, result);
             }
         }
-        if (result > 0) {
-            av_log(NULL, AV_LOG_INFO, "decklink output result code: %d\n", result);
+        if (result != bmdOutputFrameCompleted) {
+            uint32_t buffered = 0;
+            ctx->dlo->GetBufferedVideoFrameCount(&buffered);
+            av_log(NULL, AV_LOG_WARNING, "Frame issue: result=%s, buffered_frames=%d, slots_avail=%d\n",
+                   result_str, buffered, ctx->frames_buffer_available_spots);
         } else {
-            av_log(NULL, AV_LOG_DEBUG, "decklink output result is normal\n");
+            av_log(NULL, AV_LOG_DEBUG, "Frame completed normally\n");
         }
 
         bool active = true;
         HRESULT schedule_running = ctx->dlo->IsScheduledPlaybackRunning(&active);
         if (schedule_running != S_OK) {
-            av_log(NULL, AV_LOG_INFO, "decklink schedule running result is not ok: %d\n", schedule_running);
+            av_log(NULL, AV_LOG_WARNING, "decklink schedule running result is not ok: %d\n", schedule_running);
         }
         if (!active){
-            av_log(NULL, AV_LOG_INFO, "decklink active status is false\n");
+            av_log(NULL, AV_LOG_WARNING, "decklink active status is false - playback stopped?\n");
         }
 
         pthread_mutex_lock(&ctx->mutex);
@@ -259,57 +272,136 @@ public:
 static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt);
 static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt);
 
-/* Consumer thread for async output buffer - pulls packets and schedules to decklink */
-static void *decklink_output_thread(void *arg)
+/* Video consumer thread - pulls from video queue and schedules to DeckLink.
+ * This thread may block waiting for DeckLink buffer slots, which is why we need
+ * a separate audio thread.
+ */
+static void *decklink_video_output_thread(void *arg)
 {
     struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
     AVFormatContext *avctx = ctx->avctx;
-    DecklinkPacketQueue *q = &ctx->output_queue;
+    DecklinkPacketQueue *vq = &ctx->output_video_queue;
     AVPacket pkt;
     int ret;
+    int idle_count = 0;
+    int64_t frames_scheduled = 0;
+    int64_t last_log_time = av_gettime_relative();
 
-    av_log(avctx, AV_LOG_INFO, "Async output thread started\n");
+    av_log(avctx, AV_LOG_INFO, "Video output thread started\n");
 
     while (!ctx->output_thread_stop) {
-        /* Use non-blocking get so we can check stop flag periodically */
-        ret = ff_decklink_packet_queue_get(q, &pkt, 0);
+        ret = ff_decklink_packet_queue_get(vq, &pkt, 0);
         if (ret <= 0) {
-            /* No packet available, sleep briefly and retry */
-            usleep(1000);  /* 1ms */
+            idle_count++;
+            usleep(idle_count < 10 ? 100 : 1000);
             continue;
         }
 
-        /* Signal producers that space is available */
-        pthread_mutex_lock(&q->mutex);
-        pthread_cond_broadcast(&q->cond);
-        pthread_mutex_unlock(&q->mutex);
+        idle_count = 0;
 
-        /* Dispatch based on stream type */
-        AVStream *st = avctx->streams[pkt.stream_index];
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            ret = decklink_schedule_video_packet(avctx, &pkt);
-        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            ret = decklink_schedule_audio_packet(avctx, &pkt);
-        } else {
-            ret = 0;  /* Ignore other types in async path */
-        }
+        /* Signal producers that space is available */
+        pthread_mutex_lock(&vq->mutex);
+        pthread_cond_broadcast(&vq->cond);
+        pthread_mutex_unlock(&vq->mutex);
+
+        /* Log before scheduling to detect blocking */
+        int64_t before_schedule = av_gettime_relative();
+        int64_t pkt_pts = pkt.pts;
+
+        ret = decklink_schedule_video_packet(avctx, &pkt);
         av_packet_unref(&pkt);
 
+        int64_t after_schedule = av_gettime_relative();
+        int64_t schedule_time_ms = (after_schedule - before_schedule) / 1000;
+
+        /* Warn if scheduling took too long (indicates blocking on buffer slots) */
+        if (schedule_time_ms > 100) {
+            av_log(avctx, AV_LOG_WARNING, "Video scheduling blocked for %"PRId64"ms (pts=%"PRId64", queue=%d pkts)\n",
+                   schedule_time_ms, pkt_pts, vq->nb_packets);
+        }
+
+        frames_scheduled++;
+
+        /* Periodic status logging */
+        if (after_schedule - last_log_time > 5000000) {  /* Every 5 seconds */
+            uint32_t buffered_frames = 0;
+            ctx->dlo->GetBufferedVideoFrameCount(&buffered_frames);
+            av_log(avctx, AV_LOG_INFO, "Video thread: %"PRId64" frames scheduled, %d in DeckLink buffer, %d in queue, %d slots available\n",
+                   frames_scheduled, buffered_frames, vq->nb_packets, ctx->frames_buffer_available_spots);
+            last_log_time = after_schedule;
+        }
+
         if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Async output thread: schedule failed with error %d. Stopping thread.\n", ret);
+            av_log(avctx, AV_LOG_ERROR, "Video output thread: schedule failed with error %d. Stopping.\n", ret);
             ctx->output_thread_error = ret;
-            break;  /* Exit thread on fatal error */
+            break;
         }
     }
 
-    av_log(avctx, AV_LOG_INFO, "Async output thread exiting\n");
+    av_log(avctx, AV_LOG_INFO, "Video output thread exiting\n");
+    return NULL;
+}
+
+/* Audio consumer thread - pulls from audio queue and schedules to DeckLink.
+ * Audio scheduling never blocks, so this thread runs independently of video.
+ */
+static void *decklink_audio_output_thread(void *arg)
+{
+    struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    DecklinkPacketQueue *aq = &ctx->output_audio_queue;
+    AVPacket pkt;
+    int ret;
+    int idle_count = 0;
+    int64_t packets_scheduled = 0;
+    int64_t last_log_time = av_gettime_relative();
+
+    av_log(avctx, AV_LOG_INFO, "Audio output thread started\n");
+
+    while (!ctx->output_thread_stop) {
+        ret = ff_decklink_packet_queue_get(aq, &pkt, 0);
+        if (ret <= 0) {
+            idle_count++;
+            usleep(idle_count < 10 ? 100 : 1000);
+            continue;
+        }
+
+        idle_count = 0;
+
+        /* Signal producers that space is available */
+        pthread_mutex_lock(&aq->mutex);
+        pthread_cond_broadcast(&aq->cond);
+        pthread_mutex_unlock(&aq->mutex);
+
+        ret = decklink_schedule_audio_packet(avctx, &pkt);
+        av_packet_unref(&pkt);
+
+        packets_scheduled++;
+
+        /* Periodic status logging */
+        int64_t now = av_gettime_relative();
+        if (now - last_log_time > 5000000) {  /* Every 5 seconds */
+            uint32_t buffered_samples = 0;
+            ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered_samples);
+            av_log(avctx, AV_LOG_INFO, "Audio thread: %"PRId64" packets scheduled, %d samples in DeckLink buffer, %d in queue\n",
+                   packets_scheduled, buffered_samples, aq->nb_packets);
+            last_log_time = now;
+        }
+
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Audio output thread: schedule failed with error %d. Stopping.\n", ret);
+            ctx->output_thread_error = ret;
+            break;
+        }
+    }
+
+    av_log(avctx, AV_LOG_INFO, "Audio output thread exiting\n");
     return NULL;
 }
 
 /* Blocking put for output queue - waits if queue is full */
-static int decklink_output_queue_put_blocking(struct decklink_ctx *ctx, AVPacket *pkt)
+static int decklink_output_queue_put_blocking(struct decklink_ctx *ctx, DecklinkPacketQueue *q, AVPacket *pkt)
 {
-    DecklinkPacketQueue *q = &ctx->output_queue;
     int pkt_size = pkt->size;
     int ret;
 
@@ -407,8 +499,19 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     if (st->time_base.den > 1000)
         ctx->frames_preroll /= 1000;
 
-    /* Buffer twice as many frames as the preroll. */
+    /* Buffer twice as many frames as the preroll, minimum 8 for robustness.
+     * When async output is enabled, we use a larger buffer (up to 60 frames = 2.4s at 25fps)
+     * to handle timing jitter from system scheduling.
+     */
     ctx->frames_buffer = ctx->frames_preroll * 2;
+    ctx->frames_buffer = FFMAX(ctx->frames_buffer, 8);  /* Minimum 8 frames */
+    if (cctx->output_buffer_size > 0) {
+        /* With async output, use maximum buffer for robustness against jitter.
+         * Also increase preroll to half the buffer to ensure we have good margin.
+         */
+        ctx->frames_buffer = 60;
+        ctx->frames_preroll = FFMAX(ctx->frames_preroll, 30);
+    }
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
@@ -575,29 +678,37 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     if (ctx->output_thread_started) {
         av_log(avctx, AV_LOG_INFO, "Waiting for async output buffer to drain...\n");
 
-        /* Wait for queue to drain before stopping */
-        static int log_counter = 0;
-        while (ff_decklink_packet_queue_size(&ctx->output_queue) > 0) {
+        /* Wait for both queues to drain before stopping */
+        int log_counter = 0;
+        while (ff_decklink_packet_queue_size(&ctx->output_video_queue) > 0 ||
+               ff_decklink_packet_queue_size(&ctx->output_audio_queue) > 0) {
             usleep(10000);  /* 10ms */
             if (++log_counter >= 100) {
-                unsigned long long qsize = ff_decklink_packet_queue_size(&ctx->output_queue);
-                av_log(avctx, AV_LOG_INFO, "Async buffer (draining): %llu / %"PRId64" bytes (%.1f%%), %d packets\n",
-                       qsize, cctx->output_buffer_size,
-                       100.0 * qsize / cctx->output_buffer_size,
-                       ctx->output_queue.nb_packets);
+                unsigned long long vqsize = ff_decklink_packet_queue_size(&ctx->output_video_queue);
+                unsigned long long aqsize = ff_decklink_packet_queue_size(&ctx->output_audio_queue);
+                unsigned long long total_size = vqsize + aqsize;
+                av_log(avctx, AV_LOG_INFO, "Async buffer (draining): %llu / %"PRId64" bytes (%.1f%%), %d video + %d audio packets\n",
+                       total_size, cctx->output_buffer_size,
+                       100.0 * total_size / cctx->output_buffer_size,
+                       ctx->output_video_queue.nb_packets,
+                       ctx->output_audio_queue.nb_packets);
                 log_counter = 0;
             }
         }
 
-        /* Signal thread to stop */
+        /* Signal threads to stop */
         ctx->output_thread_stop = 1;
-        pthread_mutex_lock(&ctx->output_queue.mutex);
-        pthread_cond_broadcast(&ctx->output_queue.cond);
-        pthread_mutex_unlock(&ctx->output_queue.mutex);
+        pthread_mutex_lock(&ctx->output_video_queue.mutex);
+        pthread_cond_broadcast(&ctx->output_video_queue.cond);
+        pthread_mutex_unlock(&ctx->output_video_queue.mutex);
+        pthread_mutex_lock(&ctx->output_audio_queue.mutex);
+        pthread_cond_broadcast(&ctx->output_audio_queue.cond);
+        pthread_mutex_unlock(&ctx->output_audio_queue.mutex);
 
-        pthread_join(ctx->output_thread, NULL);
+        pthread_join(ctx->output_video_thread, NULL);
+        pthread_join(ctx->output_audio_thread, NULL);
         ctx->output_thread_started = 0;
-        av_log(avctx, AV_LOG_INFO, "Async output thread stopped\n");
+        av_log(avctx, AV_LOG_INFO, "Async output threads stopped\n");
     }
 
     if (ctx->playback_started) {
@@ -645,9 +756,10 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     if (ctx->teletext_st)
         ff_decklink_packet_queue_end(&ctx->teletext_queue);
 
-    /* Clean up async output queue if it was used */
+    /* Clean up async output queues if they were used */
     if (cctx->output_buffer_size > 0) {
-        ff_decklink_packet_queue_end(&ctx->output_queue);
+        ff_decklink_packet_queue_end(&ctx->output_video_queue);
+        ff_decklink_packet_queue_end(&ctx->output_audio_queue);
     }
 
     /* Free source filename tracking */
@@ -1233,8 +1345,14 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         double speed;
         if (ctx->dlo->GetScheduledStreamTime(ctx->bmd_tb_den, &stream_time, &speed) == S_OK) {
             int64_t stream_pts = stream_time / ctx->bmd_tb_num;
+            double ahead_secs = (double)(pkt->pts - stream_pts) * ctx->bmd_tb_num / ctx->bmd_tb_den;
+
+            /* Log timing info at debug level */
+            av_log(avctx, AV_LOG_DEBUG, "Video timing: pkt_pts=%"PRId64" stream_pts=%"PRId64" ahead=%.3fs speed=%.2f\n",
+                   pkt->pts, stream_pts, ahead_secs, speed);
+
             if (pkt->pts < stream_pts) {
-                double behind_secs = (double)(stream_pts - pkt->pts) * ctx->bmd_tb_num / ctx->bmd_tb_den;
+                double behind_secs = -ahead_secs;
 
                 /* Error if too far behind */
                 if (cctx->late_threshold > 0 && behind_secs > cctx->late_threshold) {
@@ -1292,6 +1410,9 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     /* Wait for decklink buffer slot */
     pthread_mutex_lock(&ctx->mutex);
+    if (ctx->frames_buffer_available_spots == 0) {
+        av_log(avctx, AV_LOG_DEBUG, "Video scheduling: waiting for buffer slot (pts=%"PRId64")\n", pkt->pts);
+    }
     while (ctx->frames_buffer_available_spots == 0) {
         pthread_cond_wait(&ctx->cond, &ctx->mutex);
     }
@@ -1309,9 +1430,12 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     frame->Release();
     if (hr != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Could not schedule video frame."
-                " error %08x.\n", (uint32_t) hr);
+                " error %08x (pts=%"PRId64").\n", (uint32_t) hr, pkt->pts);
         return AVERROR(EIO);
     }
+
+    av_log(avctx, AV_LOG_DEBUG, "Scheduled video frame pts=%"PRId64" (slots_remaining=%d)\n",
+           pkt->pts, ctx->frames_buffer_available_spots);
 
     ctx->dlo->GetBufferedVideoFrameCount(&buffered);
     if (pkt->pts > 2 && buffered <= 2)
@@ -1341,7 +1465,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
-    /* If async buffer is enabled, queue the packet */
+    /* If async buffer is enabled, queue the packet to the video queue */
     if (ctx->output_thread_started) {
         /* Check for fatal errors from output thread */
         if (ctx->output_thread_error) {
@@ -1354,10 +1478,10 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
             av_log(avctx, AV_LOG_ERROR, "Could not clone packet for async buffer.\n");
             return AVERROR(ENOMEM);
         }
-        int ret = decklink_output_queue_put_blocking(ctx, pkt_copy);
+        int ret = decklink_output_queue_put_blocking(ctx, &ctx->output_video_queue, pkt_copy);
         av_packet_free(&pkt_copy);
         if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to queue packet to async buffer.\n");
+            av_log(avctx, AV_LOG_ERROR, "Failed to queue video packet to async buffer.\n");
             return ret;
         }
 
@@ -1370,11 +1494,14 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         /* Log buffer fill level periodically (every ~100 video frames) */
         static int log_counter = 0;
         if (++log_counter >= 100) {
-            unsigned long long qsize = ff_decklink_packet_queue_size(&ctx->output_queue);
-            av_log(avctx, AV_LOG_INFO, "Async buffer: %llu / %"PRId64" bytes (%.1f%%), %d packets\n",
-                   qsize, cctx->output_buffer_size,
-                   100.0 * qsize / cctx->output_buffer_size,
-                   ctx->output_queue.nb_packets);
+            unsigned long long vqsize = ff_decklink_packet_queue_size(&ctx->output_video_queue);
+            unsigned long long aqsize = ff_decklink_packet_queue_size(&ctx->output_audio_queue);
+            unsigned long long total_size = vqsize + aqsize;
+            av_log(avctx, AV_LOG_INFO, "Async buffer: %llu / %"PRId64" bytes (%.1f%%), %d video + %d audio packets\n",
+                   total_size, cctx->output_buffer_size,
+                   100.0 * total_size / cctx->output_buffer_size,
+                   ctx->output_video_queue.nb_packets,
+                   ctx->output_audio_queue.nb_packets);
             log_counter = 0;
         }
         return 0;
@@ -1400,8 +1527,14 @@ static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
         BMDTimeValue stream_time;
         double speed;
         if (ctx->dlo->GetScheduledStreamTime(bmdAudioSampleRate48kHz, &stream_time, &speed) == S_OK) {
+            double ahead_secs = (double)(pkt->pts - stream_time) / 48000.0;
+
+            /* Log timing info at debug level */
+            av_log(avctx, AV_LOG_DEBUG, "Audio timing: pkt_pts=%"PRId64" stream_time=%"PRId64" ahead=%.3fs speed=%.2f\n",
+                   pkt->pts, (int64_t)stream_time, ahead_secs, speed);
+
             if (pkt->pts < stream_time) {
-                double behind_secs = (double)(stream_time - pkt->pts) / 48000.0;
+                double behind_secs = -ahead_secs;
 
                 /* Error if too far behind */
                 if (cctx->late_threshold > 0 && behind_secs > cctx->late_threshold) {
@@ -1452,7 +1585,7 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
-    /* If async buffer is enabled, queue the packet */
+    /* If async buffer is enabled, queue the packet to the audio queue */
     if (ctx->output_thread_started) {
         /* Check for fatal errors from output thread */
         if (ctx->output_thread_error) {
@@ -1465,7 +1598,7 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
             av_log(avctx, AV_LOG_ERROR, "Could not clone audio packet for async buffer.\n");
             return AVERROR(ENOMEM);
         }
-        int ret = decklink_output_queue_put_blocking(ctx, pkt_copy);
+        int ret = decklink_output_queue_put_blocking(ctx, &ctx->output_audio_queue, pkt_copy);
         av_packet_free(&pkt_copy);
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "Failed to queue audio packet to async buffer.\n");
@@ -1633,21 +1766,49 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
             }
         }
 
+        /* Split buffer between video and audio queues.
+         * Video frames are much larger (~5MB for 1080p v210) vs audio (~4KB per packet),
+         * so allocate 95% to video and 5% to audio. Minimum 100MB for audio to ensure
+         * adequate buffering even with large video buffers.
+         */
+        int64_t audio_buffer_size = FFMAX(max_buffer_size / 20, 100 * 1024 * 1024);  /* 5% or 100MB min */
+        int64_t video_buffer_size = max_buffer_size - audio_buffer_size;
+
         ctx->avctx = avctx;  /* Store for consumer thread access */
         ctx->output_thread_stop = 0;
         ctx->output_thread_error = 0;
-        ff_decklink_packet_queue_init(avctx, &ctx->output_queue, max_buffer_size);
+        ff_decklink_packet_queue_init(avctx, &ctx->output_video_queue, video_buffer_size);
+        ff_decklink_packet_queue_init(avctx, &ctx->output_audio_queue, audio_buffer_size);
 
-        ret = pthread_create(&ctx->output_thread, NULL, decklink_output_thread, ctx);
+        /* Create separate threads for video and audio to prevent blocking issues.
+         * Video scheduling can block waiting for DeckLink buffer slots, so audio
+         * needs its own thread to ensure continuous scheduling.
+         */
+        ret = pthread_create(&ctx->output_video_thread, NULL, decklink_video_output_thread, ctx);
         if (ret != 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE];
             av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, AVERROR(ret));
-            av_log(avctx, AV_LOG_ERROR, "Failed to create async output thread: %s\n", errbuf);
-            ff_decklink_packet_queue_end(&ctx->output_queue);
+            av_log(avctx, AV_LOG_ERROR, "Failed to create video output thread: %s\n", errbuf);
+            ff_decklink_packet_queue_end(&ctx->output_video_queue);
+            ff_decklink_packet_queue_end(&ctx->output_audio_queue);
             goto error;
         }
+
+        ret = pthread_create(&ctx->output_audio_thread, NULL, decklink_audio_output_thread, ctx);
+        if (ret != 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, AVERROR(ret));
+            av_log(avctx, AV_LOG_ERROR, "Failed to create audio output thread: %s\n", errbuf);
+            ctx->output_thread_stop = 1;
+            pthread_join(ctx->output_video_thread, NULL);
+            ff_decklink_packet_queue_end(&ctx->output_video_queue);
+            ff_decklink_packet_queue_end(&ctx->output_audio_queue);
+            goto error;
+        }
+
         ctx->output_thread_started = 1;
-        av_log(avctx, AV_LOG_INFO, "Async output buffer enabled: %"PRId64" bytes\n", max_buffer_size);
+        av_log(avctx, AV_LOG_INFO, "Async output buffer enabled: %"PRId64" bytes video + %"PRId64" bytes audio\n",
+               video_buffer_size, audio_buffer_size);
     }
 
     return 0;

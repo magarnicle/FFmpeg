@@ -199,9 +199,11 @@ struct decklink_ctx {
     int audio_depth;
     unsigned long tc_seen;    // used with option wait_for_tc
 
-    /* Async output buffer */
-    DecklinkPacketQueue output_queue;
-    pthread_t output_thread;
+    /* Async output buffer - separate queues and threads for audio and video */
+    DecklinkPacketQueue output_video_queue;
+    DecklinkPacketQueue output_audio_queue;
+    pthread_t output_video_thread;
+    pthread_t output_audio_thread;
     int output_thread_started;
     int output_thread_stop;
     int output_thread_error;   // Fatal error from output thread
