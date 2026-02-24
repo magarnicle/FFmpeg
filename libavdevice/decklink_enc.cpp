@@ -309,6 +309,8 @@ static void *decklink_video_output_thread(void *arg)
 
         frames_scheduled++;
 
+        int64_t after_schedule = av_gettime_relative();
+
         /* Periodic status logging */
         if (after_schedule - last_log_time > 5000000) {  /* Every 5 seconds */
             uint32_t buffered_frames = 0;
