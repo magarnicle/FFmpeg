@@ -507,10 +507,11 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     ctx->frames_buffer = FFMAX(ctx->frames_buffer, 8);  /* Minimum 8 frames */
     if (cctx->output_buffer_size > 0) {
         /* With async output, use maximum buffer for robustness against jitter.
-         * Also increase preroll to half the buffer to ensure we have good margin.
+         * Keep preroll minimal (2 frames) for fast on-air startup - the large
+         * async buffer upstream provides the timing safety, not the preroll.
          */
         ctx->frames_buffer = 60;
-        ctx->frames_preroll = FFMAX(ctx->frames_preroll, 30);
+        ctx->frames_preroll = FFMIN(ctx->frames_preroll, 2);
     }
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
     pthread_mutex_init(&ctx->mutex, NULL);
