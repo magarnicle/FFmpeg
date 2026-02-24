@@ -503,7 +503,6 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
      * When async output is enabled, we use a larger buffer (up to 60 frames = 2.4s at 25fps)
      * to handle timing jitter from system scheduling.
      */
-    ctx->frames_buffer = ctx->frames_preroll * 2;
     ctx->frames_buffer = FFMAX(ctx->frames_buffer, 8);  /* Minimum 8 frames */
     if (cctx->output_buffer_size > 0) {
         /* With async output, use maximum buffer for robustness against jitter.
@@ -511,7 +510,6 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
          * async buffer upstream provides the timing safety, not the preroll.
          */
         ctx->frames_buffer = 60;
-        ctx->frames_preroll = FFMIN(ctx->frames_preroll, 2);
     }
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
     pthread_mutex_init(&ctx->mutex, NULL);
