@@ -47,6 +47,8 @@ typedef struct SolidColorDetectContext {
     double  picture_ratio_th;
     double  pixel_th;
     double  dev_th;
+    int     grid_size;      /* grid NxN sections for uniformity check */
+    double  section_th;     /* max allowed deviation between section and frame avg */
 
     unsigned int nb_matching_pixels;
     AVRational   time_base;
@@ -84,6 +86,8 @@ static const AVOption solidcolordetect_options[] = {
     { "pix_th",    "set the pixel tolerance threshold", OFFSET(pixel_th), AV_OPT_TYPE_DOUBLE, {.dbl=.10}, 0, 1, FLAGS },
     { "dev_th",      "set the max pixel deviation threshold", OFFSET(dev_th), AV_OPT_TYPE_DOUBLE, {.dbl=1.0}, 0, 1, FLAGS },
     { "max_dev_th",  "set the max pixel deviation threshold", OFFSET(dev_th), AV_OPT_TYPE_DOUBLE, {.dbl=1.0}, 0, 1, FLAGS },
+    { "grid",        "set grid size NxN for section uniformity check (0=disabled)", OFFSET(grid_size), AV_OPT_TYPE_INT, {.i64=0}, 0, 10, FLAGS },
+    { "section_th",  "set max section deviation from frame average (0-1)", OFFSET(section_th), AV_OPT_TYPE_DOUBLE, {.dbl=0.05}, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -353,6 +357,108 @@ static unsigned compute_max_dev16(const uint8_t *src, ptrdiff_t stride,
     return max_dev;
 }
 
+/**
+ * Compute average of a rectangular region (8-bit).
+ */
+static unsigned compute_region_avg8(const uint8_t *src, ptrdiff_t stride,
+                                    int x0, int y0, int region_w, int region_h)
+{
+    uint64_t sum = 0;
+    src += y0 * stride + x0;
+    for (int y = 0; y < region_h; y++) {
+        for (int x = 0; x < region_w; x++)
+            sum += src[x];
+        src += stride;
+    }
+    return (unsigned)(sum / ((uint64_t)region_w * region_h));
+}
+
+/**
+ * Compute average of a rectangular region (>8-bit).
+ */
+static unsigned compute_region_avg16(const uint8_t *src, ptrdiff_t stride,
+                                     int x0, int y0, int region_w, int region_h)
+{
+    uint64_t sum = 0;
+    src += y0 * stride + x0 * 2;
+    for (int y = 0; y < region_h; y++) {
+        const uint16_t *src16 = (const uint16_t *)src;
+        for (int x = 0; x < region_w; x++)
+            sum += src16[x];
+        src += stride;
+    }
+    return (unsigned)(sum / ((uint64_t)region_w * region_h));
+}
+
+/**
+ * Check if all grid sections have similar averages.
+ * Returns 1 if uniform (all sections within threshold), 0 otherwise.
+ */
+static int check_grid_uniformity(const uint8_t *data_y, ptrdiff_t linesize_y,
+                                 const uint8_t *data_u, ptrdiff_t linesize_u,
+                                 const uint8_t *data_v, ptrdiff_t linesize_v,
+                                 int width, int height,
+                                 int chroma_w, int chroma_h,
+                                 int log2_chroma_w, int log2_chroma_h,
+                                 unsigned ref_y, unsigned ref_u, unsigned ref_v,
+                                 int grid_size, unsigned section_tol,
+                                 int depth)
+{
+    int section_w = width / grid_size;
+    int section_h = height / grid_size;
+    int chroma_section_w = chroma_w / grid_size;
+    int chroma_section_h = chroma_h / grid_size;
+
+    if (section_w < 1 || section_h < 1)
+        return 1; /* Frame too small for grid, skip check */
+
+    for (int gy = 0; gy < grid_size; gy++) {
+        for (int gx = 0; gx < grid_size; gx++) {
+            int x0 = gx * section_w;
+            int y0 = gy * section_h;
+            int sw = (gx == grid_size - 1) ? (width - x0) : section_w;
+            int sh = (gy == grid_size - 1) ? (height - y0) : section_h;
+
+            unsigned sec_y, sec_u, sec_v;
+            unsigned diff_y, diff_u, diff_v;
+
+            if (depth <= 8) {
+                sec_y = compute_region_avg8(data_y, linesize_y, x0, y0, sw, sh);
+            } else {
+                sec_y = compute_region_avg16(data_y, linesize_y, x0, y0, sw, sh);
+            }
+
+            diff_y = sec_y > ref_y ? sec_y - ref_y : ref_y - sec_y;
+            if (diff_y > section_tol)
+                return 0;
+
+            /* Check chroma if available */
+            if (data_u && data_v && chroma_section_w >= 1 && chroma_section_h >= 1) {
+                int cx0 = gx * chroma_section_w;
+                int cy0 = gy * chroma_section_h;
+                int csw = (gx == grid_size - 1) ? (chroma_w - cx0) : chroma_section_w;
+                int csh = (gy == grid_size - 1) ? (chroma_h - cy0) : chroma_section_h;
+
+                if (depth <= 8) {
+                    sec_u = compute_region_avg8(data_u, linesize_u, cx0, cy0, csw, csh);
+                    sec_v = compute_region_avg8(data_v, linesize_v, cx0, cy0, csw, csh);
+                } else {
+                    sec_u = compute_region_avg16(data_u, linesize_u, cx0, cy0, csw, csh);
+                    sec_v = compute_region_avg16(data_v, linesize_v, cx0, cy0, csw, csh);
+                }
+
+                diff_u = sec_u > ref_u ? sec_u - ref_u : ref_u - sec_u;
+                diff_v = sec_v > ref_v ? sec_v - ref_v : ref_v - sec_v;
+
+                if (diff_u > section_tol || diff_v > section_tol)
+                    return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
 {
     FilterLink *inl = ff_filter_link(inlink);
@@ -452,6 +558,26 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
             s->dev_th * (235 - 16) * factor;
         if (frame_dev > dev_th_i)
             picture_ratio = 0;
+
+        /* Grid uniformity check: reject frames with non-uniform sections */
+        if (picture_ratio >= s->picture_ratio_th && s->grid_size > 0) {
+            int chroma_w = AV_CEIL_RSHIFT(w, desc->log2_chroma_w);
+            int chroma_h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
+            unsigned section_tol_i = full ? s->section_th * max :
+                s->section_th * (235 - 16) * factor;
+            int uniform = check_grid_uniformity(
+                picref->data[0], picref->linesize[0],
+                desc->nb_components >= 3 ? picref->data[1] : NULL,
+                desc->nb_components >= 3 ? picref->linesize[1] : 0,
+                desc->nb_components >= 3 ? picref->data[2] : NULL,
+                desc->nb_components >= 3 ? picref->linesize[2] : 0,
+                w, h, chroma_w, chroma_h,
+                desc->log2_chroma_w, desc->log2_chroma_h,
+                s->avg_y, s->avg_u, s->avg_v,
+                s->grid_size, section_tol_i, s->depth);
+            if (!uniform)
+                picture_ratio = 0;
+        }
 
         if (picture_ratio < s->picture_ratio_th) {
             /* dev_th rejected this frame; end any ongoing solid period */

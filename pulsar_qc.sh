@@ -170,10 +170,11 @@ info "Running all quality checks in one pass..."
 #   Video: chain solidcolordetect -> freezedetect -> colorbarsdetect -> output
 #   Audio: asplit=4, one branch (silencedetect) to output, others to anullsink
 #   This decodes the file only once instead of 7 separate passes.
+             #solidcolordetect=d=0.1:grid=3:section_th=0.02 potentially only this is needed
 QC_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -i "$INPUT" \
     -filter_complex "
         [0:v]blackdetect=d=3:pix_th=0.0784:pic_th=0.98,
-             solidcolordetect=d=0:pix_th=0.05:pic_th=0.99:dev_th=0.60,
+             solidcolordetect=d=0.1:grid=3:section_th=0.02:pix_th=0.05:pic_th=0.99:dev_th=0.60,
              freezedetect=n=0.001:d=20,
              colorbarsdetect=d=0.5[vout];
         [0:a]asplit=4[a1][a2][a3][a4];
