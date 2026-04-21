@@ -34056,11 +34056,12 @@ ffmpeg -i magnitude.nut -i phase.nut -lavfi spectrumsynth=channels=2:sample_rate
 @end example
 @end itemize
 
-@section split, asplit
+@section split, asplit, ssplit
 
 Split input into several identical outputs.
 
-@code{asplit} works with audio input, @code{split} with video.
+@code{asplit} works with audio input, @code{split} with video, and
+@code{ssplit} with subtitles.
 
 The filter accepts a single parameter which specifies the number of outputs. If
 unspecified, it defaults to 2.
@@ -34094,6 +34095,13 @@ one padded:
 Create 5 copies of the input audio with @command{ffmpeg}:
 @example
 ffmpeg -i INPUT -filter_complex asplit=5 OUTPUT
+@end example
+
+@item
+Split a subtitle stream to burn into video and pass through:
+@example
+[0:s] ssplit [subs1][subs2];
+[0:v][subs1] subtitles [vout]
 @end example
 @end itemize
 

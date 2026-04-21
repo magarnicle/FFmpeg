@@ -33,6 +33,7 @@
 #include "avfilter.h"
 #include "audio.h"
 #include "filters.h"
+#include "subtitle.h"
 #include "video.h"
 
 typedef struct SplitContext {
@@ -116,13 +117,13 @@ static int activate(AVFilterContext *ctx)
 }
 
 #define OFFSET(x) offsetof(SplitContext, x)
-#define FLAGS (AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
+#define FLAGS (AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_SUBTITLE_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
 static const AVOption options[] = {
     { "outputs", "set number of outputs", OFFSET(nb_outputs), AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT_MAX, FLAGS },
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS_EXT(split, "(a)split", options);
+AVFILTER_DEFINE_CLASS_EXT(split, "(a/s)split", options);
 
 const FFFilter ff_vf_split = {
     .p.name        = "split",
@@ -144,4 +145,15 @@ const FFFilter ff_af_asplit = {
     .init        = split_init,
     .activate    = activate,
     FILTER_INPUTS(ff_audio_default_filterpad),
+};
+
+const FFFilter ff_sf_ssplit = {
+    .p.name        = "ssplit",
+    .p.description = NULL_IF_CONFIG_SMALL("Pass on the subtitle input to N subtitle outputs."),
+    .p.priv_class  = &split_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_OUTPUTS | AVFILTER_FLAG_METADATA_ONLY,
+    .priv_size   = sizeof(SplitContext),
+    .init        = split_init,
+    .activate    = activate,
+    FILTER_INPUTS(ff_subtitle_default_filterpad),
 };
