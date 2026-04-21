@@ -1764,11 +1764,11 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
 
         /* Split buffer between video and audio queues.
          * Video frames are much larger (~5MB for 1080p v210) vs audio (~4KB per packet),
-         * so allocate 95% to video and 5% to audio. Minimum 100MB for audio to ensure
-         * adequate buffering even with large video buffers.
+         * so allocate 95% to video and 5% to audio. Minimum 100MB each to ensure
+         * adequate buffering even with small requested sizes.
          */
-        int64_t audio_buffer_size = FFMAX(max_buffer_size / 20, 100 * 1024 * 1024);  /* 5% or 100MB min */
-        int64_t video_buffer_size = max_buffer_size - audio_buffer_size;
+        int64_t audio_buffer_size = FFMAX(max_buffer_size / 20, 100 * 1024 * 1024);
+        int64_t video_buffer_size = FFMAX(max_buffer_size - audio_buffer_size, 100 * 1024 * 1024);
 
         ctx->avctx = avctx;  /* Store for consumer thread access */
         ctx->output_thread_stop = 0;
