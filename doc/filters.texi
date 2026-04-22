@@ -34366,4 +34366,39 @@ Get movie duration in AV_TIME_BASE units.
 
 @end table
 
+@section snullsrc
+
+The null subtitle source, return empty subtitle frames. It is useful
+for concatenating videos where some segments lack subtitle streams.
+
+This source accepts the following options:
+
+@table @option
+
+@item duration, d
+Set the duration of the sourced subtitles. See
+@ref{time duration syntax,,the Time duration section in the ffmpeg-utils(1) manual,ffmpeg-utils}
+for the accepted syntax.
+
+If not specified, or the expressed duration is negative, the subtitles are
+supposed to be generated forever.
+
+@item time_base, tb
+Set the time base for the subtitle timestamps. Defaults to 1/1000 (milliseconds).
+
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Concatenate two videos where only the first has subtitles, using a 30 second
+null subtitle stream for the second:
+@example
+ffmpeg -i with_subs.mp4 -i no_subs.mp4 -filter_complex \
+  "[0:v][0:a][0:s][1:v][1:a][snullsrc=d=30]concat=n=2:v=1:a=1:s=1[v][a][s]" \
+  -map "[v]" -map "[a]" -map "[s]" output.mp4
+@end example
+@end itemize
+
 @c man end MULTIMEDIA SOURCES

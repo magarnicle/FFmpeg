@@ -415,6 +415,7 @@ OBJS-$(CONFIG_NOISE_FILTER)                  += vf_noise.o
 OBJS-$(CONFIG_NORMALIZE_FILTER)              += vf_normalize.o
 OBJS-$(CONFIG_NULL_FILTER)                   += vf_null.o
 OBJS-$(CONFIG_SNULL_FILTER)                  += sf_snull.o subtitle.o
+OBJS-$(CONFIG_SNULLSRC_FILTER)               += ssrc_snullsrc.o subtitle.o
 OBJS-$(CONFIG_OCR_FILTER)                    += vf_ocr.o
 OBJS-$(CONFIG_OCV_FILTER)                    += vf_libopencv.o
 OBJS-$(CONFIG_OSCILLOSCOPE_FILTER)           += vf_datascope.o

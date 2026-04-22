@@ -583,6 +583,7 @@ extern const FFFilter ff_vsrc_life;
 extern const FFFilter ff_vsrc_mandelbrot;
 extern const FFFilter ff_vsrc_mptestsrc;
 extern const FFFilter ff_vsrc_nullsrc;
+extern const FFFilter ff_ssrc_snullsrc;
 extern const FFFilter ff_vsrc_openclsrc;
 extern const FFFilter ff_vsrc_qrencodesrc;
 extern const FFFilter ff_vsrc_pal75bars;
