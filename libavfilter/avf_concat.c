@@ -227,8 +227,18 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
                    seg_idx, cat->delta_ts);
     }
 
-    buf->pts = av_rescale_q(buf->pts, inlink->time_base, outlink->time_base);
-    buf->duration = av_rescale_q(buf->duration, inlink->time_base, outlink->time_base);
+    /* Use frame time_base if link time_base is invalid (common for subtitles) */
+    AVRational in_tb = inlink->time_base;
+    AVRational out_tb = outlink->time_base;
+    if (in_tb.num <= 0 || in_tb.den <= 0)
+        in_tb = buf->time_base;
+    if (in_tb.num <= 0 || in_tb.den <= 0)
+        in_tb = AV_TIME_BASE_Q;
+    if (out_tb.num <= 0 || out_tb.den <= 0)
+        out_tb = AV_TIME_BASE_Q;
+    buf->pts = av_rescale_q(buf->pts, in_tb, out_tb);
+    buf->duration = av_rescale_q(buf->duration, in_tb, out_tb);
+    buf->time_base = out_tb;
     in->pts = buf->pts;
     in->nb_frames++;
     /* add duration to input PTS */
@@ -236,7 +246,7 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
         /* use number of audio samples */
         in->pts += av_rescale_q(buf->nb_samples,
                                 av_make_q(1, inlink->sample_rate),
-                                outlink->time_base);
+                                out_tb);
     else if (inlink->type == AVMEDIA_TYPE_SUBTITLE && buf->duration > 0)
         /* use subtitle end time (pts + duration) for segment boundary calculation */
         in->pts = buf->pts + buf->duration;
@@ -250,7 +260,7 @@ static int push_frame(AVFilterContext *ctx, unsigned in_no, AVFrame *buf)
     if (inlink->type == AVMEDIA_TYPE_SUBTITLE && buf->buf[0]) {
         AVSubtitle *sub = (AVSubtitle *)buf->buf[0]->data;
         if (sub) {
-            int64_t delta_us = av_rescale_q(cat->delta_ts, outlink->time_base, AV_TIME_BASE_Q);
+            int64_t delta_us = av_rescale_q(cat->delta_ts, out_tb, AV_TIME_BASE_Q);
             sub->pts += delta_us;
         }
     }

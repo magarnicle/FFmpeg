@@ -821,16 +821,32 @@ static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
     AVFilterLink *sub_link = avctx->inputs[1];
     int64_t start_pts, duration, end_pts;
 
-    if (!frame->buf[0])
+    av_log(avctx, AV_LOG_DEBUG, "process_subtitle_frame: frame=%p buf[0]=%p pts=%"PRId64"\n",
+           frame, frame ? frame->buf[0] : NULL, frame ? frame->pts : 0);
+
+    if (!frame->buf[0]) {
+        av_log(avctx, AV_LOG_WARNING, "Subtitle frame has no buf[0]\n");
         return 0;
+    }
 
     sub = (AVSubtitle *)frame->buf[0]->data;
-    if (!sub)
+    if (!sub) {
+        av_log(avctx, AV_LOG_WARNING, "Subtitle frame buf[0]->data is NULL\n");
         return 0;
+    }
 
-    start_pts = av_rescale_q(frame->pts, sub_link->time_base, AV_TIME_BASE_Q);
+    /* Use frame time_base if valid, otherwise assume AV_TIME_BASE_Q */
+    AVRational tb = frame->time_base;
+    if (tb.num <= 0 || tb.den <= 0)
+        tb = AV_TIME_BASE_Q;
+
+    start_pts = av_rescale_q(frame->pts, tb, AV_TIME_BASE_Q);
     duration = (int64_t)sub->end_display_time * 1000;
     end_pts = start_pts + duration;
+
+    av_log(avctx, AV_LOG_DEBUG, "Subtitle: num_rects=%u end_display=%u tb=%d/%d start=%.3fs end=%.3fs\n",
+           sub->num_rects, sub->end_display_time, tb.num, tb.den,
+           start_pts / 1e6, end_pts / 1e6);
 
     for (int i = 0; i < sub->num_rects; i++) {
         char *text = extract_subtitle_text(sub->rects[i]);
@@ -882,6 +898,17 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVF
 
     /* Convert frame PTS to AV_TIME_BASE */
     frame_pts = av_rescale_q(frame->pts, inlink->time_base, AV_TIME_BASE_Q);
+
+    /* Debug: log video frame and event state */
+    if (frame_pts < 2 * AV_TIME_BASE) {
+        av_log(avctx, AV_LOG_DEBUG, "Video frame_pts=%"PRId64" (%.3fs), nb_events=%d next_load=%d\n",
+               frame_pts, frame_pts / 1e6, ctx->nb_events, ctx->next_load);
+        if (ctx->nb_events > 0) {
+            SubtitleEvent *ev = &ctx->events[0];
+            av_log(avctx, AV_LOG_DEBUG, "  First event: start=%"PRId64" (%.3fs) cc_data_size=%d\n",
+                   ev->start_pts, ev->start_pts / 1e6, ev->cc_data_size);
+        }
+    }
 
     /* If not currently draining anything, check for new work */
     if (ctx->drain_event < 0 && ctx->erase_event < 0) {
@@ -989,12 +1016,16 @@ static int activate(AVFilterContext *avctx)
 
         /* Drain all available subtitle frames first */
         if (!ctx->sub_eof) {
+            int queued = ff_inlink_queued_frames(sub_link);
+            if (queued > 0)
+                av_log(avctx, AV_LOG_DEBUG, "Subtitle input has %d queued frames\n", queued);
             while (1) {
                 ret = ff_inlink_consume_frame(sub_link, &frame);
                 if (ret < 0)
                     return ret;
                 if (!ret)
                     break;
+                av_log(avctx, AV_LOG_DEBUG, "Consumed subtitle frame\n");
                 ret = process_subtitle_frame(avctx, frame);
                 av_frame_free(&frame);
                 if (ret < 0)

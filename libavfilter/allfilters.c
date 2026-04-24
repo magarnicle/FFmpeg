@@ -600,6 +600,7 @@ extern const FFFilter ff_vsrc_yuvtestsrc;
 extern const FFFilter ff_vsrc_zoneplate;
 
 extern const FFFilter ff_vsink_nullsink;
+extern const FFFilter ff_ssink_snullsink;
 
 /* multimedia filters */
 extern const FFFilter ff_avf_a3dscope;
