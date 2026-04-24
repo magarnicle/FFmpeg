@@ -25,6 +25,7 @@
 #include "audio.h"
 #include "avfilter.h"
 #include "filters.h"
+#include "subtitle.h"
 #include "video.h"
 
 typedef struct CueContext {
@@ -89,7 +90,7 @@ static int activate(AVFilterContext *ctx)
 }
 
 #define OFFSET(x) offsetof(CueContext, x)
-#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
+#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_SUBTITLE_PARAM | AV_OPT_FLAG_FILTERING_PARAM
 static const AVOption options[] = {
     { "cue", "cue unix timestamp in microseconds", OFFSET(cue), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, FLAGS },
     { "preroll", "preroll duration in seconds", OFFSET(preroll), AV_OPT_TYPE_DURATION, { .i64 = 0 }, 0, INT64_MAX, FLAGS },
@@ -123,3 +124,15 @@ const FFFilter ff_af_acue = {
     .activate    = activate,
 };
 #endif /* CONFIG_ACUE_FILTER */
+
+#if CONFIG_SCUE_FILTER
+const FFFilter ff_sf_scue = {
+    .p.name        = "scue",
+    .p.description = NULL_IF_CONFIG_SMALL("Delay subtitle filtering to match a cue."),
+    .p.priv_class  = &cue_acue_class,
+    .priv_size   = sizeof(CueContext),
+    FILTER_INPUTS(ff_subtitle_default_filterpad),
+    FILTER_OUTPUTS(ff_subtitle_default_filterpad),
+    .activate    = activate,
+};
+#endif /* CONFIG_SCUE_FILTER */
