@@ -426,6 +426,7 @@ extern const FFFilter ff_vf_qrencode;
 extern const FFFilter ff_vf_quirc;
 extern const FFFilter ff_vf_random;
 extern const FFFilter ff_vf_readeia608;
+extern const FFFilter ff_vf_readteletext;
 extern const FFFilter ff_vf_readvitc;
 extern const FFFilter ff_vf_realtime;
 extern const FFFilter ff_vf_remap;

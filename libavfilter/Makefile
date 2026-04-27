@@ -457,6 +457,7 @@ OBJS-$(CONFIG_QP_FILTER)                     += vf_qp.o
 OBJS-$(CONFIG_QUIRC_FILTER)                  += vf_quirc.o
 OBJS-$(CONFIG_RANDOM_FILTER)                 += vf_random.o
 OBJS-$(CONFIG_READEIA608_FILTER)             += vf_readeia608.o
+OBJS-$(CONFIG_READTELETEXT_FILTER)           += vf_readteletext.o
 OBJS-$(CONFIG_READVITC_FILTER)               += vf_readvitc.o
 OBJS-$(CONFIG_REALTIME_FILTER)               += f_realtime.o
 OBJS-$(CONFIG_REMAP_FILTER)                  += vf_remap.o framesync.o
