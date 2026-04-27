@@ -167,6 +167,7 @@ struct decklink_ctx {
     AVStream *klv_st;
     AVStream *teletext_st;
     uint16_t cdp_sequence_num;
+    uint16_t sdp_sequence_num;  /* OP-47 SDP footer sequence counter */
     /* Options */
     int list_devices;
     int list_formats;
