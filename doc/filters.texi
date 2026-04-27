@@ -20666,6 +20666,63 @@ ffprobe -f lavfi -i movie=captioned_video.mov,readeia608 -show_entries frame=pts
 @end example
 @end itemize
 
+@section readteletext
+
+Read World System Teletext (WST) data from VBI lines in SD video frames.
+
+This filter uses libzvbi to decode teletext waveforms from the vertical
+blanking interval of PAL or NTSC video. Decoded teletext content is logged
+to the console, allowing verification of embedded teletext data.
+
+This filter is the inverse of the @ref{teletextembed} filter.
+
+The filter accepts the following options:
+
+@table @option
+
+@item scan_min
+Set the first VBI line to scan (1-based). Default value is @option{6}.
+
+@item scan_max
+Set the last VBI line to scan (1-based). Default value is @option{22}.
+
+@item field2
+If set to @option{1}, also scan field 2 lines. Default value is @option{1}.
+
+@item system
+Set the TV system. @option{0} for automatic detection based on frame height,
+@option{1} for PAL (625-line), @option{2} for NTSC (525-line).
+Default value is @option{0}.
+
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Read teletext from a video file and display decoded content:
+@example
+ffmpeg -i video_with_vbi.mov -vf readteletext -f null -
+@end example
+
+@item
+Scan only line 21 (standard teletext subtitle line):
+@example
+ffmpeg -i video.mov -vf readteletext=scan_min=21:scan_max=21 -f null -
+@end example
+
+@item
+Verify round-trip: embed teletext and read it back:
+@example
+ffmpeg -i video.mp4 -i subs.srt -filter_complex \
+  "[1:s]teletext[t];[0:v][t]teletextembed=line=21,readteletext" -f null -
+@end example
+@end itemize
+
+@subsection Requirements
+
+This filter requires FFmpeg to be compiled with @code{--enable-libzvbi}.
+
 @section readvitc
 
 Read vertical interval timecode (VITC) information from the top lines of a
@@ -23344,6 +23401,72 @@ PAL output (25i):
 16.67p: 33
 16p: 33333334
 @end example
+
+@anchor{teletextembed}
+@section teletextembed
+
+Embed World System Teletext (WST) subtitles as VBI waveforms in SD video frames.
+
+This filter renders teletext data into the vertical blanking interval (VBI)
+lines of PAL (625-line) or NTSC (525-line) video. The teletext waveform is
+rendered directly into the video pixels, making it compatible with traditional
+teletext decoders that read VBI lines.
+
+This filter accepts a subtitle input containing teletext data (encoded by the
+teletext encoder) and a video input. The video must be in UYVY422 format at
+SD resolution (720x576 for PAL or 720x480/486 for NTSC).
+
+The filter accepts the following options:
+
+@table @option
+
+@item line, line_f1
+Set the VBI line number for field 1 (1-based). For PAL, typical teletext
+lines are 7-22 (field 1) and 320-335 (field 2). Australian standard uses
+line 21. Default value is @option{21}.
+
+@item line_f2
+Set the VBI line number for field 2 (1-based). If set to @option{0}, uses
+the same line number as field 1. Default value is @option{0}.
+
+@item system
+Set the TV system. @option{0} for automatic detection based on frame height,
+@option{1} for PAL (625-line), @option{2} for NTSC (525-line).
+Default value is @option{0}.
+
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Embed teletext subtitles from an SRT file into PAL video on line 21:
+@example
+ffmpeg -i video.mp4 -i subs.srt -filter_complex \
+  "[1:s]teletext[t];[0:v][t]teletextembed=line=21" -c:v rawvideo output.mov
+@end example
+
+@item
+Embed teletext with different lines for each field:
+@example
+ffmpeg -i video.mp4 -i subs.srt -filter_complex \
+  "[1:s]teletext[t];[0:v][t]teletextembed=line_f1=21:line_f2=21" output.mov
+@end example
+
+@item
+Verify the embedded teletext can be read back:
+@example
+ffmpeg -i output.mov -vf readteletext -f null -
+@end example
+@end itemize
+
+@subsection Notes
+
+This filter is intended for SD output where VBI teletext is required.
+For HD output (1080i), use the decklink output device with a teletext
+subtitle stream, which will insert OP-47/SMPTE RDD-8 VANC packets.
+
+See also @ref{readteletext} for reading teletext from VBI lines.
 
 @section thistogram
 
