@@ -1147,14 +1147,45 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
 
             ret = klvanc_convert_SDP_to_words(sdp, &vanc_words, &word_count);
             if (ret == 0 && vanc_words) {
-                /* Insert on HD line 12 for 1080i (Australian convention)
-                 * klvanc_line_insert handles the ADF and CS automatically
-                 */
+                int f1_line = 12;
+                int f2_line = 0;
+
+                /* Insert on HD line 12 for field 1 */
                 ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
-                                         word_count, 12, 0);
+                                         word_count, f1_line, 0);
                 if (ret != 0) {
-                    av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC on line 12: %d\n", ret);
+                    av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC on line %d: %d\n", f1_line, ret);
                 }
+
+                /* For interlaced video, insert on both fields per Australian OP-47:
+                 * "Caption data must always be inserted on both fields"
+                 * Field 2 line numbers from SMPTE RP 168:2009 */
+                switch (ctx->bmd_mode) {
+                case bmdModeNTSC:
+                case bmdModeNTSC2398:
+                    f2_line = 273 - 10 + f1_line;  /* Line 275 */
+                    break;
+                case bmdModePAL:
+                    f2_line = 319 - 6 + f1_line;   /* Line 325 */
+                    break;
+                case bmdModeHD1080i50:
+                case bmdModeHD1080i5994:
+                case bmdModeHD1080i6000:
+                    f2_line = 569 - 7 + f1_line;   /* Line 574 (HD line 575 in spec) */
+                    break;
+                default:
+                    f2_line = 0;  /* Progressive modes: no field 2 */
+                    break;
+                }
+
+                if (f2_line > 0) {
+                    ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                             word_count, f2_line, 0);
+                    if (ret != 0) {
+                        av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC on line %d: %d\n", f2_line, ret);
+                    }
+                }
+
                 free(vanc_words);
             } else {
                 av_log(avctx, AV_LOG_ERROR, "Failed to convert SDP to VANC words: %d\n", ret);
