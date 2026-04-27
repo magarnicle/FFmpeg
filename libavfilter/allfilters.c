@@ -498,6 +498,7 @@ extern const FFFilter ff_vf_swaprect;
 extern const FFFilter ff_vf_swapuv;
 extern const FFFilter ff_vf_tblend;
 extern const FFFilter ff_vf_telecine;
+extern const FFFilter ff_vf_teletextembed;
 extern const FFFilter ff_vf_thistogram;
 extern const FFFilter ff_vf_threshold;
 extern const FFFilter ff_vf_thumbnail;

@@ -531,6 +531,7 @@ OBJS-$(CONFIG_SWAPRECT_FILTER)               += vf_swaprect.o
 OBJS-$(CONFIG_SWAPUV_FILTER)                 += vf_swapuv.o
 OBJS-$(CONFIG_TBLEND_FILTER)                 += vf_blend.o framesync.o
 OBJS-$(CONFIG_TELECINE_FILTER)               += vf_telecine.o
+OBJS-$(CONFIG_TELETEXTEMBED_FILTER)          += vf_teletextembed.o
 OBJS-$(CONFIG_THISTOGRAM_FILTER)             += vf_histogram.o
 OBJS-$(CONFIG_THRESHOLD_FILTER)              += vf_threshold.o framesync.o
 OBJS-$(CONFIG_THUMBNAIL_FILTER)              += vf_thumbnail.o
