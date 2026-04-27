@@ -33,10 +33,8 @@
 #include "avfilter.h"
 #include "audio.h"
 #include "filters.h"
-#include "video.h"
-#if CONFIG_SSPLIT_FILTER
 #include "subtitle.h"
-#endif
+#include "video.h"
 
 typedef struct SplitContext {
     const AVClass *class;
