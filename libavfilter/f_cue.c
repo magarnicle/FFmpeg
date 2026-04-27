@@ -134,7 +134,6 @@ const FFFilter ff_af_acue = {
 };
 #endif /* CONFIG_ACUE_FILTER */
 
-#if CONFIG_SCUE_FILTER
 const FFFilter ff_sf_scue = {
     .p.name        = "scue",
     .p.description = NULL_IF_CONFIG_SMALL("Delay subtitle filtering to match a cue."),
@@ -144,4 +143,3 @@ const FFFilter ff_sf_scue = {
     FILTER_OUTPUTS(ff_subtitle_default_filterpad),
     .activate    = activate,
 };
-#endif /* CONFIG_SCUE_FILTER */

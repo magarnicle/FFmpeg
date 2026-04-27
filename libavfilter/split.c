@@ -147,7 +147,6 @@ const FFFilter ff_af_asplit = {
     FILTER_INPUTS(ff_audio_default_filterpad),
 };
 
-#if CONFIG_SSPLIT_FILTER
 const FFFilter ff_sf_ssplit = {
     .p.name        = "ssplit",
     .p.description = NULL_IF_CONFIG_SMALL("Pass on the subtitle input to N subtitle outputs."),
@@ -158,4 +157,3 @@ const FFFilter ff_sf_ssplit = {
     .activate    = activate,
     FILTER_INPUTS(ff_subtitle_default_filterpad),
 };
-#endif
