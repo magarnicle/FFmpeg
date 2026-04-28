@@ -667,11 +667,13 @@ static int config_output(AVFilterLink *outlink)
     outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
     ol->frame_rate = il->frame_rate;
 
-    /* Validate dimensions for SD */
+    /* Validate dimensions for SD - VBI embedding only works for SD video */
     if (inlink->w != 720 || (inlink->h != 576 && inlink->h != 486 && inlink->h != 480)) {
-        av_log(avctx, AV_LOG_WARNING,
-               "Frame size %dx%d is not standard SD (720x576 PAL or 720x480/486 NTSC)\n",
+        av_log(avctx, AV_LOG_ERROR,
+               "Frame size %dx%d is not standard SD (720x576 PAL or 720x480/486 NTSC). "
+               "VBI teletext embedding requires SD video. For HD, use VANC via the decklink output device.\n",
                inlink->w, inlink->h);
+        return AVERROR(EINVAL);
     }
 
     return 0;
