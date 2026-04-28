@@ -145,6 +145,46 @@ static char *extract_text_from_ass(const char *ass, char *out, int max_len)
 }
 
 /**
+ * Encode a teletext page header (row 0) with page number.
+ * Returns the number of bytes written (46 for one data unit).
+ */
+static int encode_teletext_header(uint8_t *out, int magazine, int page, int field)
+{
+    uint8_t line_data[42];
+    int mag_enc = (magazine == 8) ? 0 : magazine;
+    int page_units = page % 10;
+    int page_tens = (page / 10) % 10;
+    int i;
+
+    /* Bytes 0-1: MRAG for row 0 */
+    line_data[0] = ff_teletext_ham84((mag_enc & 0x07) | ((0 & 0x01) << 3));
+    line_data[1] = ff_teletext_ham84(0);  /* Row 0 */
+
+    /* Bytes 2-3: Page number (units and tens in Hamming 8/4) */
+    line_data[2] = ff_teletext_ham84(page_units);
+    line_data[3] = ff_teletext_ham84(page_tens);
+
+    /* Bytes 4-7: Subcode S1-S4 (all zeros) */
+    line_data[4] = ff_teletext_ham84(0);
+    line_data[5] = ff_teletext_ham84(0);
+    line_data[6] = ff_teletext_ham84(0);
+    line_data[7] = ff_teletext_ham84(0);
+
+    /* Bytes 8-9: Control bits C7-C14
+     * C6=1 (subtitle), C10=0 (serial), others=0 */
+    line_data[8] = ff_teletext_ham84(0x04);  /* C5=0, C6=1 (subtitle), C7=0, C8=0 */
+    line_data[9] = ff_teletext_ham84(0);     /* C9-C12 = 0 */
+
+    /* Bytes 10-41: Header display area (32 characters, spaces) */
+    for (i = 10; i < 42; i++)
+        line_data[i] = ff_teletext_odd_parity(' ');
+
+    return ff_teletext_build_data_unit(out, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
+                                       field == 1 ? 1 : 0, 21,
+                                       magazine, 0, line_data);
+}
+
+/**
  * Encode a single line of text as a teletext subtitle data unit.
  * Returns the number of bytes written (46 for one data unit).
  */
@@ -216,23 +256,33 @@ static uint8_t *encode_text_to_teletext(AVFilterContext *ctx, const char *text,
         return NULL;
     }
 
-    /* Allocate output: 2 data units per line (both fields) */
-    out = av_malloc(num_lines * 2 * TELETEXT_DATA_UNIT_SIZE);
+    /* Allocate output: page header + content rows for each field
+     * (1 header + num_lines content) * 2 fields */
+    out = av_malloc((1 + num_lines) * 2 * TELETEXT_DATA_UNIT_SIZE);
     if (!out) {
         av_free(tmp);
         return NULL;
     }
 
-    /* Encode each line for both fields */
+    /* Encode page header (row 0) for field 1 */
+    encode_teletext_header(out + out_pos, s->magazine, s->page, 1);
+    out_pos += TELETEXT_DATA_UNIT_SIZE;
+
+    /* Encode content rows for field 1 */
     /* Subtitle rows typically start at row 21, 22, 23, 24 (bottom of screen) */
     for (int i = 0; i < num_lines; i++) {
         int row = 24 - num_lines + 1 + i;  /* Bottom-align subtitles */
-
-        /* Field 1 */
         encode_teletext_line(out + out_pos, lines[i], s->magazine, row, 1);
         out_pos += TELETEXT_DATA_UNIT_SIZE;
+    }
 
-        /* Field 2 (same content, different field parity) */
+    /* Encode page header (row 0) for field 2 */
+    encode_teletext_header(out + out_pos, s->magazine, s->page, 2);
+    out_pos += TELETEXT_DATA_UNIT_SIZE;
+
+    /* Encode content rows for field 2 */
+    for (int i = 0; i < num_lines; i++) {
+        int row = 24 - num_lines + 1 + i;  /* Bottom-align subtitles */
         encode_teletext_line(out + out_pos, lines[i], s->magazine, row, 2);
         out_pos += TELETEXT_DATA_UNIT_SIZE;
     }

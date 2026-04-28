@@ -1028,6 +1028,180 @@ static void log_teletext_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 }
 
+/* Render teletext VBI waveform into a v210 line buffer.
+ * This is used for SD output where VBI lines carry the actual teletext waveform.
+ *
+ * Parameters:
+ *   buf: v210 format line buffer (720 pixels for SD)
+ *   data: 42 bytes of teletext line data (MRAG + 40 data bytes)
+ *   width: line width in pixels (720 for SD)
+ */
+static void render_teletext_vbi_v210(uint8_t *buf, const uint8_t *data, int width)
+{
+    /* VBI teletext waveform parameters (ITU-R BT.653 System B):
+     * - Bit rate: 6.9375 MHz
+     * - Sample rate: 13.5 MHz (SD-SDI)
+     * - Samples per bit: ~1.946
+     * - Clock run-in start: ~10.5 µs from line start = ~142 samples at 13.5 MHz
+     */
+    const int cri_offset = 142;  /* Clock run-in start sample */
+    const int luma_black = 64;   /* 10-bit black level (16 * 4) */
+    const int luma_white = 940;  /* 10-bit white level (235 * 4) */
+    const int chroma_neutral = 512;  /* 10-bit neutral chroma */
+
+    /* v210 packs 6 pixels into 4 32-bit words:
+     * Word 0: Cb0 | Y0  | Cr0  (bits 0-9, 10-19, 20-29)
+     * Word 1: Y1  | Cb2 | Y2   (bits 0-9, 10-19, 20-29)
+     * Word 2: Cr2 | Y3  | Cb4  (bits 0-9, 10-19, 20-29)
+     * Word 3: Y4  | Cr4 | Y5   (bits 0-9, 10-19, 20-29)
+     */
+
+    /* Build luma samples for the waveform */
+    uint16_t luma[720];
+    int pos = 0;
+
+    /* Initialize to black */
+    for (int i = 0; i < width; i++)
+        luma[i] = luma_black;
+
+    /* Skip to clock run-in start position */
+    pos = cri_offset;
+
+    /* Clock run-in: 16 cycles of alternating 1/0 (32 bits total) */
+    for (int i = 0; i < 16 && pos < width - 1; i++) {
+        luma[pos++] = luma_white;  /* ~2 samples per bit */
+        luma[pos++] = luma_white;
+        luma[pos++] = luma_black;
+        luma[pos++] = luma_black;
+    }
+
+    /* Framing code: 11100100 (0xE4) transmitted LSB first */
+    uint8_t framing = 0xE4;
+    for (int bit = 0; bit < 8 && pos < width - 1; bit++) {
+        int level = (framing >> bit) & 1 ? luma_white : luma_black;
+        luma[pos++] = level;
+        luma[pos++] = level;
+    }
+
+    /* Data: 42 bytes transmitted LSB first */
+    for (int byte = 0; byte < 42 && pos < width - 1; byte++) {
+        uint8_t b = data[byte];
+        for (int bit = 0; bit < 8 && pos < width - 1; bit++) {
+            int level = (b >> bit) & 1 ? luma_white : luma_black;
+            luma[pos++] = level;
+            luma[pos++] = level;
+        }
+    }
+
+    /* Convert to v210 format */
+    uint32_t *words = (uint32_t *)buf;
+    for (int i = 0; i < width; i += 6) {
+        int y0 = luma[i];
+        int y1 = (i + 1 < width) ? luma[i + 1] : luma_black;
+        int y2 = (i + 2 < width) ? luma[i + 2] : luma_black;
+        int y3 = (i + 3 < width) ? luma[i + 3] : luma_black;
+        int y4 = (i + 4 < width) ? luma[i + 4] : luma_black;
+        int y5 = (i + 5 < width) ? luma[i + 5] : luma_black;
+
+        /* Word 0: Cb0 | Y0 | Cr0 */
+        words[0] = (chroma_neutral & 0x3FF) | ((y0 & 0x3FF) << 10) | ((chroma_neutral & 0x3FF) << 20);
+        /* Word 1: Y1 | Cb2 | Y2 */
+        words[1] = (y1 & 0x3FF) | ((chroma_neutral & 0x3FF) << 10) | ((y2 & 0x3FF) << 20);
+        /* Word 2: Cr2 | Y3 | Cb4 */
+        words[2] = (chroma_neutral & 0x3FF) | ((y3 & 0x3FF) << 10) | ((chroma_neutral & 0x3FF) << 20);
+        /* Word 3: Y4 | Cr4 | Y5 */
+        words[3] = (y4 & 0x3FF) | ((chroma_neutral & 0x3FF) << 10) | ((y5 & 0x3FF) << 20);
+
+        words += 4;
+    }
+}
+
+/* Insert teletext VBI waveforms for SD output.
+ * For PAL: lines 6-22 (field 1), lines 319-335 (field 2)
+ * For NTSC: lines 10-21 (field 1), lines 273-284 (field 2)
+ */
+static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                   IDeckLinkVideoFrameAncillary *vanc)
+{
+    AVPacket teletext_pkt;
+    int ret;
+    int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
+
+    /* Process pending teletext packets */
+    while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
+        int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
+        if (pts > ctx->last_pts)
+            break;
+
+        ret = ff_decklink_packet_queue_get(&ctx->teletext_queue, &teletext_pkt, 0);
+        if (ret <= 0)
+            break;
+
+        if (teletext_pkt.pts + 1 < ctx->last_pts) {
+            av_log(avctx, AV_LOG_WARNING, "Teletext packet too old, discarding\n");
+            av_packet_unref(&teletext_pkt);
+            continue;
+        }
+
+        /* Log teletext content */
+        log_teletext_packet(avctx, &teletext_pkt);
+
+        /* Process each 46-byte data unit */
+        int num_data_units = teletext_pkt.size / 46;
+        for (int i = 0; i < num_data_units; i++) {
+            uint8_t *du = teletext_pkt.data + (i * 46);
+
+            /* Data unit format:
+             *   du[0]: data_unit_id
+             *   du[1]: data_unit_length (44)
+             *   du[2]: field_parity (bit 5) + line_offset (bits 0-4)
+             *   du[3]: framing_code (0xE4)
+             *   du[4-45]: 42 bytes teletext data (MRAG + 40 bytes)
+             */
+            int field = ((du[2] >> 5) & 1) ? 1 : 2;
+            int line_offset = du[2] & 0x1F;
+            const uint8_t *ttx_data = &du[4];
+
+            /* Calculate actual VBI line number */
+            int vbi_line;
+            if (is_pal) {
+                /* PAL: field 1 lines 6-22 map to SDI lines 6-22
+                 *      field 2 lines 6-22 map to SDI lines 319-335 */
+                if (field == 1)
+                    vbi_line = line_offset;
+                else
+                    vbi_line = 313 + line_offset;
+            } else {
+                /* NTSC: field 1 lines 10-21 map to SDI lines 10-21
+                 *       field 2 lines 10-21 map to SDI lines 273-284 */
+                if (field == 1)
+                    vbi_line = line_offset;
+                else
+                    vbi_line = 263 + line_offset;
+            }
+
+            /* Get buffer for VBI line */
+            void *buf;
+            HRESULT result = vanc->GetBufferForVerticalBlankingLine(vbi_line, &buf);
+            if (result != S_OK) {
+                av_log(avctx, AV_LOG_DEBUG, "Failed to get VBI line %d (field %d, offset %d): %d\n",
+                       vbi_line, field, line_offset, result);
+                continue;
+            }
+
+            /* Render teletext waveform into VBI line */
+            render_teletext_vbi_v210((uint8_t *)buf, ttx_data, 720);
+
+            av_log(avctx, AV_LOG_DEBUG, "Rendered teletext VBI on line %d (field %d)\n",
+                   vbi_line, field);
+        }
+
+        av_packet_unref(&teletext_pkt);
+    }
+
+    return 0;
+}
+
 /* Build OP47/SDP VANC packet from teletext data units per Free TV Australia OP-47
  * and SMPTE RDD-8 specifications.
  *
@@ -1227,8 +1401,13 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
     construct_cc(avctx, ctx, pkt, &vanc_lines);
     construct_afd(avctx, ctx, pkt, &vanc_lines, st);
 
-    /* Process any pending teletext packets */
-    if (ctx->teletext_st)
+    /* Process any pending teletext packets.
+     * For HD modes, use VANC (OP-47/SDP packets).
+     * For SD modes, teletext is handled via VBI waveforms later. */
+    int is_sd_mode = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp ||
+                      ctx->bmd_mode == bmdModeNTSC || ctx->bmd_mode == bmdModeNTSC2398 ||
+                      ctx->bmd_mode == bmdModeNTSCp);
+    if (ctx->teletext_st && !is_sd_mode)
         construct_teletext(avctx, ctx, &vanc_lines);
 
     /* See if there any pending data packets to process */
@@ -1289,6 +1468,11 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
         av_log(avctx, AV_LOG_ERROR, "Failed to create vanc\n");
         ret = AVERROR(EIO);
         goto done;
+    }
+
+    /* For SD modes, render teletext as VBI waveforms */
+    if (ctx->teletext_st && is_sd_mode) {
+        construct_teletext_vbi(avctx, ctx, vanc);
     }
 
     /* Now that we've got all the VANC lines in a nice orderly manner, generate the
