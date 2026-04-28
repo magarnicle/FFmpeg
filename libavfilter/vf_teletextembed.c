@@ -37,11 +37,13 @@
  *   Data: 42 bytes (MRAG + 40 character bytes) = 336 bits
  */
 
+#include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavcodec/avcodec.h"
+#include "libavcodec/teletextenc.h"
 #include "avfilter.h"
 #include "filters.h"
 #include "video.h"
@@ -113,7 +115,165 @@ typedef struct TeletextEmbedContext {
     int stream_input;
     int sub_eof;
     int current_event;   /* Index of currently active event, or -1 */
+
+    /* Teletext encoding state */
+    int magazine;        /* Magazine number (1-8) */
+    int page;            /* Page number (100-899) */
 } TeletextEmbedContext;
+
+/**
+ * Strip ASS formatting and extract plain text.
+ * Handles tags like {\pos}, {\an}, <font>, etc.
+ */
+static void strip_ass_formatting(const char *ass, char *out, int max_len)
+{
+    const char *p = ass;
+    int pos = 0;
+    int in_brace = 0;
+    int in_tag = 0;
+
+    /* Skip ASS header fields (ReadOrder, Layer, Style, etc.) */
+    int commas = 0;
+    while (*p && commas < 9) {
+        if (*p == ',')
+            commas++;
+        p++;
+    }
+
+    while (*p && pos < max_len - 1) {
+        if (*p == '{') {
+            in_brace = 1;
+            p++;
+            continue;
+        }
+        if (in_brace) {
+            if (*p == '}')
+                in_brace = 0;
+            p++;
+            continue;
+        }
+        if (*p == '<') {
+            in_tag = 1;
+            p++;
+            continue;
+        }
+        if (in_tag) {
+            if (*p == '>')
+                in_tag = 0;
+            p++;
+            continue;
+        }
+        /* Handle ASS newlines */
+        if (*p == '\\' && (*(p + 1) == 'N' || *(p + 1) == 'n')) {
+            out[pos++] = '\n';
+            p += 2;
+            continue;
+        }
+        out[pos++] = *p++;
+    }
+    out[pos] = '\0';
+}
+
+/**
+ * Encode a single line of text as a teletext subtitle data unit.
+ * Returns the number of bytes written (46 for one data unit).
+ */
+static int encode_teletext_line(uint8_t *out, const char *text, int magazine,
+                                 int row, int field)
+{
+    uint8_t line_data[42];
+    int mag_enc = (magazine == 8) ? 0 : magazine;
+    int i;
+
+    /* Encode MRAG (Magazine and Row Address Group) */
+    line_data[0] = ff_teletext_ham84((mag_enc & 0x07) | ((row & 0x01) << 3));
+    line_data[1] = ff_teletext_ham84((row >> 1) & 0x0F);
+
+    /* Fill with spaces (with odd parity) initially */
+    for (i = 2; i < 42; i++)
+        line_data[i] = ff_teletext_odd_parity(' ');
+
+    /* Copy text characters with odd parity, centered */
+    int text_len = strlen(text);
+    if (text_len > 40)
+        text_len = 40;
+    int start_col = (40 - text_len) / 2;  /* Center the text */
+
+    for (i = 0; i < text_len && text[i]; i++) {
+        unsigned char c = text[i];
+        if (c >= 0x20 && c <= 0x7E)
+            line_data[2 + start_col + i] = ff_teletext_odd_parity(c);
+    }
+
+    /* Build the data unit */
+    return ff_teletext_build_data_unit(out, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
+                                       field == 1 ? 1 : 0, 21,  /* Line 21 is standard subtitle line */
+                                       magazine, row, line_data);
+}
+
+/**
+ * Encode text subtitle as teletext data units.
+ * Returns allocated buffer with teletext data, sets out_size.
+ */
+static uint8_t *encode_text_to_teletext(AVFilterContext *ctx, const char *text,
+                                         int *out_size)
+{
+    TeletextEmbedContext *s = ctx->priv;
+    char plain[256];
+    char *lines[4];  /* Max 4 lines for subtitle */
+    int num_lines = 0;
+    uint8_t *out;
+    int out_pos = 0;
+    char *p, *saveptr;
+
+    /* Strip ASS formatting to get plain text */
+    strip_ass_formatting(text, plain, sizeof(plain));
+
+    /* Split into lines */
+    char *tmp = av_strdup(plain);
+    if (!tmp)
+        return NULL;
+
+    p = av_strtok(tmp, "\n", &saveptr);
+    while (p && num_lines < 4) {
+        /* Skip empty lines */
+        while (*p == ' ') p++;
+        if (*p)
+            lines[num_lines++] = p;
+        p = av_strtok(NULL, "\n", &saveptr);
+    }
+
+    if (num_lines == 0) {
+        av_free(tmp);
+        *out_size = 0;
+        return NULL;
+    }
+
+    /* Allocate output: 2 data units per line (both fields) */
+    out = av_malloc(num_lines * 2 * TELETEXT_DATA_UNIT_SIZE);
+    if (!out) {
+        av_free(tmp);
+        return NULL;
+    }
+
+    /* Encode each line for both fields */
+    /* Subtitle rows typically start at row 21, 22, 23, 24 (bottom of screen) */
+    for (int i = 0; i < num_lines; i++) {
+        int row = 24 - num_lines + 1 + i;  /* Bottom-align subtitles */
+
+        /* Field 1 */
+        encode_teletext_line(out + out_pos, lines[i], s->magazine, row, 1);
+        out_pos += TELETEXT_DATA_UNIT_SIZE;
+
+        /* Field 2 (same content, different field parity) */
+        encode_teletext_line(out + out_pos, lines[i], s->magazine, row, 2);
+        out_pos += TELETEXT_DATA_UNIT_SIZE;
+    }
+
+    av_free(tmp);
+    *out_size = out_pos;
+    return out;
+}
 
 /**
  * Log teletext line content being embedded.
@@ -294,6 +454,18 @@ static int add_teletext_event(TeletextEmbedContext *ctx, int64_t start_pts,
     return 0;
 }
 
+/**
+ * Extract text from a subtitle rectangle.
+ */
+static char *extract_subtitle_text(const AVSubtitleRect *rect)
+{
+    if (rect->type == SUBTITLE_ASS && rect->ass)
+        return av_strdup(rect->ass);
+    if (rect->type == SUBTITLE_TEXT && rect->text)
+        return av_strdup(rect->text);
+    return NULL;
+}
+
 static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
 {
     TeletextEmbedContext *ctx = avctx->priv;
@@ -301,12 +473,16 @@ static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
     int64_t start_pts, duration, end_pts;
     AVRational tb;
 
-    if (!frame->buf[0])
+    if (!frame->buf[0]) {
+        av_log(avctx, AV_LOG_DEBUG, "Subtitle frame has no buf[0]\n");
         return 0;
+    }
 
     sub = (AVSubtitle *)frame->buf[0]->data;
-    if (!sub)
+    if (!sub) {
+        av_log(avctx, AV_LOG_DEBUG, "Subtitle frame buf[0]->data is NULL\n");
         return 0;
+    }
 
     tb = frame->time_base;
     if (tb.num <= 0 || tb.den <= 0)
@@ -316,14 +492,38 @@ static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
     duration = (int64_t)sub->end_display_time * 1000;
     end_pts = start_pts + duration;
 
-    /* For teletext, the subtitle data should be the raw encoded packets
-     * from the teletext encoder (46-byte data units) */
+    av_log(avctx, AV_LOG_DEBUG, "Subtitle: num_rects=%u start=%.3fs end=%.3fs\n",
+           sub->num_rects, start_pts / 1e6, end_pts / 1e6);
+
     for (unsigned i = 0; i < sub->num_rects; i++) {
         AVSubtitleRect *rect = sub->rects[i];
+        char *text;
 
-        /* Check if this is raw teletext data (stored in pict or data field) */
+        av_log(avctx, AV_LOG_DEBUG, "  rect[%u]: type=%d ass=%p text=%p data[0]=%p linesize[0]=%d\n",
+               i, rect->type, rect->ass, rect->text, rect->data[0], rect->linesize[0]);
+
+        /* First try to get text content and encode it */
+        text = extract_subtitle_text(rect);
+        if (text) {
+            uint8_t *ttx_data;
+            int ttx_size;
+
+            ttx_data = encode_text_to_teletext(avctx, text, &ttx_size);
+            if (ttx_data && ttx_size > 0) {
+                int ret = add_teletext_event(ctx, start_pts, end_pts,
+                                              ttx_data, ttx_size);
+                av_free(ttx_data);
+                if (ret < 0) {
+                    av_free(text);
+                    return ret;
+                }
+            }
+            av_free(text);
+            continue;
+        }
+
+        /* Check if this is raw teletext data (stored as bitmap data) */
         if (rect->type == SUBTITLE_BITMAP && rect->data[0] && rect->linesize[0] > 0) {
-            /* Teletext data stored as bitmap data */
             int ret = add_teletext_event(ctx, start_pts, end_pts,
                                           rect->data[0], rect->linesize[0]);
             if (ret < 0)
@@ -569,10 +769,12 @@ static int config_output(AVFilterLink *outlink)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption teletextembed_options[] = {
-    { "line",    "VBI line number for field 1 (1-based)", OFFSET(line_f1), AV_OPT_TYPE_INT, {.i64 = 21}, 1, 50, FLAGS },
-    { "line_f1", "VBI line number for field 1 (1-based)", OFFSET(line_f1), AV_OPT_TYPE_INT, {.i64 = 21}, 1, 50, FLAGS },
-    { "line_f2", "VBI line number for field 2 (0=same as f1)", OFFSET(line_f2), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 50, FLAGS },
-    { "system",  "TV system (0=auto, 1=PAL, 2=NTSC)", OFFSET(system), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 2, FLAGS },
+    { "line",     "VBI line number for field 1 (1-based)", OFFSET(line_f1), AV_OPT_TYPE_INT, {.i64 = 21}, 1, 50, FLAGS },
+    { "line_f1",  "VBI line number for field 1 (1-based)", OFFSET(line_f1), AV_OPT_TYPE_INT, {.i64 = 21}, 1, 50, FLAGS },
+    { "line_f2",  "VBI line number for field 2 (0=same as f1)", OFFSET(line_f2), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 50, FLAGS },
+    { "system",   "TV system (0=auto, 1=PAL, 2=NTSC)", OFFSET(system), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 2, FLAGS },
+    { "magazine", "Teletext magazine number (1-8)", OFFSET(magazine), AV_OPT_TYPE_INT, {.i64 = 8}, 1, 8, FLAGS },
+    { "page",     "Teletext page number (100-899)", OFFSET(page), AV_OPT_TYPE_INT, {.i64 = 888}, 100, 899, FLAGS },
     { NULL }
 };
 
