@@ -38,7 +38,6 @@
  */
 
 #include "libavutil/avstring.h"
-#include "libavutil/bprint.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -47,42 +46,6 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "video.h"
-
-/* Hamming 8/4 decode table for MRAG parsing */
-static const uint8_t ham84_decode[256] = {
-    0x01, 0xFF, 0x01, 0x01, 0xFF, 0x00, 0x01, 0xFF,
-    0xFF, 0x02, 0x01, 0xFF, 0x0A, 0xFF, 0xFF, 0x07,
-    0xFF, 0x00, 0x01, 0xFF, 0x00, 0x00, 0xFF, 0x00,
-    0x06, 0xFF, 0xFF, 0x0B, 0xFF, 0x00, 0x03, 0xFF,
-    0xFF, 0x0C, 0x01, 0xFF, 0x04, 0xFF, 0xFF, 0x07,
-    0x06, 0xFF, 0xFF, 0x07, 0xFF, 0x07, 0x07, 0x07,
-    0x06, 0xFF, 0xFF, 0x05, 0xFF, 0x00, 0x0D, 0xFF,
-    0x06, 0x06, 0x06, 0xFF, 0x06, 0xFF, 0xFF, 0x07,
-    0xFF, 0x02, 0x01, 0xFF, 0x04, 0xFF, 0xFF, 0x09,
-    0x02, 0x02, 0xFF, 0x02, 0xFF, 0x02, 0x03, 0xFF,
-    0x08, 0xFF, 0xFF, 0x05, 0xFF, 0x00, 0x03, 0xFF,
-    0xFF, 0x02, 0x03, 0xFF, 0x03, 0xFF, 0x03, 0x03,
-    0x04, 0xFF, 0xFF, 0x05, 0x04, 0x04, 0x04, 0xFF,
-    0xFF, 0x02, 0x0F, 0xFF, 0x04, 0xFF, 0xFF, 0x07,
-    0xFF, 0x05, 0x05, 0x05, 0x04, 0xFF, 0xFF, 0x05,
-    0x06, 0xFF, 0xFF, 0x05, 0xFF, 0x0E, 0x03, 0xFF,
-    0xFF, 0x0C, 0x01, 0xFF, 0x0A, 0xFF, 0xFF, 0x09,
-    0x0A, 0xFF, 0xFF, 0x0B, 0x0A, 0x0A, 0x0A, 0xFF,
-    0x08, 0xFF, 0xFF, 0x0B, 0xFF, 0x00, 0x0D, 0xFF,
-    0xFF, 0x0B, 0x0B, 0x0B, 0x0A, 0xFF, 0xFF, 0x0B,
-    0x0C, 0x0C, 0xFF, 0x0C, 0xFF, 0x0C, 0x0D, 0xFF,
-    0xFF, 0x0C, 0x0F, 0xFF, 0x0A, 0xFF, 0xFF, 0x07,
-    0xFF, 0x0C, 0x0D, 0xFF, 0x0D, 0xFF, 0x0D, 0x0D,
-    0x06, 0xFF, 0xFF, 0x0B, 0xFF, 0x0E, 0x0D, 0xFF,
-    0x08, 0xFF, 0xFF, 0x09, 0xFF, 0x09, 0x09, 0x09,
-    0xFF, 0x02, 0x0F, 0xFF, 0x0A, 0xFF, 0xFF, 0x09,
-    0x08, 0x08, 0x08, 0xFF, 0x08, 0xFF, 0xFF, 0x09,
-    0x08, 0xFF, 0xFF, 0x0B, 0xFF, 0x0E, 0x03, 0xFF,
-    0xFF, 0x0C, 0x0F, 0xFF, 0x04, 0xFF, 0xFF, 0x09,
-    0x0F, 0xFF, 0x0F, 0x0F, 0xFF, 0x0E, 0x0F, 0xFF,
-    0x08, 0xFF, 0xFF, 0x05, 0xFF, 0x0E, 0x0D, 0xFF,
-    0xFF, 0x0E, 0x0F, 0xFF, 0x0E, 0x0E, 0xFF, 0x0E,
-};
 
 /* VBI waveform parameters */
 #define VBI_LUMA_BLACK   0x10   /* Black level (IRE 0) */
@@ -97,7 +60,8 @@ typedef struct TeletextEvent {
     int64_t end_pts;
     uint8_t *data;       /* Raw teletext data units */
     int data_size;
-    int active;          /* Currently being displayed */
+    char *text;          /* Plain text for logging */
+    int logged;          /* Already logged this event */
 } TeletextEvent;
 
 typedef struct TeletextEmbedContext {
@@ -122,56 +86,62 @@ typedef struct TeletextEmbedContext {
 } TeletextEmbedContext;
 
 /**
- * Strip ASS formatting and extract plain text.
- * Handles tags like {\pos}, {\an}, <font>, etc.
+ * Strip ASS formatting escape sequences from text.
+ * Handles {...} override blocks and \N \n \h escapes.
  */
-static void strip_ass_formatting(const char *ass, char *out, int max_len)
+static void strip_ass_formatting(const char *input, char *out, int max_len)
 {
-    const char *p = ass;
+    const char *p = input;
     int pos = 0;
-    int in_brace = 0;
-    int in_tag = 0;
-
-    /* Skip ASS header fields (ReadOrder, Layer, Style, etc.) */
-    int commas = 0;
-    while (*p && commas < 9) {
-        if (*p == ',')
-            commas++;
-        p++;
-    }
 
     while (*p && pos < max_len - 1) {
         if (*p == '{') {
-            in_brace = 1;
-            p++;
-            continue;
+            /* Skip ASS override block */
+            const char *end = strchr(p, '}');
+            if (end) {
+                p = end + 1;
+                continue;
+            }
         }
-        if (in_brace) {
-            if (*p == '}')
-                in_brace = 0;
-            p++;
-            continue;
-        }
-        if (*p == '<') {
-            in_tag = 1;
-            p++;
-            continue;
-        }
-        if (in_tag) {
-            if (*p == '>')
-                in_tag = 0;
-            p++;
-            continue;
-        }
-        /* Handle ASS newlines */
-        if (*p == '\\' && (*(p + 1) == 'N' || *(p + 1) == 'n')) {
+        if (*p == '\\' && (p[1] == 'N' || p[1] == 'n')) {
             out[pos++] = '\n';
+            p += 2;
+            continue;
+        }
+        if (*p == '\\' && p[1] == 'h') {
+            out[pos++] = ' ';
             p += 2;
             continue;
         }
         out[pos++] = *p++;
     }
     out[pos] = '\0';
+}
+
+/**
+ * Extract plain text from ASS subtitle rect.
+ * Skips 8 header fields (ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect)
+ * and strips ASS formatting from the Text field.
+ */
+static char *extract_text_from_ass(const char *ass, char *out, int max_len)
+{
+    const char *p = ass;
+    int field_count = 0;
+
+    /* Skip 8 commas to get to the Text field */
+    while (*p && field_count < 8) {
+        if (*p == ',')
+            field_count++;
+        p++;
+    }
+
+    if (field_count < 8) {
+        out[0] = '\0';
+        return out;
+    }
+
+    strip_ass_formatting(p, out, max_len);
+    return out;
 }
 
 /**
@@ -213,24 +183,21 @@ static int encode_teletext_line(uint8_t *out, const char *text, int magazine,
 
 /**
  * Encode text subtitle as teletext data units.
+ * Input should be plain text (already stripped of ASS formatting).
  * Returns allocated buffer with teletext data, sets out_size.
  */
 static uint8_t *encode_text_to_teletext(AVFilterContext *ctx, const char *text,
                                          int *out_size)
 {
     TeletextEmbedContext *s = ctx->priv;
-    char plain[256];
     char *lines[4];  /* Max 4 lines for subtitle */
     int num_lines = 0;
     uint8_t *out;
     int out_pos = 0;
     char *p, *saveptr;
 
-    /* Strip ASS formatting to get plain text */
-    strip_ass_formatting(text, plain, sizeof(plain));
-
     /* Split into lines */
-    char *tmp = av_strdup(plain);
+    char *tmp = av_strdup(text);
     if (!tmp)
         return NULL;
 
@@ -273,61 +240,6 @@ static uint8_t *encode_text_to_teletext(AVFilterContext *ctx, const char *text,
     av_free(tmp);
     *out_size = out_pos;
     return out;
-}
-
-/**
- * Log teletext line content being embedded.
- * Decodes MRAG and extracts visible text from the 42-byte teletext data.
- */
-static void log_teletext_embed(AVFilterContext *ctx, int line_num, int field,
-                                const uint8_t *data)
-{
-    AVBPrint bp;
-    uint8_t mrag0 = ham84_decode[data[0]];
-    uint8_t mrag1 = ham84_decode[data[1]];
-    int magazine, row;
-    char text[41];
-
-    if (mrag0 == 0xFF || mrag1 == 0xFF) {
-        av_log(ctx, AV_LOG_DEBUG, "TTX EMBED line %d f%d: Hamming error in MRAG\n",
-               line_num, field);
-        return;
-    }
-
-    magazine = mrag0 & 0x07;
-    row = ((mrag0 >> 3) & 1) | (mrag1 << 1);
-    if (magazine == 0)
-        magazine = 8;
-
-    /* Extract text content (strip parity) */
-    for (int i = 0; i < 40; i++) {
-        uint8_t c = data[2 + i] & 0x7F;
-        if (c < 0x20 || c > 0x7E)
-            c = ' ';
-        text[i] = c;
-    }
-    text[40] = '\0';
-
-    /* Trim trailing spaces */
-    int len = 40;
-    while (len > 0 && text[len - 1] == ' ')
-        text[--len] = '\0';
-
-    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
-    av_bprintf(&bp, "TTX EMBED M%d/%02d line %d f%d: \"%s\"",
-               magazine, row, line_num, field, text);
-
-    /* Show first few raw bytes for debugging */
-    av_bprintf(&bp, " [%02X %02X", data[0], data[1]);
-    for (int i = 2; i < 8 && i < 42; i++)
-        av_bprintf(&bp, " %02X", data[i]);
-    av_bprintf(&bp, "...]");
-
-    if (row == 0)
-        av_bprintf(&bp, " [header]");
-
-    av_log(ctx, AV_LOG_INFO, "%s\n", bp.str);
-    av_bprint_finalize(&bp, NULL);
 }
 
 /**
@@ -428,7 +340,8 @@ static int field_line_to_frame(int line_in_field, int field, int is_pal)
 }
 
 static int add_teletext_event(TeletextEmbedContext *ctx, int64_t start_pts,
-                               int64_t end_pts, const uint8_t *data, int size)
+                               int64_t end_pts, const uint8_t *data, int size,
+                               const char *text)
 {
     if (ctx->nb_events >= ctx->events_capacity) {
         int new_cap = ctx->events_capacity ? ctx->events_capacity * 2 : 64;
@@ -445,25 +358,14 @@ static int add_teletext_event(TeletextEmbedContext *ctx, int64_t start_pts,
     ev->end_pts = end_pts;
     ev->data = av_memdup(data, size);
     ev->data_size = size;
-    ev->active = 0;
+    ev->text = text ? av_strdup(text) : NULL;
+    ev->logged = 0;
 
     if (!ev->data)
         return AVERROR(ENOMEM);
 
     ctx->nb_events++;
     return 0;
-}
-
-/**
- * Extract text from a subtitle rectangle.
- */
-static char *extract_subtitle_text(const AVSubtitleRect *rect)
-{
-    if (rect->type == SUBTITLE_ASS && rect->ass)
-        return av_strdup(rect->ass);
-    if (rect->type == SUBTITLE_TEXT && rect->text)
-        return av_strdup(rect->text);
-    return NULL;
 }
 
 static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
@@ -497,35 +399,39 @@ static int process_subtitle_frame(AVFilterContext *avctx, AVFrame *frame)
 
     for (unsigned i = 0; i < sub->num_rects; i++) {
         AVSubtitleRect *rect = sub->rects[i];
-        char *text;
+        char plain[256];
+        uint8_t *ttx_data;
+        int ttx_size;
 
-        av_log(avctx, AV_LOG_DEBUG, "  rect[%u]: type=%d ass=%p text=%p data[0]=%p linesize[0]=%d\n",
-               i, rect->type, rect->ass, rect->text, rect->data[0], rect->linesize[0]);
+        av_log(avctx, AV_LOG_DEBUG, "  rect[%u]: type=%d ass=%p text=%p\n",
+               i, rect->type, rect->ass, rect->text);
 
-        /* First try to get text content and encode it */
-        text = extract_subtitle_text(rect);
-        if (text) {
-            uint8_t *ttx_data;
-            int ttx_size;
-
-            ttx_data = encode_text_to_teletext(avctx, text, &ttx_size);
-            if (ttx_data && ttx_size > 0) {
+        /* Extract plain text from ASS or text subtitle */
+        if (rect->type == SUBTITLE_ASS && rect->ass) {
+            extract_text_from_ass(rect->ass, plain, sizeof(plain));
+        } else if (rect->type == SUBTITLE_TEXT && rect->text) {
+            av_strlcpy(plain, rect->text, sizeof(plain));
+        } else {
+            /* Check if this is raw teletext data (stored as bitmap data) */
+            if (rect->type == SUBTITLE_BITMAP && rect->data[0] && rect->linesize[0] > 0) {
                 int ret = add_teletext_event(ctx, start_pts, end_pts,
-                                              ttx_data, ttx_size);
-                av_free(ttx_data);
-                if (ret < 0) {
-                    av_free(text);
+                                              rect->data[0], rect->linesize[0], NULL);
+                if (ret < 0)
                     return ret;
-                }
             }
-            av_free(text);
             continue;
         }
 
-        /* Check if this is raw teletext data (stored as bitmap data) */
-        if (rect->type == SUBTITLE_BITMAP && rect->data[0] && rect->linesize[0] > 0) {
+        /* Skip empty subtitles */
+        if (!plain[0])
+            continue;
+
+        /* Encode text to teletext */
+        ttx_data = encode_text_to_teletext(avctx, plain, &ttx_size);
+        if (ttx_data && ttx_size > 0) {
             int ret = add_teletext_event(ctx, start_pts, end_pts,
-                                          rect->data[0], rect->linesize[0]);
+                                          ttx_data, ttx_size, plain);
+            av_free(ttx_data);
             if (ret < 0)
                 return ret;
         }
@@ -586,9 +492,6 @@ static int render_teletext_to_frame(AVFilterContext *avctx, AVFrame *frame,
             continue;
         }
 
-        /* Log teletext content being embedded */
-        log_teletext_embed(avctx, vbi_line, field, teletext_data);
-
         /* Render teletext waveform */
         render_teletext_line(luma, teletext_data, FFMIN(width, 720));
 
@@ -628,6 +531,13 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink,
     for (int i = 0; i < ctx->nb_events; i++) {
         TeletextEvent *ev = &ctx->events[i];
         if (frame_pts >= ev->start_pts && frame_pts < ev->end_pts) {
+            /* Log when event first becomes active */
+            if (!ev->logged) {
+                if (ev->text) {
+                    av_log(avctx, AV_LOG_INFO, "TTX EMBED: %s\n", ev->text);
+                }
+                ev->logged = 1;
+            }
             ret = render_teletext_to_frame(avctx, frame, ev->data, ev->data_size);
             if (ret < 0) {
                 av_frame_free(&frame);
@@ -735,8 +645,10 @@ static av_cold void uninit(AVFilterContext *avctx)
 {
     TeletextEmbedContext *ctx = avctx->priv;
 
-    for (int i = 0; i < ctx->nb_events; i++)
+    for (int i = 0; i < ctx->nb_events; i++) {
         av_freep(&ctx->events[i].data);
+        av_freep(&ctx->events[i].text);
+    }
     av_freep(&ctx->events);
     ctx->nb_events = 0;
     ctx->events_capacity = 0;
