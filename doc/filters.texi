@@ -23466,7 +23466,7 @@ This filter is intended for SD output where VBI teletext is required.
 For HD output (1080i), use the decklink output device with a teletext
 subtitle stream, which will insert OP-47/SMPTE RDD-8 VANC packets.
 
-See also @ref{readteletext} for reading teletext from VBI lines.
+See also the @code{readteletext} filter for reading teletext from VBI lines.
 
 @section thistogram
 
