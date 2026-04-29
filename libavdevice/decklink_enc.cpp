@@ -1253,7 +1253,7 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
             int row = (d0 != 0xFF && d1 != 0xFF) ? (((d0 >> 3) & 1) | (d1 << 1)) : 0;
             if (magazine == 0) magazine = 8;
 
-            av_log(avctx, AV_LOG_DEBUG, "VBI: Rendered teletext waveform on SDI line %d (field %d): M%d/R%02d, MRAG=0x%02X%02X\n",
+            av_log(avctx, AV_LOG_INFO, "VBI: Rendered teletext waveform on SDI line %d (field %d): M%d/R%02d, MRAG=0x%02X%02X\n",
                    vbi_line, field, magazine, row, ttx_data[0], ttx_data[1]);
         }
 
