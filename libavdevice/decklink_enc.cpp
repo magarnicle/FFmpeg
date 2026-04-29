@@ -51,6 +51,9 @@ extern "C" {
 
 #include "decklink_common.h"
 #include "decklink_enc.h"
+extern "C" {
+#include "libavcodec/teletextenc.h"
+}
 #if CONFIG_LIBKLVANC
 #include "libklvanc/vanc.h"
 #include "libklvanc/vanc-lines.h"
@@ -1266,6 +1269,128 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
     return 0;
 }
 
+/* Build a dummy teletext header line (42 bytes) for Page 8FF, Subcode 0x3F7E.
+ * Per Australian OP-47 Appendix: "Dummy Headers" should be Page 8FF, Subcode 0x3F7E,
+ * transmitted when no caption content is present to keep the teletext service active.
+ */
+static void build_dummy_teletext_header(uint8_t *line)
+{
+    /* Magazine 8 encoded as 0, row 0 (page header) */
+    line[0] = ff_teletext_ham84(0);  /* M1-M3=0 (magazine 8), Y0=0 */
+    line[1] = ff_teletext_ham84(0);  /* Y1-Y4=0 (row 0) */
+
+    /* Page FF (units=F, tens=F) */
+    line[2] = ff_teletext_ham84(0x0F);
+    line[3] = ff_teletext_ham84(0x0F);
+
+    /* Subcode 0x3F7E per Australian convention:
+     * S1=0xE, S2=0x7, C4=1, S3=0xF, S4=0x3
+     * Byte layout:
+     *   byte4: S1 (4 bits) -> 0xE
+     *   byte5: S2 (3 bits) + C4 (1 bit) -> 0x7 | 0x8 = 0xF
+     *   byte6: S3 low (4 bits) -> 0xF
+     *   byte7: S3 high (2 bits) + C5/C6 -> 0x3
+     */
+    line[4] = ff_teletext_ham84(0x0E);        /* S1 = 0xE */
+    line[5] = ff_teletext_ham84(0x07 | 0x08); /* S2=7, C4=1 */
+    line[6] = ff_teletext_ham84(0x0F);        /* S3 low = 0xF */
+    line[7] = ff_teletext_ham84(0x03);        /* S3 high + C5/C6 = 0x3 */
+
+    /* Control bits: C7=0, C8=0, C9=0, C10=0, C11=0 */
+    line[8] = ff_teletext_ham84(0);
+    line[9] = ff_teletext_ham84(0);
+
+    /* C12=0, C13=0, C14=0 (region) */
+    line[10] = ff_teletext_ham84(0);
+    line[11] = ff_teletext_ham84(0);
+
+    /* Bytes 12-41: 30 spaces with odd parity */
+    for (int i = 0; i < 30; i++) {
+        line[12 + i] = ff_teletext_odd_parity(' ');
+    }
+}
+
+/* Insert a dummy teletext header VANC packet for when no subtitle content is present.
+ * Per Australian OP-47: dummy headers keep the teletext service active.
+ */
+static void insert_dummy_teletext_header(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                          struct klvanc_line_set_s *vanc_lines)
+{
+    struct klvanc_packet_sdp_s *sdp = NULL;
+    uint8_t dummy_line[42];
+    int ret;
+
+    ret = klvanc_create_SDP(&sdp);
+    if (ret < 0 || !sdp) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create dummy SDP packet\n");
+        return;
+    }
+
+    /* Build the dummy header line */
+    build_dummy_teletext_header(dummy_line);
+
+    /* Set SDP identifier and format */
+    sdp->identifier = 0x5115;  /* OP-47 identifier */
+    sdp->format_code = SDP_WSS_TELETEXT;  /* 0x02 = WST teletext */
+
+    /* Two descriptors: one for field 1 (odd), one for field 2 (even)
+     * Both on SD line 21 per Australian OP-47 convention */
+    for (int field = 0; field < 2; field++) {
+        sdp->descriptors[field].line = 21;
+        sdp->descriptors[field].field = (field == 0) ? 1 : 0;  /* field 0 = odd (1), field 1 = even (0) */
+
+        /* Structure B: run-in + framing + teletext data */
+        sdp->descriptors[field].data[0] = 0x55;  /* Run-in 1 */
+        sdp->descriptors[field].data[1] = 0x55;  /* Run-in 2 */
+        sdp->descriptors[field].data[2] = 0x27;  /* Framing code (bit-reversed 0xE4) */
+        memcpy(&sdp->descriptors[field].data[3], dummy_line, 42);
+    }
+
+    /* Finalize with sequence counter */
+    klvanc_finalize_SDP(sdp, ctx->sdp_sequence_num++);
+
+    /* Convert to VANC words */
+    uint16_t *vanc_words = NULL;
+    uint16_t word_count = 0;
+
+    ret = klvanc_convert_SDP_to_words(sdp, &vanc_words, &word_count);
+    if (ret == 0 && vanc_words) {
+        int f1_line = 12;
+        int f2_line = 0;
+
+        /* Insert on HD line 12 for field 1 */
+        ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                 word_count, f1_line, 0);
+        if (ret != 0) {
+            av_log(avctx, AV_LOG_DEBUG, "Failed to insert dummy teletext VANC on line %d: %d\n", f1_line, ret);
+        }
+
+        /* Field 2 line based on video mode */
+        switch (ctx->bmd_mode) {
+        case bmdModeHD1080i50:
+        case bmdModeHD1080i5994:
+        case bmdModeHD1080i6000:
+            f2_line = 563 + f1_line;  /* Line 575 per Australian OP-47 */
+            break;
+        default:
+            f2_line = 0;
+            break;
+        }
+
+        if (f2_line > 0) {
+            ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                     word_count, f2_line, 0);
+            if (ret != 0) {
+                av_log(avctx, AV_LOG_DEBUG, "Failed to insert dummy teletext VANC on line %d: %d\n", f2_line, ret);
+            }
+        }
+
+        free(vanc_words);
+    }
+
+    klvanc_destroy_SDP(sdp);
+}
+
 /* Build OP47/SDP VANC packet from teletext data units per Free TV Australia OP-47
  * and SMPTE RDD-8 specifications.
  *
@@ -1303,6 +1428,7 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
 {
     AVPacket teletext_pkt;
     int ret;
+    int processed_data = 0;  /* Track if we processed any teletext for this frame */
 
     if (!ctx->teletext_mode_logged) {
         av_log(avctx, AV_LOG_INFO, "Teletext: using VANC (OP-47) for HD output\n");
@@ -1430,6 +1556,7 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
                 }
 
                 free(vanc_words);
+                processed_data = 1;  /* Successfully inserted teletext data */
             } else {
                 av_log(avctx, AV_LOG_ERROR, "Failed to convert SDP to VANC words: %d\n", ret);
             }
@@ -1438,6 +1565,13 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
         }
 
         av_packet_unref(&teletext_pkt);
+    }
+
+    /* Per Australian OP-47 Appendix: "Dummy Headers" should be transmitted when
+     * no caption content is present to keep the teletext service active.
+     * Page 8FF, Subcode 0x3F7E */
+    if (!processed_data) {
+        insert_dummy_teletext_header(avctx, ctx, vanc_lines);
     }
 }
 
