@@ -1141,6 +1141,11 @@ static void render_teletext_vbi_v210(uint8_t *buf, const uint8_t *data, int widt
     }
 }
 
+/* Forward declarations for dummy teletext insertion */
+static void build_dummy_teletext_header(uint8_t *line);
+static void insert_dummy_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                       IDeckLinkVideoFrameAncillary *vanc);
+
 /* Insert teletext VBI waveforms for SD output.
  * For PAL: lines 6-22 (field 1), lines 319-335 (field 2)
  * For NTSC: lines 10-21 (field 1), lines 273-284 (field 2)
@@ -1151,6 +1156,7 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
     AVPacket teletext_pkt;
     int ret;
     int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
+    int processed_data = 0;
 
     if (!ctx->teletext_mode_logged) {
         av_log(avctx, AV_LOG_INFO, "Teletext: using VBI waveforms for SD output (lines 7-22)\n");
@@ -1230,6 +1236,7 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
 
             /* Render teletext waveform into VBI line */
             render_teletext_vbi_v210((uint8_t *)buf, ttx_data, 720);
+            processed_data = 1;
 
             /* Log MRAG for debugging - decode Hamming 8/4 first */
             static const uint8_t ham84[256] = {
@@ -1264,6 +1271,11 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
                num_data_units, teletext_pkt.pts);
 
         av_packet_unref(&teletext_pkt);
+    }
+
+    /* Per Australian OP-47: send dummy headers when no content to maintain decoder sync */
+    if (!processed_data) {
+        insert_dummy_teletext_vbi(avctx, ctx, vanc);
     }
 
     return 0;
@@ -1307,6 +1319,37 @@ static void build_dummy_teletext_header(uint8_t *line)
     /* Bytes 12-41: 30 spaces with odd parity */
     for (int i = 0; i < 30; i++) {
         line[12 + i] = ff_teletext_odd_parity(' ');
+    }
+}
+
+/* Insert dummy teletext VBI waveforms for SD output when no content is present.
+ * This keeps the teletext decoder synchronized by providing continuous clock run-in
+ * and framing codes on the standard subtitle VBI lines.
+ */
+static void insert_dummy_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                       IDeckLinkVideoFrameAncillary *vanc)
+{
+    uint8_t dummy_line[42];
+    int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
+
+    build_dummy_teletext_header(dummy_line);
+
+    /* Per Australian OP-47: SD lines 21/334 carry teletext subtitles
+     * Render dummy headers on both fields to maintain decoder sync */
+    int field1_line = is_pal ? 21 : 21;
+    int field2_line = is_pal ? 334 : 284;
+
+    void *buf;
+    HRESULT result;
+
+    result = vanc->GetBufferForVerticalBlankingLine(field1_line, &buf);
+    if (result == S_OK) {
+        render_teletext_vbi_v210((uint8_t *)buf, dummy_line, 720);
+    }
+
+    result = vanc->GetBufferForVerticalBlankingLine(field2_line, &buf);
+    if (result == S_OK) {
+        render_teletext_vbi_v210((uint8_t *)buf, dummy_line, 720);
     }
 }
 
