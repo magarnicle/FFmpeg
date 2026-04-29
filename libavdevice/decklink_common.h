@@ -168,6 +168,7 @@ struct decklink_ctx {
     AVStream *teletext_st;
     uint16_t cdp_sequence_num;
     uint16_t sdp_sequence_num;  /* OP-47 SDP footer sequence counter */
+    int teletext_mode_logged;   /* Have we logged the teletext output mode? */
     /* Options */
     int list_devices;
     int list_formats;
