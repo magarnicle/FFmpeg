@@ -299,6 +299,40 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
 }
 
 /**
+ * Build a dummy teletext header for page 8FF with subcode 0x3F7E.
+ * Per Australian OP-47 convention, this should be transmitted when
+ * no caption content is present to keep the teletext service active.
+ */
+static void build_dummy_header(uint8_t *line)
+{
+    /* Magazine 8 encoded as 0, row 0 */
+    line[0] = ff_teletext_ham84(0);  /* M=0 (magazine 8), Y0=0 */
+    line[1] = ff_teletext_ham84(0);  /* Y1-Y4=0 (row 0) */
+
+    /* Page FF (units=F, tens=F) */
+    line[2] = ff_teletext_ham84(0x0F);
+    line[3] = ff_teletext_ham84(0x0F);
+
+    /* Subcode 0x3F7E per Australian convention:
+     * S1=0xE, S2=0x7, C4=1, S3=0xF, S4=0x3 */
+    line[4] = ff_teletext_ham84(0x0E);        /* S1 low nibble */
+    line[5] = ff_teletext_ham84(0x07 | 0x08); /* S2 (3 bits) + C4=1 */
+    line[6] = ff_teletext_ham84(0x0F);        /* S3 low nibble */
+    line[7] = ff_teletext_ham84(0x03);        /* S3 high + C5/C6 */
+
+    /* Control bits: C7=0, C8=0, C9=0, C10=0, C11=0 (no special flags) */
+    line[8] = ff_teletext_ham84(0);
+    line[9] = ff_teletext_ham84(0);
+    line[10] = ff_teletext_ham84(0);
+    line[11] = ff_teletext_ham84(0);
+
+    /* Bytes 12-41: 30 spaces with odd parity */
+    for (int i = 0; i < 30; i++) {
+        line[12 + i] = ff_teletext_odd_parity(' ');
+    }
+}
+
+/**
  * Build a teletext header row (row 0)
  */
 static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
@@ -430,16 +464,20 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
     clear_page_buffer(ctx);
 
     if (!sub || sub->num_rects == 0) {
-        /* Empty subtitle - generate clear page */
-        /* Build header row */
-        build_header_row(ctx, line_data);
+        /* Empty subtitle - generate dummy header (page 8FF, subcode 0x3F7E)
+         * per Australian OP-47 convention on line 21 (field 1) and 334 (field 2) */
+        build_dummy_header(line_data);
 
-        if (buf_size < TELETEXT_DATA_UNIT_SIZE)
+        if (buf_size < TELETEXT_DATA_UNIT_SIZE * 2)
             return AVERROR_BUFFER_TOO_SMALL;
 
+        /* Field 1 on line 21 */
         ff_teletext_build_data_unit(buf, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
-                                    0, 7, ctx->mag_encoded, 0, line_data);
-        return TELETEXT_DATA_UNIT_SIZE;
+                                    1, 21, 0, 0, line_data);
+        /* Field 2 on line 21 (maps to SDI line 334) */
+        ff_teletext_build_data_unit(buf + TELETEXT_DATA_UNIT_SIZE, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
+                                    0, 21, 0, 0, line_data);
+        return TELETEXT_DATA_UNIT_SIZE * 2;
     }
 
     /* Process subtitle rectangles */
@@ -514,35 +552,44 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
         av_log(avctx, AV_LOG_DEBUG, "Teletext: wrote %d lines total\n", line_count);
     }
 
-    /* Generate teletext packets */
-    /* Header row (row 0) */
-    build_header_row(ctx, line_data);
-    if (total_size + TELETEXT_DATA_UNIT_SIZE > buf_size)
-        return AVERROR_BUFFER_TOO_SMALL;
+    /* Generate teletext packets for both fields.
+     * VBI lines 6-22 are available for teletext in PAL (17 lines per field).
+     * Per Australian OP-47 convention: header on line 21, content on lines 17-20.
+     * For field 2, line 21 maps to SDI line 334 (313 + 21). */
+    for (int field = 1; field <= 2; field++) {
+        int field_parity = (field == 1) ? 1 : 0;
 
-    ff_teletext_build_data_unit(buf + total_size, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
-                                0, 7, ctx->mag_encoded, 0, line_data);
-    total_size += TELETEXT_DATA_UNIT_SIZE;
+        /* Header row (row 0) on line 21 per Australian OP-47 convention */
+        build_header_row(ctx, line_data);
+        if (total_size + TELETEXT_DATA_UNIT_SIZE > buf_size)
+            return AVERROR_BUFFER_TOO_SMALL;
 
-    /* Content rows (rows 1-23) - only emit non-empty rows near the subtitle area */
-    for (int row = 19; row < TELETEXT_ROWS && row <= 23; row++) {
-        /* Check if row has content */
-        int has_content = 0;
-        for (int col = 0; col < TELETEXT_COLS; col++) {
-            if (ctx->page_buffer[row][col] != ' ') {
-                has_content = 1;
-                break;
+        ff_teletext_build_data_unit(buf + total_size, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
+                                    field_parity, 21, ctx->mag_encoded, 0, line_data);
+        total_size += TELETEXT_DATA_UNIT_SIZE;
+
+        /* Content rows on lines 17-20 (before header line 21)
+         * This allows up to 4 content rows while keeping header on line 21 */
+        int content_line = 17;
+        for (int row = 19; row < TELETEXT_ROWS && row <= 23 && content_line <= 20; row++) {
+            /* Check if row has content */
+            int has_content = 0;
+            for (int col = 0; col < TELETEXT_COLS; col++) {
+                if (ctx->page_buffer[row][col] != ' ') {
+                    has_content = 1;
+                    break;
+                }
             }
-        }
 
-        if (has_content || row >= 20) {
-            build_content_row(ctx, line_data, row);
-            if (total_size + TELETEXT_DATA_UNIT_SIZE > buf_size)
-                return AVERROR_BUFFER_TOO_SMALL;
+            if (has_content || row >= 20) {
+                build_content_row(ctx, line_data, row);
+                if (total_size + TELETEXT_DATA_UNIT_SIZE > buf_size)
+                    return AVERROR_BUFFER_TOO_SMALL;
 
-            ff_teletext_build_data_unit(buf + total_size, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
-                                        0, 7 + row, ctx->mag_encoded, row, line_data);
-            total_size += TELETEXT_DATA_UNIT_SIZE;
+                ff_teletext_build_data_unit(buf + total_size, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
+                                            field_parity, content_line++, ctx->mag_encoded, row, line_data);
+                total_size += TELETEXT_DATA_UNIT_SIZE;
+            }
         }
     }
 

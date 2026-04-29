@@ -624,10 +624,10 @@ static int decklink_setup_subtitle(AVFormatContext *avctx, AVStream *st)
         ret = 0;
         break;
     case AV_CODEC_ID_DVB_TELETEXT:
-        /* Teletext for VANC output */
+        /* Teletext for VANC (HD) or VBI (SD) output */
         ctx->teletext_st = st;
         ff_decklink_packet_queue_init(avctx, &ctx->teletext_queue, 1024 * 1024);
-        av_log(avctx, AV_LOG_INFO, "Teletext stream configured for VANC output\n");
+        av_log(avctx, AV_LOG_INFO, "Teletext stream configured (VANC for HD, VBI waveforms for SD)\n");
         ret = 0;
         break;
 #endif
@@ -1041,13 +1041,20 @@ static void render_teletext_vbi_v210(uint8_t *buf, const uint8_t *data, int widt
     /* VBI teletext waveform parameters (ITU-R BT.653 System B):
      * - Bit rate: 6.9375 MHz
      * - Sample rate: 13.5 MHz (SD-SDI)
-     * - Samples per bit: ~1.946
-     * - Clock run-in start: ~10.5 µs from line start = ~142 samples at 13.5 MHz
+     * - Samples per bit: 13.5/6.9375 = 1.946
+     *
+     * Total bits: 32 (CRI) + 8 (framing) + 336 (42 bytes) = 376 bits
+     * At 1.946 samples/bit = 732 samples
+     * Starting at offset 6 allows full waveform to fit in 720 samples
+     * (some samples overlap, which is fine for the waveform shape)
      */
-    const int cri_offset = 142;  /* Clock run-in start sample */
+    const int cri_offset = 6;    /* Clock run-in start sample */
     const int luma_black = 64;   /* 10-bit black level (16 * 4) */
     const int luma_white = 940;  /* 10-bit white level (235 * 4) */
     const int chroma_neutral = 512;  /* 10-bit neutral chroma */
+
+    /* Timing: use 1946/1000 samples per bit for accurate 6.9375 MHz bit rate */
+    #define SAMPLES_PER_BIT_X1000 1946
 
     /* v210 packs 6 pixels into 4 32-bit words:
      * Word 0: Cb0 | Y0  | Cr0  (bits 0-9, 10-19, 20-29)
@@ -1058,40 +1065,55 @@ static void render_teletext_vbi_v210(uint8_t *buf, const uint8_t *data, int widt
 
     /* Build luma samples for the waveform */
     uint16_t luma[720];
-    int pos = 0;
 
     /* Initialize to black */
     for (int i = 0; i < width; i++)
         luma[i] = luma_black;
 
-    /* Skip to clock run-in start position */
-    pos = cri_offset;
+    int bit_index = 0;
 
     /* Clock run-in: 16 cycles of alternating 1/0 (32 bits total) */
-    for (int i = 0; i < 16 && pos < width - 1; i++) {
-        luma[pos++] = luma_white;  /* ~2 samples per bit */
-        luma[pos++] = luma_white;
-        luma[pos++] = luma_black;
-        luma[pos++] = luma_black;
+    for (int i = 0; i < 16; i++) {
+        /* '1' bit */
+        int start = cri_offset + (bit_index * SAMPLES_PER_BIT_X1000) / 1000;
+        int end = cri_offset + ((bit_index + 1) * SAMPLES_PER_BIT_X1000) / 1000;
+        for (int s = start; s < end && s < width; s++)
+            luma[s] = luma_white;
+        bit_index++;
+
+        /* '0' bit */
+        start = cri_offset + (bit_index * SAMPLES_PER_BIT_X1000) / 1000;
+        end = cri_offset + ((bit_index + 1) * SAMPLES_PER_BIT_X1000) / 1000;
+        for (int s = start; s < end && s < width; s++)
+            luma[s] = luma_black;
+        bit_index++;
     }
 
     /* Framing code: 11100100 (0xE4) transmitted LSB first */
     uint8_t framing = 0xE4;
-    for (int bit = 0; bit < 8 && pos < width - 1; bit++) {
+    for (int bit = 0; bit < 8; bit++) {
         int level = (framing >> bit) & 1 ? luma_white : luma_black;
-        luma[pos++] = level;
-        luma[pos++] = level;
+        int start = cri_offset + (bit_index * SAMPLES_PER_BIT_X1000) / 1000;
+        int end = cri_offset + ((bit_index + 1) * SAMPLES_PER_BIT_X1000) / 1000;
+        for (int s = start; s < end && s < width; s++)
+            luma[s] = level;
+        bit_index++;
     }
 
     /* Data: 42 bytes transmitted LSB first */
-    for (int byte = 0; byte < 42 && pos < width - 1; byte++) {
+    for (int byte = 0; byte < 42; byte++) {
         uint8_t b = data[byte];
-        for (int bit = 0; bit < 8 && pos < width - 1; bit++) {
+        for (int bit = 0; bit < 8; bit++) {
             int level = (b >> bit) & 1 ? luma_white : luma_black;
-            luma[pos++] = level;
-            luma[pos++] = level;
+            int start = cri_offset + (bit_index * SAMPLES_PER_BIT_X1000) / 1000;
+            int end = cri_offset + ((bit_index + 1) * SAMPLES_PER_BIT_X1000) / 1000;
+            for (int s = start; s < end && s < width; s++)
+                luma[s] = level;
+            bit_index++;
         }
     }
+
+    #undef SAMPLES_PER_BIT_X1000
 
     /* Convert to v210 format */
     uint32_t *words = (uint32_t *)buf;
@@ -1127,6 +1149,11 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
     int ret;
     int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
 
+    if (!ctx->teletext_mode_logged) {
+        av_log(avctx, AV_LOG_INFO, "Teletext: using VBI waveforms for SD output (lines 7-22)\n");
+        ctx->teletext_mode_logged = 1;
+    }
+
     /* Process pending teletext packets */
     while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
         int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
@@ -1146,6 +1173,9 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
         /* Log teletext content */
         log_teletext_packet(avctx, &teletext_pkt);
 
+        av_log(avctx, AV_LOG_VERBOSE, "VBI: Processing teletext packet, size=%d, pts=%"PRId64", %d data units\n",
+               teletext_pkt.size, teletext_pkt.pts, teletext_pkt.size / 46);
+
         /* Process each 46-byte data unit */
         int num_data_units = teletext_pkt.size / 46;
         for (int i = 0; i < num_data_units; i++) {
@@ -1161,6 +1191,9 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
             int field = ((du[2] >> 5) & 1) ? 1 : 2;
             int line_offset = du[2] & 0x1F;
             const uint8_t *ttx_data = &du[4];
+
+            av_log(avctx, AV_LOG_VERBOSE, "VBI: Data unit %d: id=0x%02X len=%d field=%d line_offset=%d framing=0x%02X\n",
+                   i, du[0], du[1], field, line_offset, du[3]);
 
             /* Calculate actual VBI line number */
             int vbi_line;
@@ -1182,19 +1215,50 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
 
             /* Get buffer for VBI line */
             void *buf;
+            av_log(avctx, AV_LOG_VERBOSE, "VBI: Requesting buffer for SDI line %d (field %d, offset %d)\n",
+                   vbi_line, field, line_offset);
+
             HRESULT result = vanc->GetBufferForVerticalBlankingLine(vbi_line, &buf);
             if (result != S_OK) {
-                av_log(avctx, AV_LOG_DEBUG, "Failed to get VBI line %d (field %d, offset %d): %d\n",
-                       vbi_line, field, line_offset, result);
+                av_log(avctx, AV_LOG_WARNING, "VBI: Failed to get buffer for line %d (field %d, offset %d): HRESULT=0x%08X\n",
+                       vbi_line, field, line_offset, (unsigned int)result);
                 continue;
             }
 
             /* Render teletext waveform into VBI line */
             render_teletext_vbi_v210((uint8_t *)buf, ttx_data, 720);
 
-            av_log(avctx, AV_LOG_DEBUG, "Rendered teletext VBI on line %d (field %d)\n",
-                   vbi_line, field);
+            /* Log MRAG for debugging - decode Hamming 8/4 first */
+            static const uint8_t ham84[256] = {
+                0x01,0xFF,0x01,0x01,0xFF,0x00,0x01,0xFF,0xFF,0x02,0x01,0xFF,0x0A,0xFF,0xFF,0x07,
+                0xFF,0x00,0x01,0xFF,0x00,0x00,0xFF,0x00,0x06,0xFF,0xFF,0x0B,0xFF,0x00,0x03,0xFF,
+                0xFF,0x0C,0x01,0xFF,0x04,0xFF,0xFF,0x07,0x06,0xFF,0xFF,0x07,0xFF,0x07,0x07,0x07,
+                0x06,0xFF,0xFF,0x05,0xFF,0x00,0x0D,0xFF,0x06,0x06,0x06,0xFF,0x06,0xFF,0xFF,0x07,
+                0xFF,0x02,0x01,0xFF,0x04,0xFF,0xFF,0x09,0x02,0x02,0xFF,0x02,0xFF,0x02,0x03,0xFF,
+                0x08,0xFF,0xFF,0x05,0xFF,0x00,0x03,0xFF,0xFF,0x02,0x03,0xFF,0x03,0xFF,0x03,0x03,
+                0x04,0xFF,0xFF,0x05,0x04,0x04,0x04,0xFF,0xFF,0x02,0x0F,0xFF,0x04,0xFF,0xFF,0x07,
+                0xFF,0x05,0x05,0x05,0x04,0xFF,0xFF,0x05,0x06,0xFF,0xFF,0x05,0xFF,0x0E,0x03,0xFF,
+                0xFF,0x0C,0x01,0xFF,0x0A,0xFF,0xFF,0x09,0x0A,0xFF,0xFF,0x0B,0x0A,0x0A,0x0A,0xFF,
+                0x08,0xFF,0xFF,0x0B,0xFF,0x00,0x0D,0xFF,0xFF,0x0B,0x0B,0x0B,0x0A,0xFF,0xFF,0x0B,
+                0x0C,0x0C,0xFF,0x0C,0xFF,0x0C,0x0D,0xFF,0xFF,0x0C,0x0F,0xFF,0x0A,0xFF,0xFF,0x07,
+                0xFF,0x0C,0x0D,0xFF,0x0D,0xFF,0x0D,0x0D,0x06,0xFF,0xFF,0x0B,0xFF,0x0E,0x0D,0xFF,
+                0x08,0xFF,0xFF,0x09,0xFF,0x09,0x09,0x09,0xFF,0x02,0x0F,0xFF,0x0A,0xFF,0xFF,0x09,
+                0x08,0x08,0x08,0xFF,0x08,0xFF,0xFF,0x09,0x08,0xFF,0xFF,0x0B,0xFF,0x0E,0x03,0xFF,
+                0xFF,0x0C,0x0F,0xFF,0x04,0xFF,0xFF,0x09,0x0F,0xFF,0x0F,0x0F,0xFF,0x0E,0x0F,0xFF,
+                0x08,0xFF,0xFF,0x05,0xFF,0x0E,0x0D,0xFF,0xFF,0x0E,0x0F,0xFF,0x0E,0x0E,0xFF,0x0E,
+            };
+            uint8_t d0 = ham84[ttx_data[0]];
+            uint8_t d1 = ham84[ttx_data[1]];
+            int magazine = (d0 != 0xFF) ? (d0 & 0x07) : 0;
+            int row = (d0 != 0xFF && d1 != 0xFF) ? (((d0 >> 3) & 1) | (d1 << 1)) : 0;
+            if (magazine == 0) magazine = 8;
+
+            av_log(avctx, AV_LOG_DEBUG, "VBI: Rendered teletext waveform on SDI line %d (field %d): M%d/R%02d, MRAG=0x%02X%02X\n",
+                   vbi_line, field, magazine, row, ttx_data[0], ttx_data[1]);
         }
+
+        av_log(avctx, AV_LOG_VERBOSE, "VBI: Completed %d teletext data units for pts=%"PRId64"\n",
+               num_data_units, teletext_pkt.pts);
 
         av_packet_unref(&teletext_pkt);
     }
@@ -1239,6 +1303,11 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
 {
     AVPacket teletext_pkt;
     int ret;
+
+    if (!ctx->teletext_mode_logged) {
+        av_log(avctx, AV_LOG_INFO, "Teletext: using VANC (OP-47) for HD output\n");
+        ctx->teletext_mode_logged = 1;
+    }
 
     /* Process pending teletext packets */
     while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
@@ -1345,7 +1414,7 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
                 case bmdModeHD1080i50:
                 case bmdModeHD1080i5994:
                 case bmdModeHD1080i6000:
-                    f2_line = 569 - 7 + f1_line;   /* Line 574 (HD line 575 in spec) */
+                    f2_line = 563 + f1_line;   /* Line 575 per Australian OP-47 */
                     break;
                 default:
                     f2_line = 0;  /* Progressive modes: no field 2 */
@@ -1860,6 +1929,7 @@ static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
     AVStream *st = avctx->streams[pkt->stream_index];
 
     switch (st->codecpar->codec_id) {
+#if CONFIG_LIBKLVANC
     case AV_CODEC_ID_EIA_608:
         ff_ccfifo_extractbytes(&ctx->cc_fifo, pkt->data, pkt->size);
         break;
@@ -1869,6 +1939,7 @@ static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
             av_log(avctx, AV_LOG_WARNING, "Failed to queue teletext packet\n");
         }
         break;
+#endif
     default:
         av_log(avctx, AV_LOG_WARNING, "Unsupported subtitle codec in packet\n");
         break;

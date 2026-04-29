@@ -50,7 +50,8 @@
 /* VBI waveform parameters */
 #define VBI_LUMA_BLACK   0x10   /* Black level (IRE 0) */
 #define VBI_LUMA_WHITE   0xEB   /* White level (IRE 100) */
-#define VBI_CRI_OFFSET   72     /* Clock run-in start sample (after H sync) */
+#define VBI_CRI_OFFSET   6      /* Clock run-in start sample */
+#define VBI_SAMPLES_PER_BIT_X1000 1946  /* 13.5 MHz / 6.9375 MHz = 1.946 */
 
 /* Teletext data unit size from encoder */
 #define TELETEXT_DATA_UNIT_SIZE 46
@@ -293,18 +294,10 @@ static uint8_t *encode_text_to_teletext(AVFilterContext *ctx, const char *text,
 }
 
 /**
- * Render a single bit into the luma samples.
- * Writes approximately 2 samples per bit (13.5 MHz / 6.9375 MHz ≈ 1.946).
- */
-static inline void render_bit(uint8_t *luma, int *pos, int bit, int max_pos)
-{
-    uint8_t level = bit ? VBI_LUMA_WHITE : VBI_LUMA_BLACK;
-    if (*pos < max_pos) luma[(*pos)++] = level;
-    if (*pos < max_pos) luma[(*pos)++] = level;
-}
-
-/**
  * Render teletext data into a luma buffer (720 samples).
+ *
+ * Uses accurate 1.946 samples per bit timing (13.5 MHz / 6.9375 MHz)
+ * to ensure the full 376-bit waveform fits within 720 samples.
  *
  * @param luma   Output buffer for luma samples (must be >= 720 bytes)
  * @param data   42 bytes of teletext line data (MRAG + 40 data bytes)
@@ -312,7 +305,7 @@ static inline void render_bit(uint8_t *luma, int *pos, int bit, int max_pos)
  */
 static void render_teletext_line(uint8_t *luma, const uint8_t *data, int width)
 {
-    int pos = VBI_CRI_OFFSET;
+    int bit_index = 0;
 
     /* Initialize line to black */
     memset(luma, VBI_LUMA_BLACK, width);
@@ -320,21 +313,42 @@ static void render_teletext_line(uint8_t *luma, const uint8_t *data, int width)
     /* Clock run-in: 16 cycles of alternating 1/0 (32 bits)
      * This creates the 10101010... pattern for receiver sync */
     for (int i = 0; i < 16; i++) {
-        render_bit(luma, &pos, 1, width);
-        render_bit(luma, &pos, 0, width);
+        /* '1' bit */
+        int start = VBI_CRI_OFFSET + (bit_index * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+        int end = VBI_CRI_OFFSET + ((bit_index + 1) * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+        for (int s = start; s < end && s < width; s++)
+            luma[s] = VBI_LUMA_WHITE;
+        bit_index++;
+
+        /* '0' bit */
+        start = VBI_CRI_OFFSET + (bit_index * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+        end = VBI_CRI_OFFSET + ((bit_index + 1) * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+        for (int s = start; s < end && s < width; s++)
+            luma[s] = VBI_LUMA_BLACK;
+        bit_index++;
     }
 
     /* Framing code: 11100100 binary = 0xE4 (transmitted LSB first) */
     uint8_t framing = 0xE4;
     for (int i = 0; i < 8; i++) {
-        render_bit(luma, &pos, (framing >> i) & 1, width);
+        uint8_t level = (framing >> i) & 1 ? VBI_LUMA_WHITE : VBI_LUMA_BLACK;
+        int start = VBI_CRI_OFFSET + (bit_index * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+        int end = VBI_CRI_OFFSET + ((bit_index + 1) * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+        for (int s = start; s < end && s < width; s++)
+            luma[s] = level;
+        bit_index++;
     }
 
     /* Data: 42 bytes transmitted LSB first with odd parity */
     for (int byte = 0; byte < 42; byte++) {
         uint8_t b = data[byte];
         for (int bit = 0; bit < 8; bit++) {
-            render_bit(luma, &pos, (b >> bit) & 1, width);
+            uint8_t level = (b >> bit) & 1 ? VBI_LUMA_WHITE : VBI_LUMA_BLACK;
+            int start = VBI_CRI_OFFSET + (bit_index * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+            int end = VBI_CRI_OFFSET + ((bit_index + 1) * VBI_SAMPLES_PER_BIT_X1000) / 1000;
+            for (int s = start; s < end && s < width; s++)
+                luma[s] = level;
+            bit_index++;
         }
     }
 }
