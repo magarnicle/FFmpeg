@@ -151,6 +151,9 @@ struct decklink_ctx {
     int teletext_page;
     int teletext_magazine;
     DecklinkTeletextFields teletext_fields;
+    uint8_t last_teletext_data[42];  /* Last transmitted teletext payload for SD VBI (MRAG + 40 data) */
+    uint8_t last_teletext_pkt[46];   /* Last transmitted teletext data unit for HD VANC */
+    int has_last_teletext;           /* Whether we have valid last teletext data */
 
     /* Streams present */
     int audio;

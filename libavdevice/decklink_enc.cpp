@@ -1077,7 +1077,7 @@ static uint16_t sdp_sequence_counter = 0;
  *     SDP CHECKSUM
  */
 static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
-                                  uint8_t *teletext_data, int num_data_units,
+                                  const uint8_t *teletext_data, int num_data_units,
                                   int field, int sd_line)
 {
     if (num_data_units < 1 || num_data_units > OP47_MAX_VBI_PACKETS)
@@ -1149,7 +1149,7 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
      *   data: 40 bytes with parity
      */
     for (int i = 0; i < num_data_units; i++) {
-        uint8_t *du = teletext_data + (i * 46);
+        const uint8_t *du = teletext_data + (i * 46);
         /* Structure B starts at byte 4 of data unit (after data_unit_id, length, field/line, framing)
          * But we need to reconstruct with proper run-in/framing codes */
 
@@ -1211,7 +1211,7 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  *   Word 3: Y4[9:0], Cr2[9:0], Y5[9:0], xx
  */
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
-                                            uint8_t *teletext_data, int data_len)
+                                            const uint8_t *teletext_data, int data_len)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -1293,8 +1293,56 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     }
 }
 
+/* Filler teletext data unit for HD VANC (OP-47 SDP format)
+ * Structure: data_unit_id (0x03=subtitle), length (0x2C=44),
+ *            field/line (0x00), framing_code (0xE4),
+ *            42-byte payload (MRAG for M8/row23 + 40 spaces)
+ */
+static const uint8_t teletext_filler_data_unit[46] = {
+    0x03,        /* data_unit_id: EBU teletext subtitle */
+    0x2C,        /* data_unit_length: 44 */
+    0x00,        /* reserved/field/line */
+    0xE4,        /* framing_code */
+    0x8C, 0x73,  /* MRAG: magazine 8, row 23 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 40 spaces */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+};
+
+/* Insert OP-47 VANC packet on specified line */
+static int insert_op47_vanc_line(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                  struct klvanc_line_set_s *vanc_lines,
+                                  const uint8_t *teletext_data, int num_data_units,
+                                  int field, int vbi_line, int vanc_line)
+{
+    int max_vanc_words = 3 + 2 + 1 + 1 + 5 + (5 * 45) + 1 + 2 + 1;
+    uint16_t *vanc_words = (uint16_t *)av_malloc(max_vanc_words * sizeof(uint16_t));
+    if (!vanc_words)
+        return AVERROR(ENOMEM);
+
+    int word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
+                                            (uint8_t *)teletext_data, num_data_units,
+                                            field, vbi_line);
+    int ret = 0;
+    if (word_count > 0) {
+        ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                 word_count, vanc_line, 0);
+        if (ret != 0) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line (field %d): %d\n",
+                   field, ret);
+        }
+    }
+
+    av_free(vanc_words);
+    return ret;
+}
+
 /* Build OP47 VANC packet from teletext data units
- * Supports both HD VANC (OP47 SDP) and SD PAL VBI modes per Australian OP-47
+ * Supports HD VANC (OP47 SDP) modes per Australian OP-47.
+ * Always inserts data on every frame to maintain decoder sync - either
+ * new data from the queue, last transmitted data, or a filler packet.
  */
 static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                struct klvanc_line_set_s *vanc_lines)
@@ -1302,11 +1350,10 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
     AVPacket teletext_pkt;
     int ret;
 
-    /* Process pending teletext packets */
+    /* Check for new teletext packets */
     while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
         int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
         if (pts > ctx->last_pts) {
-            /* Packet is for a future frame */
             break;
         }
 
@@ -1320,95 +1367,104 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
             continue;
         }
 
-        /* Log teletext content at debug level */
         log_teletext_packet(avctx, &teletext_pkt);
 
         if (teletext_pkt.size >= 46) {
-            int num_data_units = teletext_pkt.size / 46;
-            if (num_data_units > OP47_MAX_VBI_PACKETS)
-                num_data_units = OP47_MAX_VBI_PACKETS;
-
-            /* Build OP47 SDP packets for both fields per Australian convention
-             * For HD modes: Insert on VANC line 12 (field 1) and appropriate field 2 line
-             * For SD PAL: VBI waveform insertion is handled separately
-             */
-
-            /* Determine field 2 line based on video mode */
-            int f2_line;
-            switch (ctx->bmd_mode) {
-            case bmdModeHD1080i50:
-            case bmdModeHD1080i5994:
-            case bmdModeHD1080i6000:
-                f2_line = AUS_HD_LINE_FIELD2;  /* Line 575 for 1080i */
-                break;
-            case bmdModePAL:
-                f2_line = AUS_SD_LINE_FIELD2;  /* Line 334 for SD PAL */
-                break;
-            default:
-                f2_line = 0;  /* Progressive modes don't have field 2 */
-                break;
-            }
-
-            /* Allocate buffer for VANC words (max size for 5 packets) */
-            int max_vanc_words = 3 + 2 + 1 + 1 + 5 + (5 * 45) + 1 + 2 + 1;
-            uint16_t *vanc_words = (uint16_t *)av_malloc(max_vanc_words * sizeof(uint16_t));
-            if (!vanc_words) {
-                av_packet_unref(&teletext_pkt);
-                continue;
-            }
-
-            /* Build and insert field 1 packet (odd field) */
-            if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
-                int word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
-                                                        teletext_pkt.data, num_data_units,
-                                                        1, AUS_SD_LINE_FIELD1);
-                if (word_count > 0) {
-                    ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
-                                             word_count, AUS_HD_LINE_FIELD1, 0);
-                    if (ret != 0) {
-                        av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line (field 1): %d\n", ret);
-                    }
-                }
-            }
-
-            /* Build and insert field 2 packet for interlaced modes (even field) */
-            if (f2_line > 0 && ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
-                int word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
-                                                        teletext_pkt.data, num_data_units,
-                                                        2, AUS_SD_LINE_FIELD2);
-                if (word_count > 0) {
-                    ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
-                                             word_count, f2_line, 0);
-                    if (ret != 0) {
-                        av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line (field 2): %d\n", ret);
-                    }
-                }
-            }
-
-            av_free(vanc_words);
+            /* Store first data unit for retransmission */
+            memcpy(ctx->last_teletext_pkt, teletext_pkt.data, 46);
+            memcpy(ctx->last_teletext_data, teletext_pkt.data + 4, 42);
+            ctx->has_last_teletext = 1;
         }
 
         av_packet_unref(&teletext_pkt);
+    }
+
+    /* Determine which data to transmit: stored data or filler */
+    const uint8_t *data_to_send;
+    if (ctx->has_last_teletext) {
+        data_to_send = ctx->last_teletext_pkt;
+    } else {
+        data_to_send = teletext_filler_data_unit;
+    }
+
+    /* Determine field 2 line based on video mode */
+    int f2_line;
+    switch (ctx->bmd_mode) {
+    case bmdModeHD1080i50:
+    case bmdModeHD1080i5994:
+    case bmdModeHD1080i6000:
+        f2_line = AUS_HD_LINE_FIELD2;
+        break;
+    case bmdModePAL:
+        f2_line = AUS_SD_LINE_FIELD2;
+        break;
+    default:
+        f2_line = 0;
+        break;
+    }
+
+    /* Insert field 1 packet (odd field) */
+    if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
+        insert_op47_vanc_line(avctx, ctx, vanc_lines, data_to_send, 1,
+                              1, AUS_SD_LINE_FIELD1, AUS_HD_LINE_FIELD1);
+    }
+
+    /* Insert field 2 packet for interlaced modes (even field) */
+    if (f2_line > 0 && ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
+        insert_op47_vanc_line(avctx, ctx, vanc_lines, data_to_send, 1,
+                              2, AUS_SD_LINE_FIELD2, f2_line);
+    }
+}
+
+/* Filler teletext packet: magazine 8, row 23 with 40 spaces
+ * Used when no new teletext data is available to maintain decoder sync.
+ * MRAG uses Hamming 8/4 encoding:
+ *   Byte 0: M1=0, R0=1, M2=0, R1=1 -> 0x8C
+ *   Byte 1: R2=1, R3=0, R4=1, M3=0 -> 0x73
+ * Data bytes: 0x20 (space with odd parity)
+ */
+static const uint8_t teletext_filler_packet[42] = {
+    0x8C, 0x73,  /* MRAG: magazine 8, row 23 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 40 spaces */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+};
+
+/* Insert teletext VBI waveform into specified line */
+static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                      IDeckLinkVideoFrameAncillary *vanc,
+                                      int line_num, const uint8_t *teletext_data)
+{
+    void *line_buf;
+    HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
+    if (result == S_OK) {
+        generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
+                                        teletext_data, 42);
+        av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", line_num);
+    } else {
+        av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", line_num);
     }
 }
 
 /* Insert teletext VBI waveforms directly into SD PAL VBI lines
  * This is called for SD PAL mode where we write raw teletext waveforms
- * to VBI lines 21 (field 1) and 334 (field 2) per Australian OP-47
+ * to VBI lines 21 (field 1) and 334 (field 2) per Australian OP-47.
+ * Always inserts data on every frame to maintain decoder sync - either
+ * new data from the queue, last transmitted data, or a filler packet.
  */
 static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                        IDeckLinkVideoFrameAncillary *vanc)
 {
     AVPacket teletext_pkt;
     int ret;
-    void *line_buf;
-    HRESULT result;
 
     /* Only process if we're in SD PAL mode */
     if (ctx->bmd_mode != bmdModePAL)
         return;
 
-    /* Process pending teletext packets */
+    /* Check for new teletext packets */
     while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
         int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
         if (pts > ctx->last_pts) {
@@ -1432,32 +1488,30 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             uint8_t *du = teletext_pkt.data;
             uint8_t *teletext_data = du + 4;
 
-            /* Insert on VBI line 21 (field 1 / odd field) */
-            if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
-                result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD1, &line_buf);
-                if (result == S_OK) {
-                    generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                                    teletext_data, 42);
-                    av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD1);
-                } else {
-                    av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD1);
-                }
-            }
-
-            /* Insert on VBI line 334 (field 2 / even field) - duplicate for Australian compliance */
-            if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
-                result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD2, &line_buf);
-                if (result == S_OK) {
-                    generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                                    teletext_data, 42);
-                    av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD2);
-                } else {
-                    av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD2);
-                }
-            }
+            /* Store this data for retransmission on subsequent frames */
+            memcpy(ctx->last_teletext_data, teletext_data, 42);
+            ctx->has_last_teletext = 1;
         }
 
         av_packet_unref(&teletext_pkt);
+    }
+
+    /* Determine which data to transmit: new data, last data, or filler */
+    const uint8_t *data_to_send;
+    if (ctx->has_last_teletext) {
+        data_to_send = ctx->last_teletext_data;
+    } else {
+        data_to_send = teletext_filler_packet;
+    }
+
+    /* Insert on VBI line 21 (field 1 / odd field) */
+    if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
+    }
+
+    /* Insert on VBI line 334 (field 2 / even field) */
+    if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
     }
 }
 
