@@ -1206,10 +1206,12 @@ static void queue_teletext_overflow(struct decklink_ctx *ctx, const uint8_t *du)
 }
 
 /* Helper to render a single teletext data unit to VBI
- * Returns 1 if rendered, 0 if field already used */
+ * Returns 1 if rendered, 0 if field already used
+ * log_level: AV_LOG_INFO for new data, AV_LOG_VERBOSE for repeated/cached */
 static int render_single_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                        IDeckLinkVideoFrameAncillary *vanc,
-                                       const uint8_t *du, int *field1_done, int *field2_done)
+                                       const uint8_t *du, int *field1_done, int *field2_done,
+                                       int log_level)
 {
     int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
     int field = ((du[2] >> 5) & 1) ? 1 : 2;
@@ -1261,7 +1263,7 @@ static int render_single_teletext_vbi(AVFormatContext *avctx, struct decklink_ct
     int row = (d0 != 0xFF && d1 != 0xFF) ? (((d0 >> 3) & 1) | (d1 << 1)) : 0;
     if (magazine == 0) magazine = 8;
 
-    av_log(avctx, AV_LOG_INFO, "VBI: Rendered teletext on line %d (field %d): M%d/R%02d\n",
+    av_log(avctx, log_level, "VBI: Rendered teletext on line %d (field %d): M%d/R%02d\n",
            vbi_line, field, magazine, row);
     return 1;
 }
@@ -1282,17 +1284,6 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
         ctx->teletext_mode_logged = 1;
     }
 
-    /* Double transmit: render cached data from previous frame first */
-    if (cctx->teletext_double_transmit && ctx->last_teletext_data && ctx->last_teletext_size > 0) {
-        int num_units = ctx->last_teletext_size / 46;
-        for (int i = 0; i < num_units && (!field1_done || !field2_done); i++) {
-            const uint8_t *du = ctx->last_teletext_data + (i * 46);
-            if (render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done))
-                processed_data = 1;
-        }
-        av_log(avctx, AV_LOG_VERBOSE, "VBI: Double transmit - repeated previous frame's teletext\n");
-    }
-
     /* Process overflow from previous frames first (rows that didn't fit) */
     if (ctx->teletext_overflow_size > 0) {
         int num_units = ctx->teletext_overflow_size / 46;
@@ -1300,7 +1291,7 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
 
         for (int i = 0; i < num_units; i++) {
             const uint8_t *du = ctx->teletext_overflow + (i * 46);
-            if (!render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done)) {
+            if (!render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done, AV_LOG_INFO)) {
                 /* Couldn't render, keep in overflow */
                 if (new_overflow_size != i * 46)
                     memmove(ctx->teletext_overflow + new_overflow_size, du, 46);
@@ -1338,7 +1329,7 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
         for (int i = 0; i < num_data_units; i++) {
             uint8_t *du = teletext_pkt.data + (i * 46);
 
-            if (render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done)) {
+            if (render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done, AV_LOG_INFO)) {
                 processed_data = 1;
             } else {
                 /* Field already has data this frame - queue for next frame */
@@ -1348,8 +1339,8 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
             }
         }
 
-        /* For double transmit: save packet data */
-        if (cctx->teletext_double_transmit && teletext_pkt.size > 0) {
+        /* Save packet data to cache for persistence across frames */
+        if (teletext_pkt.size > 0) {
             av_freep(&current_frame_data);
             current_frame_data = (uint8_t *)av_malloc(teletext_pkt.size);
             if (current_frame_data) {
@@ -1361,12 +1352,31 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
         av_packet_unref(&teletext_pkt);
     }
 
-    /* Update cache for next frame's double transmit */
-    if (cctx->teletext_double_transmit) {
+    /* Update cache - teletext data persists until new subtitle arrives */
+    if (current_frame_data) {
         av_freep(&ctx->last_teletext_data);
         ctx->last_teletext_data = current_frame_data;
         ctx->last_teletext_size = current_frame_size;
         current_frame_data = NULL;
+    }
+
+    /* If no new data was rendered, re-render from cache (persistence) */
+    if (!processed_data && ctx->last_teletext_data && ctx->last_teletext_size > 0) {
+        int num_units = ctx->last_teletext_size / 46;
+        for (int i = 0; i < num_units && (!field1_done || !field2_done); i++) {
+            const uint8_t *du = ctx->last_teletext_data + (i * 46);
+            if (render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done, AV_LOG_VERBOSE))
+                processed_data = 1;
+        }
+    }
+
+    /* Double transmit: render cache again on fields not yet filled */
+    if (cctx->teletext_double_transmit && ctx->last_teletext_data && ctx->last_teletext_size > 0) {
+        int num_units = ctx->last_teletext_size / 46;
+        for (int i = 0; i < num_units && (!field1_done || !field2_done); i++) {
+            const uint8_t *du = ctx->last_teletext_data + (i * 46);
+            render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done, AV_LOG_VERBOSE);
+        }
     }
 
     /* Per Australian OP-47: send dummy headers when no content */
