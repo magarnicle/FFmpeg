@@ -1169,11 +1169,12 @@ static int render_teletext_data_to_vbi(AVFormatContext *avctx, struct decklink_c
         int line_offset = du[2] & 0x1F;
         const uint8_t *ttx_data = &du[4];
 
+        /* Per Australian OP-47/OP-42: force line 21/334 for subtitles */
         int vbi_line;
         if (is_pal) {
-            vbi_line = (field == 1) ? line_offset : 313 + line_offset;
+            vbi_line = (field == 1) ? 21 : 334;
         } else {
-            vbi_line = (field == 1) ? line_offset : 263 + line_offset;
+            vbi_line = (field == 1) ? 21 : 284;
         }
 
         void *buf;
@@ -1253,22 +1254,17 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
             av_log(avctx, AV_LOG_VERBOSE, "VBI: Data unit %d: id=0x%02X len=%d field=%d line_offset=%d framing=0x%02X\n",
                    i, du[0], du[1], field, line_offset, du[3]);
 
-            /* Calculate actual VBI line number */
+            /* Calculate actual VBI line number
+             * Per Australian OP-47/OP-42: all teletext subtitles go on line 21 (field 1)
+             * and line 334 (field 2), regardless of input line_offset.
+             */
             int vbi_line;
             if (is_pal) {
-                /* PAL: field 1 lines 6-22 map to SDI lines 6-22
-                 *      field 2 lines 6-22 map to SDI lines 319-335 */
-                if (field == 1)
-                    vbi_line = line_offset;
-                else
-                    vbi_line = 313 + line_offset;
+                /* Australian PAL: force line 21/334 for subtitles */
+                vbi_line = (field == 1) ? 21 : 334;
             } else {
-                /* NTSC: field 1 lines 10-21 map to SDI lines 10-21
-                 *       field 2 lines 10-21 map to SDI lines 273-284 */
-                if (field == 1)
-                    vbi_line = line_offset;
-                else
-                    vbi_line = 263 + line_offset;
+                /* NTSC: line 21/284 */
+                vbi_line = (field == 1) ? 21 : 284;
             }
 
             /* Get buffer for VBI line */
