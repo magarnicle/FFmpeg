@@ -65,6 +65,10 @@ static const AVOption options[] = {
     { "true"        ,  NULL                     , 0                   , AV_OPT_TYPE_CONST , { .i64 = 1   }, 0, 0, ENC, .unit = "level_a"},
     { "timing_offset", "genlock timing pixel offset", OFFSET(timing_offset), AV_OPT_TYPE_INT,   { .i64 = INT_MIN }, INT_MIN, INT_MAX, ENC, .unit = "timing_offset"},
     { "unset"       ,  NULL                     , 0                        , AV_OPT_TYPE_CONST, { .i64 = INT_MIN },       0,       0, ENC, .unit = "timing_offset"},
+    { "teletext_fields", "teletext field insertion mode", OFFSET(teletext_fields), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, ENC, .unit = "teletext_fields"},
+    { "both"        , "insert on both fields (default, per OP-47)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, ENC, .unit = "teletext_fields"},
+    { "odd"         , "insert on odd field (field 1) only",         0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, ENC, .unit = "teletext_fields"},
+    { "even"        , "insert on even field (field 2) only",        0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, ENC, .unit = "teletext_fields"},
     { NULL },
 };
 

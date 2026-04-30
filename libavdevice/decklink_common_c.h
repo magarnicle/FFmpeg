@@ -43,6 +43,12 @@ typedef enum DecklinkSignalLossAction {
     SIGNAL_LOSS_BARS    = 3
 } DecklinkSignalLossAction;
 
+typedef enum DecklinkTeletextFields {
+    TELETEXT_FIELDS_BOTH = 0,
+    TELETEXT_FIELDS_ODD  = 1,  /* Field 1 only */
+    TELETEXT_FIELDS_EVEN = 2,  /* Field 2 only */
+} DecklinkTeletextFields;
+
 struct decklink_cctx {
     const AVClass *cclass;
 
@@ -78,6 +84,7 @@ struct decklink_cctx {
     DecklinkSignalLossAction signal_loss_action;
     int64_t output_buffer_size;
     double late_threshold;
+    DecklinkTeletextFields teletext_fields;
 };
 
 #endif /* AVDEVICE_DECKLINK_COMMON_C_H */
