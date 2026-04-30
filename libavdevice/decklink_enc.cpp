@@ -1236,9 +1236,9 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     int pixel_pos = 84;
     int bit_pos_fp = 0;
 
-    /* Generate clock run-in: 16 bits of alternating 1/0 */
+    /* Generate clock run-in: 16 bits of alternating 1/0, starting with 1 */
     for (int bit = 0; bit < 16; bit++) {
-        uint16_t value = (bit & 1) ? LUMA_HIGH : LUMA_LOW;
+        uint16_t value = (bit & 1) ? LUMA_LOW : LUMA_HIGH;
         int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
         int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
         for (int p = start_pixel; p < end_pixel && p < 720; p++)
@@ -1246,8 +1246,8 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         bit_pos_fp += SAMPLES_PER_BIT_FP;
     }
 
-    /* Generate framing code: 0xE4 (LSB first) */
-    uint8_t framing = 0xE4;
+    /* Generate framing code: 0x27 (0xE4 bit-reversed for LSB-first transmission) */
+    uint8_t framing = 0x27;
     for (int bit = 0; bit < 8; bit++) {
         uint16_t value = (framing & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
         int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
@@ -1357,23 +1357,25 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
                 continue;
             }
 
-            /* Build and insert field 1 packet */
-            int word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
-                                                    teletext_pkt.data, num_data_units,
-                                                    1, AUS_SD_LINE_FIELD1);
-            if (word_count > 0) {
-                ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
-                                         word_count, AUS_HD_LINE_FIELD1, 0);
-                if (ret != 0) {
-                    av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line (field 1): %d\n", ret);
+            /* Build and insert field 1 packet (odd field) */
+            if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
+                int word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
+                                                        teletext_pkt.data, num_data_units,
+                                                        1, AUS_SD_LINE_FIELD1);
+                if (word_count > 0) {
+                    ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                             word_count, AUS_HD_LINE_FIELD1, 0);
+                    if (ret != 0) {
+                        av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line (field 1): %d\n", ret);
+                    }
                 }
             }
 
-            /* Build and insert field 2 packet for interlaced modes */
-            if (f2_line > 0) {
-                word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
-                                                    teletext_pkt.data, num_data_units,
-                                                    2, AUS_SD_LINE_FIELD2);
+            /* Build and insert field 2 packet for interlaced modes (even field) */
+            if (f2_line > 0 && ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
+                int word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
+                                                        teletext_pkt.data, num_data_units,
+                                                        2, AUS_SD_LINE_FIELD2);
                 if (word_count > 0) {
                     ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
                                              word_count, f2_line, 0);
@@ -1430,24 +1432,28 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             uint8_t *du = teletext_pkt.data;
             uint8_t *teletext_data = du + 4;
 
-            /* Insert on VBI line 21 (field 1) */
-            result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD1, &line_buf);
-            if (result == S_OK) {
-                generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                                teletext_data, 42);
-                av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD1);
-            } else {
-                av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD1);
+            /* Insert on VBI line 21 (field 1 / odd field) */
+            if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
+                result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD1, &line_buf);
+                if (result == S_OK) {
+                    generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
+                                                    teletext_data, 42);
+                    av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD1);
+                } else {
+                    av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD1);
+                }
             }
 
-            /* Insert on VBI line 334 (field 2) - duplicate for Australian compliance */
-            result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD2, &line_buf);
-            if (result == S_OK) {
-                generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                                teletext_data, 42);
-                av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD2);
-            } else {
-                av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD2);
+            /* Insert on VBI line 334 (field 2 / even field) - duplicate for Australian compliance */
+            if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
+                result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD2, &line_buf);
+                if (result == S_OK) {
+                    generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
+                                                    teletext_data, 42);
+                    av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD2);
+                } else {
+                    av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD2);
+                }
             }
         }
 
@@ -1986,6 +1992,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->preroll      = cctx->preroll;
     ctx->block_until_available      = cctx->block_until_available;
     ctx->duplex_mode  = cctx->duplex_mode;
+    ctx->teletext_fields = cctx->teletext_fields;
     ctx->first_pts    = AV_NOPTS_VALUE;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
         ctx->link = decklink_link_conf_map[cctx->link];
