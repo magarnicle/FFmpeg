@@ -1432,30 +1432,36 @@ static const uint8_t teletext_filler_packet[42] = {
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
-/* Insert teletext VBI waveform into specified line */
-static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx *ctx,
-                                      IDeckLinkVideoFrameAncillary *vanc,
-                                      int line_num, const uint8_t *teletext_data)
+/* Insert teletext VBI waveform into specified line of the video frame buffer.
+ * For SD PAL, VBI lines are part of the actual video raster, so we write
+ * directly to the frame buffer rather than using ancillary data.
+ * V210 format: 6 pixels per 16 bytes, so line stride = (width/6) * 16
+ */
+static void insert_teletext_vbi_line_to_frame(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                               void *frame_buf, int line_num,
+                                               const uint8_t *teletext_data)
 {
-    void *line_buf;
-    HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
-    if (result == S_OK) {
-        generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                        teletext_data, 42);
-        av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", line_num);
-    } else {
-        av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", line_num);
-    }
+    int line_stride = (ctx->bmd_width / 6) * 16;
+    int line_offset = line_num * line_stride;
+
+    uint8_t *line_buf = (uint8_t *)frame_buf + line_offset;
+    generate_teletext_vbi_waveform(line_buf, ctx->bmd_width, teletext_data, 42);
+
+    av_log(avctx, AV_LOG_DEBUG,
+           "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x%02x%02x...\n",
+           line_num, teletext_data[0], teletext_data[1],
+           teletext_data[2], teletext_data[3], teletext_data[4],
+           teletext_data[5], teletext_data[6], teletext_data[7]);
 }
 
-/* Insert teletext VBI waveforms directly into SD PAL VBI lines
- * This is called for SD PAL mode where we write raw teletext waveforms
- * to VBI lines 21 (field 1) and 334 (field 2) per Australian OP-47.
- * Always inserts data on every frame to maintain decoder sync - either
- * new data from the queue, last transmitted data, or a filler packet.
+/* Insert teletext VBI waveforms directly into SD PAL VBI lines.
+ * For SD PAL, VBI lines are part of the actual video raster, so we write
+ * directly to the frame buffer on lines 21 (field 1) and 334 (field 2)
+ * per Australian OP-47. Always inserts data on every frame to maintain
+ * decoder sync - either new data from queue, last data, or filler.
  */
 static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ctx *ctx,
-                                       IDeckLinkVideoFrameAncillary *vanc)
+                                       decklink_frame *frame)
 {
     AVPacket teletext_pkt;
     int ret;
@@ -1463,6 +1469,15 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     /* Only process if we're in SD PAL mode */
     if (ctx->bmd_mode != bmdModePAL)
         return;
+
+    if (!ctx->teletext_st)
+        return;
+
+    void *frame_buf;
+    if (frame->GetBytes(&frame_buf) != S_OK) {
+        av_log(avctx, AV_LOG_WARNING, "Could not get frame buffer for teletext VBI\n");
+        return;
+    }
 
     /* Check for new teletext packets */
     while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
@@ -1506,13 +1521,59 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
 
     /* Insert on VBI line 21 (field 1 / odd field) */
     if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
+        insert_teletext_vbi_line_to_frame(avctx, ctx, frame_buf, AUS_SD_LINE_FIELD1, data_to_send);
     }
 
     /* Insert on VBI line 334 (field 2 / even field) */
     if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
+        insert_teletext_vbi_line_to_frame(avctx, ctx, frame_buf, AUS_SD_LINE_FIELD2, data_to_send);
     }
+}
+
+/* Debug: write teletext waveform directly to video frame buffer for visibility testing.
+ * This writes to the active video area so it can be seen on a monitor.
+ * V210 format: 6 pixels per 16 bytes, so line stride = (width/6) * 16
+ */
+static void debug_teletext_to_frame(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                     decklink_frame *frame)
+{
+    if (ctx->teletext_debug_line <= 0 || !ctx->teletext_st)
+        return;
+
+    void *frame_buf;
+    if (frame->GetBytes(&frame_buf) != S_OK) {
+        av_log(avctx, AV_LOG_WARNING, "Debug: could not get frame buffer\n");
+        return;
+    }
+
+    /* Determine which data to display */
+    const uint8_t *data_to_send;
+    if (ctx->has_last_teletext) {
+        data_to_send = ctx->last_teletext_data;
+    } else {
+        data_to_send = teletext_filler_packet;
+    }
+
+    /* Calculate line offset in V210 format: 6 pixels per 16 bytes */
+    int line_stride = (ctx->bmd_width / 6) * 16;
+    int line_offset = ctx->teletext_debug_line * line_stride;
+
+    /* Bounds check */
+    if (ctx->teletext_debug_line >= ctx->bmd_height) {
+        av_log(avctx, AV_LOG_WARNING, "Debug line %d exceeds frame height %d\n",
+               ctx->teletext_debug_line, ctx->bmd_height);
+        return;
+    }
+
+    uint8_t *line_buf = (uint8_t *)frame_buf + line_offset;
+    generate_teletext_vbi_waveform(line_buf, ctx->bmd_width, data_to_send, 42);
+
+    av_log(avctx, AV_LOG_INFO,
+           "Debug: teletext line %d: MRAG=%02x%02x data=%02x%02x%02x%02x%02x%02x... (has_last=%d)\n",
+           ctx->teletext_debug_line, data_to_send[0], data_to_send[1],
+           data_to_send[2], data_to_send[3], data_to_send[4],
+           data_to_send[5], data_to_send[6], data_to_send[7],
+           ctx->has_last_teletext);
 }
 
 /* Parse any EIA-608 subtitles sitting on the queue, and write packet side data
@@ -1610,10 +1671,10 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
         goto done;
     }
 
-    /* For SD PAL mode, insert teletext as raw VBI waveforms on lines 21/334
-     * This must be done after ancillary data creation so we can access VBI line buffers */
+    /* For SD PAL mode, insert teletext as raw VBI waveforms directly into the
+     * video frame buffer on lines 21/334 (VBI is part of the SD raster) */
     if (ctx->teletext_st && ctx->bmd_mode == bmdModePAL)
-        construct_teletext_vbi_sd(avctx, ctx, vanc);
+        construct_teletext_vbi_sd(avctx, ctx, frame);
 
     /* Now that we've got all the VANC lines in a nice orderly manner, generate the
        final VANC sections for the Decklink output (HD modes only) */
@@ -1761,6 +1822,11 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         }
 
         frame = new decklink_frame(ctx, avframe, st->codecpar->codec_id, avframe->height, avframe->width);
+
+#if CONFIG_LIBKLVANC
+        /* Debug: write teletext waveform to visible video line if requested */
+        debug_teletext_to_frame(avctx, ctx, frame);
+#endif
     } else {
         avpacket = av_packet_clone(pkt);
         if (!avpacket) {
@@ -1773,6 +1839,9 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 #if CONFIG_LIBKLVANC
         if (decklink_construct_vanc(avctx, ctx, pkt, frame, st))
             av_log(avctx, AV_LOG_ERROR, "Failed to construct VANC\n");
+
+        /* Debug: write teletext waveform to visible video line if requested */
+        debug_teletext_to_frame(avctx, ctx, frame);
 #endif
     }
 
@@ -2047,6 +2116,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->block_until_available      = cctx->block_until_available;
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
+    ctx->teletext_debug_line = cctx->teletext_debug_line;
     ctx->first_pts    = AV_NOPTS_VALUE;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
         ctx->link = decklink_link_conf_map[cctx->link];
