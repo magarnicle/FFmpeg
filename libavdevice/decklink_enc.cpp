@@ -1046,8 +1046,7 @@ static void log_teletext_packet(AVFormatContext *avctx, AVPacket *pkt)
 
 /* OP-47 SDP packet constants */
 #define OP47_DID            0x43
-#define OP47_SDID_FIELD1    0x02
-#define OP47_SDID_FIELD2    0x03
+#define OP47_SDID           0x02  /* SDID=0x102 with parity, same for both fields per OP-47 4.2(ii) */
 #define OP47_IDENTIFIER_1   0x51
 #define OP47_IDENTIFIER_2   0x15
 #define OP47_FORMAT_WST     0x02
@@ -1099,7 +1098,7 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
 
     /* VANC header - DID, SDID, DC with parity */
     vanc_words[idx++] = vanc_parity(OP47_DID);
-    vanc_words[idx++] = vanc_parity(field == 1 ? OP47_SDID_FIELD1 : OP47_SDID_FIELD2);
+    vanc_words[idx++] = vanc_parity(OP47_SDID);
     vanc_words[idx++] = vanc_parity(sdp_payload_size & 0xFF);
 
     /* OP47 identifiers */
