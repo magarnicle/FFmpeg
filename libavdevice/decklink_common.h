@@ -173,6 +173,12 @@ struct decklink_ctx {
     /* Teletext double transmit state - cache previous frame's data */
     uint8_t *last_teletext_data;
     int last_teletext_size;
+
+    /* Teletext overflow queue - for rows that couldn't fit in current frame
+     * Per Australian OP-47: only one packet per field, so excess rows are queued */
+    uint8_t *teletext_overflow;
+    int teletext_overflow_size;
+    int teletext_overflow_capacity;
     /* Options */
     int list_devices;
     int list_formats;

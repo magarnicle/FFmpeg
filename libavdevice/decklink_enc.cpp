@@ -756,6 +756,7 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     if (ctx->teletext_st) {
         ff_decklink_packet_queue_end(&ctx->teletext_queue);
         av_freep(&ctx->last_teletext_data);
+        av_freep(&ctx->teletext_overflow);
     }
 
     /* Clean up async output queues if they were used */
@@ -1189,28 +1190,102 @@ static int render_teletext_data_to_vbi(AVFormatContext *avctx, struct decklink_c
     return rendered;
 }
 
+/* Helper to add a data unit to the overflow queue */
+static void queue_teletext_overflow(struct decklink_ctx *ctx, const uint8_t *du)
+{
+    if (ctx->teletext_overflow_size + 46 > ctx->teletext_overflow_capacity) {
+        int new_capacity = ctx->teletext_overflow_capacity ? ctx->teletext_overflow_capacity * 2 : 460;
+        uint8_t *new_buf = (uint8_t *)av_realloc(ctx->teletext_overflow, new_capacity);
+        if (!new_buf)
+            return;
+        ctx->teletext_overflow = new_buf;
+        ctx->teletext_overflow_capacity = new_capacity;
+    }
+    memcpy(ctx->teletext_overflow + ctx->teletext_overflow_size, du, 46);
+    ctx->teletext_overflow_size += 46;
+}
+
+/* Helper to render a single teletext data unit to VBI
+ * Returns 1 if rendered, 0 if field already used */
+static int render_single_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                       IDeckLinkVideoFrameAncillary *vanc,
+                                       const uint8_t *du, int *field1_done, int *field2_done)
+{
+    int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
+    int field = ((du[2] >> 5) & 1) ? 1 : 2;
+    const uint8_t *ttx_data = &du[4];
+
+    /* Per Australian OP-47: only one packet per field */
+    if ((field == 1 && *field1_done) || (field == 2 && *field2_done))
+        return 0;
+
+    int vbi_line;
+    if (is_pal) {
+        vbi_line = (field == 1) ? 21 : 334;
+    } else {
+        vbi_line = (field == 1) ? 21 : 284;
+    }
+
+    void *buf;
+    HRESULT result = vanc->GetBufferForVerticalBlankingLine(vbi_line, &buf);
+    if (result != S_OK)
+        return 0;
+
+    render_teletext_vbi_v210((uint8_t *)buf, ttx_data, 720);
+
+    if (field == 1) *field1_done = 1;
+    else *field2_done = 1;
+
+    av_log(avctx, AV_LOG_VERBOSE, "VBI: Rendered teletext on line %d (field %d)\n", vbi_line, field);
+    return 1;
+}
+
 static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                    IDeckLinkVideoFrameAncillary *vanc)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     AVPacket teletext_pkt;
     int ret;
-    int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
     int processed_data = 0;
+    int field1_done = 0, field2_done = 0;
     uint8_t *current_frame_data = NULL;
     int current_frame_size = 0;
 
     if (!ctx->teletext_mode_logged) {
-        av_log(avctx, AV_LOG_INFO, "Teletext: using VBI waveforms for SD output (lines 7-22)\n");
+        av_log(avctx, AV_LOG_INFO, "Teletext: using VBI waveforms for SD output (line 21/334 only, one packet per field)\n");
         ctx->teletext_mode_logged = 1;
     }
 
     /* Double transmit: render cached data from previous frame first */
     if (cctx->teletext_double_transmit && ctx->last_teletext_data && ctx->last_teletext_size > 0) {
-        render_teletext_data_to_vbi(avctx, ctx, vanc, ctx->last_teletext_data,
-                                    ctx->last_teletext_size, 0);
+        int num_units = ctx->last_teletext_size / 46;
+        for (int i = 0; i < num_units && (!field1_done || !field2_done); i++) {
+            const uint8_t *du = ctx->last_teletext_data + (i * 46);
+            if (render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done))
+                processed_data = 1;
+        }
         av_log(avctx, AV_LOG_VERBOSE, "VBI: Double transmit - repeated previous frame's teletext\n");
-        processed_data = 1;
+    }
+
+    /* Process overflow from previous frames first (rows that didn't fit) */
+    if (ctx->teletext_overflow_size > 0) {
+        int num_units = ctx->teletext_overflow_size / 46;
+        int new_overflow_size = 0;
+
+        for (int i = 0; i < num_units; i++) {
+            const uint8_t *du = ctx->teletext_overflow + (i * 46);
+            if (!render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done)) {
+                /* Couldn't render, keep in overflow */
+                if (new_overflow_size != i * 46)
+                    memmove(ctx->teletext_overflow + new_overflow_size, du, 46);
+                new_overflow_size += 46;
+            } else {
+                processed_data = 1;
+            }
+        }
+        ctx->teletext_overflow_size = new_overflow_size;
+        if (new_overflow_size > 0)
+            av_log(avctx, AV_LOG_VERBOSE, "VBI: %d data units still queued for next frame\n", new_overflow_size / 46);
     }
 
     /* Process pending teletext packets */
@@ -1229,93 +1304,25 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
             continue;
         }
 
-        /* Log teletext content */
         log_teletext_packet(avctx, &teletext_pkt);
 
-        av_log(avctx, AV_LOG_VERBOSE, "VBI: Processing teletext packet, size=%d, pts=%"PRId64", %d data units\n",
-               teletext_pkt.size, teletext_pkt.pts, teletext_pkt.size / 46);
-
-        /* Process each 46-byte data unit */
         int num_data_units = teletext_pkt.size / 46;
+        av_log(avctx, AV_LOG_VERBOSE, "VBI: Processing teletext packet with %d data units\n", num_data_units);
+
         for (int i = 0; i < num_data_units; i++) {
             uint8_t *du = teletext_pkt.data + (i * 46);
 
-            /* Data unit format:
-             *   du[0]: data_unit_id
-             *   du[1]: data_unit_length (44)
-             *   du[2]: field_parity (bit 5) + line_offset (bits 0-4)
-             *   du[3]: framing_code (0xE4)
-             *   du[4-45]: 42 bytes teletext data (MRAG + 40 bytes)
-             */
-            int field = ((du[2] >> 5) & 1) ? 1 : 2;
-            int line_offset = du[2] & 0x1F;
-            const uint8_t *ttx_data = &du[4];
-
-            av_log(avctx, AV_LOG_VERBOSE, "VBI: Data unit %d: id=0x%02X len=%d field=%d line_offset=%d framing=0x%02X\n",
-                   i, du[0], du[1], field, line_offset, du[3]);
-
-            /* Calculate actual VBI line number
-             * Per Australian OP-47/OP-42: all teletext subtitles go on line 21 (field 1)
-             * and line 334 (field 2), regardless of input line_offset.
-             */
-            int vbi_line;
-            if (is_pal) {
-                /* Australian PAL: force line 21/334 for subtitles */
-                vbi_line = (field == 1) ? 21 : 334;
+            if (render_single_teletext_vbi(avctx, ctx, vanc, du, &field1_done, &field2_done)) {
+                processed_data = 1;
             } else {
-                /* NTSC: line 21/284 */
-                vbi_line = (field == 1) ? 21 : 284;
+                /* Field already has data this frame - queue for next frame */
+                queue_teletext_overflow(ctx, du);
+                av_log(avctx, AV_LOG_VERBOSE, "VBI: Queued data unit for next frame (field %d already rendered)\n",
+                       ((du[2] >> 5) & 1) ? 1 : 2);
             }
-
-            /* Get buffer for VBI line */
-            void *buf;
-            av_log(avctx, AV_LOG_VERBOSE, "VBI: Requesting buffer for SDI line %d (field %d, offset %d)\n",
-                   vbi_line, field, line_offset);
-
-            HRESULT result = vanc->GetBufferForVerticalBlankingLine(vbi_line, &buf);
-            if (result != S_OK) {
-                av_log(avctx, AV_LOG_WARNING, "VBI: Failed to get buffer for line %d (field %d, offset %d): HRESULT=0x%08X\n",
-                       vbi_line, field, line_offset, (unsigned int)result);
-                continue;
-            }
-
-            /* Render teletext waveform into VBI line */
-            render_teletext_vbi_v210((uint8_t *)buf, ttx_data, 720);
-            processed_data = 1;
-
-            /* Log MRAG for debugging - decode Hamming 8/4 first */
-            static const uint8_t ham84[256] = {
-                0x01,0xFF,0x01,0x01,0xFF,0x00,0x01,0xFF,0xFF,0x02,0x01,0xFF,0x0A,0xFF,0xFF,0x07,
-                0xFF,0x00,0x01,0xFF,0x00,0x00,0xFF,0x00,0x06,0xFF,0xFF,0x0B,0xFF,0x00,0x03,0xFF,
-                0xFF,0x0C,0x01,0xFF,0x04,0xFF,0xFF,0x07,0x06,0xFF,0xFF,0x07,0xFF,0x07,0x07,0x07,
-                0x06,0xFF,0xFF,0x05,0xFF,0x00,0x0D,0xFF,0x06,0x06,0x06,0xFF,0x06,0xFF,0xFF,0x07,
-                0xFF,0x02,0x01,0xFF,0x04,0xFF,0xFF,0x09,0x02,0x02,0xFF,0x02,0xFF,0x02,0x03,0xFF,
-                0x08,0xFF,0xFF,0x05,0xFF,0x00,0x03,0xFF,0xFF,0x02,0x03,0xFF,0x03,0xFF,0x03,0x03,
-                0x04,0xFF,0xFF,0x05,0x04,0x04,0x04,0xFF,0xFF,0x02,0x0F,0xFF,0x04,0xFF,0xFF,0x07,
-                0xFF,0x05,0x05,0x05,0x04,0xFF,0xFF,0x05,0x06,0xFF,0xFF,0x05,0xFF,0x0E,0x03,0xFF,
-                0xFF,0x0C,0x01,0xFF,0x0A,0xFF,0xFF,0x09,0x0A,0xFF,0xFF,0x0B,0x0A,0x0A,0x0A,0xFF,
-                0x08,0xFF,0xFF,0x0B,0xFF,0x00,0x0D,0xFF,0xFF,0x0B,0x0B,0x0B,0x0A,0xFF,0xFF,0x0B,
-                0x0C,0x0C,0xFF,0x0C,0xFF,0x0C,0x0D,0xFF,0xFF,0x0C,0x0F,0xFF,0x0A,0xFF,0xFF,0x07,
-                0xFF,0x0C,0x0D,0xFF,0x0D,0xFF,0x0D,0x0D,0x06,0xFF,0xFF,0x0B,0xFF,0x0E,0x0D,0xFF,
-                0x08,0xFF,0xFF,0x09,0xFF,0x09,0x09,0x09,0xFF,0x02,0x0F,0xFF,0x0A,0xFF,0xFF,0x09,
-                0x08,0x08,0x08,0xFF,0x08,0xFF,0xFF,0x09,0x08,0xFF,0xFF,0x0B,0xFF,0x0E,0x03,0xFF,
-                0xFF,0x0C,0x0F,0xFF,0x04,0xFF,0xFF,0x09,0x0F,0xFF,0x0F,0x0F,0xFF,0x0E,0x0F,0xFF,
-                0x08,0xFF,0xFF,0x05,0xFF,0x0E,0x0D,0xFF,0xFF,0x0E,0x0F,0xFF,0x0E,0x0E,0xFF,0x0E,
-            };
-            uint8_t d0 = ham84[ttx_data[0]];
-            uint8_t d1 = ham84[ttx_data[1]];
-            int magazine = (d0 != 0xFF) ? (d0 & 0x07) : 0;
-            int row = (d0 != 0xFF && d1 != 0xFF) ? (((d0 >> 3) & 1) | (d1 << 1)) : 0;
-            if (magazine == 0) magazine = 8;
-
-            av_log(avctx, AV_LOG_INFO, "VBI: Rendered teletext waveform on SDI line %d (field %d): M%d/R%02d, MRAG=0x%02X%02X\n",
-                   vbi_line, field, magazine, row, ttx_data[0], ttx_data[1]);
         }
 
-        av_log(avctx, AV_LOG_VERBOSE, "VBI: Completed %d teletext data units for pts=%"PRId64"\n",
-               num_data_units, teletext_pkt.pts);
-
-        /* For double transmit: save this packet's data for next frame */
+        /* For double transmit: save packet data */
         if (cctx->teletext_double_transmit && teletext_pkt.size > 0) {
             av_freep(&current_frame_data);
             current_frame_data = (uint8_t *)av_malloc(teletext_pkt.size);
@@ -1333,15 +1340,15 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
         av_freep(&ctx->last_teletext_data);
         ctx->last_teletext_data = current_frame_data;
         ctx->last_teletext_size = current_frame_size;
-        current_frame_data = NULL;  /* Ownership transferred */
+        current_frame_data = NULL;
     }
 
-    /* Per Australian OP-47: send dummy headers when no content to maintain decoder sync */
+    /* Per Australian OP-47: send dummy headers when no content */
     if (!processed_data) {
         insert_dummy_teletext_vbi(avctx, ctx, vanc);
     }
 
-    av_freep(&current_frame_data);  /* Free if not transferred */
+    av_freep(&current_frame_data);
     return 0;
 }
 
