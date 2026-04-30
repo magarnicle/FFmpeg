@@ -752,9 +752,11 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 #endif
     ff_decklink_packet_queue_end(&ctx->vanc_queue);
 
-    /* Clean up teletext queue if it was used */
-    if (ctx->teletext_st)
+    /* Clean up teletext queue and double transmit cache */
+    if (ctx->teletext_st) {
         ff_decklink_packet_queue_end(&ctx->teletext_queue);
+        av_freep(&ctx->last_teletext_data);
+    }
 
     /* Clean up async output queues if they were used */
     if (cctx->output_buffer_size > 0) {
@@ -1152,17 +1154,62 @@ static void insert_dummy_teletext_vbi(AVFormatContext *avctx, struct decklink_ct
  * For PAL: lines 6-22 (field 1), lines 319-335 (field 2)
  * For NTSC: lines 10-21 (field 1), lines 273-284 (field 2)
  */
+/* Helper to render teletext data units to VBI lines */
+static int render_teletext_data_to_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                        IDeckLinkVideoFrameAncillary *vanc,
+                                        const uint8_t *data, int size, int log_output)
+{
+    int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
+    int num_data_units = size / 46;
+    int rendered = 0;
+
+    for (int i = 0; i < num_data_units; i++) {
+        const uint8_t *du = data + (i * 46);
+        int field = ((du[2] >> 5) & 1) ? 1 : 2;
+        int line_offset = du[2] & 0x1F;
+        const uint8_t *ttx_data = &du[4];
+
+        int vbi_line;
+        if (is_pal) {
+            vbi_line = (field == 1) ? line_offset : 313 + line_offset;
+        } else {
+            vbi_line = (field == 1) ? line_offset : 263 + line_offset;
+        }
+
+        void *buf;
+        HRESULT result = vanc->GetBufferForVerticalBlankingLine(vbi_line, &buf);
+        if (result == S_OK) {
+            render_teletext_vbi_v210((uint8_t *)buf, ttx_data, 720);
+            rendered = 1;
+            if (log_output)
+                av_log(avctx, AV_LOG_VERBOSE, "VBI: Rendered teletext on line %d (field %d)\n", vbi_line, field);
+        }
+    }
+    return rendered;
+}
+
 static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                    IDeckLinkVideoFrameAncillary *vanc)
 {
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     AVPacket teletext_pkt;
     int ret;
     int is_pal = (ctx->bmd_mode == bmdModePAL || ctx->bmd_mode == bmdModePALp);
     int processed_data = 0;
+    uint8_t *current_frame_data = NULL;
+    int current_frame_size = 0;
 
     if (!ctx->teletext_mode_logged) {
         av_log(avctx, AV_LOG_INFO, "Teletext: using VBI waveforms for SD output (lines 7-22)\n");
         ctx->teletext_mode_logged = 1;
+    }
+
+    /* Double transmit: render cached data from previous frame first */
+    if (cctx->teletext_double_transmit && ctx->last_teletext_data && ctx->last_teletext_size > 0) {
+        render_teletext_data_to_vbi(avctx, ctx, vanc, ctx->last_teletext_data,
+                                    ctx->last_teletext_size, 0);
+        av_log(avctx, AV_LOG_VERBOSE, "VBI: Double transmit - repeated previous frame's teletext\n");
+        processed_data = 1;
     }
 
     /* Process pending teletext packets */
@@ -1272,7 +1319,25 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
         av_log(avctx, AV_LOG_VERBOSE, "VBI: Completed %d teletext data units for pts=%"PRId64"\n",
                num_data_units, teletext_pkt.pts);
 
+        /* For double transmit: save this packet's data for next frame */
+        if (cctx->teletext_double_transmit && teletext_pkt.size > 0) {
+            av_freep(&current_frame_data);
+            current_frame_data = (uint8_t *)av_malloc(teletext_pkt.size);
+            if (current_frame_data) {
+                memcpy(current_frame_data, teletext_pkt.data, teletext_pkt.size);
+                current_frame_size = teletext_pkt.size;
+            }
+        }
+
         av_packet_unref(&teletext_pkt);
+    }
+
+    /* Update cache for next frame's double transmit */
+    if (cctx->teletext_double_transmit) {
+        av_freep(&ctx->last_teletext_data);
+        ctx->last_teletext_data = current_frame_data;
+        ctx->last_teletext_size = current_frame_size;
+        current_frame_data = NULL;  /* Ownership transferred */
     }
 
     /* Per Australian OP-47: send dummy headers when no content to maintain decoder sync */
@@ -1280,6 +1345,7 @@ static int construct_teletext_vbi(AVFormatContext *avctx, struct decklink_ctx *c
         insert_dummy_teletext_vbi(avctx, ctx, vanc);
     }
 
+    av_freep(&current_frame_data);  /* Free if not transferred */
     return 0;
 }
 

@@ -169,6 +169,10 @@ struct decklink_ctx {
     uint16_t cdp_sequence_num;
     uint16_t sdp_sequence_num;  /* OP-47 SDP footer sequence counter */
     int teletext_mode_logged;   /* Have we logged the teletext output mode? */
+
+    /* Teletext double transmit state - cache previous frame's data */
+    uint8_t *last_teletext_data;
+    int last_teletext_size;
     /* Options */
     int list_devices;
     int list_formats;
