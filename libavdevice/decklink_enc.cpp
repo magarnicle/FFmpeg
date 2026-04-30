@@ -1047,17 +1047,19 @@ static void render_teletext_vbi_v210(uint8_t *buf, const uint8_t *data, int widt
      * - Samples per bit: 13.5/6.9375 = 1.946
      *
      * Total bits: 32 (CRI) + 8 (framing) + 336 (42 bytes) = 376 bits
-     * At 1.946 samples/bit = 732 samples
-     * Starting at offset 6 allows full waveform to fit in 720 samples
-     * (some samples overlap, which is fine for the waveform shape)
+     * The waveform must fit within 720 active samples, so we start at
+     * sample 0 and use a slightly tighter timing to ensure it fits.
+     *
+     * Per ITU-R BT.653, teletext amplitude is 66% of full scale to avoid
+     * clipping and provide headroom for transmission.
      */
-    const int cri_offset = 6;    /* Clock run-in start sample */
-    const int luma_black = 64;   /* 10-bit black level (16 * 4) */
-    const int luma_white = 940;  /* 10-bit white level (235 * 4) */
+    const int cri_offset = 0;    /* Clock run-in starts at first active sample */
+    const int luma_black = 64;   /* 10-bit black level (0 IRE) */
+    const int luma_white = 640;  /* 10-bit ~66% white level per teletext spec */
     const int chroma_neutral = 512;  /* 10-bit neutral chroma */
 
-    /* Timing: use 1946/1000 samples per bit for accurate 6.9375 MHz bit rate */
-    #define SAMPLES_PER_BIT_X1000 1946
+    /* Timing: use 1910/1000 samples per bit to fit 376 bits in 720 samples */
+    #define SAMPLES_PER_BIT_X1000 1910
 
     /* v210 packs 6 pixels into 4 32-bit words:
      * Word 0: Cb0 | Y0  | Cr0  (bits 0-9, 10-19, 20-29)
