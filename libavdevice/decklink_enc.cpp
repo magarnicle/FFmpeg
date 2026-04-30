@@ -1028,9 +1028,274 @@ static void log_teletext_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 }
 
+/* Australian OP-47 teletext implementation
+ * Per Free TV Australia Operational Practice OP-47 Issue 6 (May 2018):
+ *
+ * HD-SDI VANC (OP47 SDP packets):
+ *   - DID=0x43, SDID=0x02 for Subtitling Distribution Packet
+ *   - Insert on HD line 12 (field 1) and HD line 575 (field 2) for 1080i
+ *   - VBI packet descriptors set for SD lines 21/334 (for down-conversion)
+ *   - Caption data must appear on both fields
+ *   - Only one OP47 packet per field (no multi-packets in Australia)
+ *
+ * SD PAL VBI (raw teletext waveforms):
+ *   - Insert on VBI lines 21 (field 1) and 334 (field 2)
+ *   - ITU-R System B Teletext (45-byte packets)
+ *   - Waveform: clock run-in, framing code 0xE4, 42 data bytes
+ */
+
+/* OP-47 SDP packet constants */
+#define OP47_DID            0x43
+#define OP47_SDID_FIELD1    0x02
+#define OP47_SDID_FIELD2    0x03
+#define OP47_IDENTIFIER_1   0x51
+#define OP47_IDENTIFIER_2   0x15
+#define OP47_FORMAT_WST     0x02
+#define OP47_FOOTER_ID      0x74  /* 0x274 with parity = footer marker */
+#define OP47_MAX_VBI_PACKETS 5
+
+/* Australian conventions */
+#define AUS_SD_LINE_FIELD1  21    /* SD line 21 for field 1 */
+#define AUS_SD_LINE_FIELD2  334   /* SD line 334 for field 2 */
+#define AUS_HD_LINE_FIELD1  12    /* HD line 12 for field 1 (1080i) */
+#define AUS_HD_LINE_FIELD2  575   /* HD line 575 for field 2 (1080i) */
+
+/* Static sequence counter for SDP Footer Sequence Counter (FSC) */
+static uint16_t sdp_sequence_counter = 0;
+
+/* Build an OP-47 SDP (Subtitling Distribution Packet) per Australian conventions
+ * Returns the number of 10-bit words written, or 0 on error
+ *
+ * Per OP-47 5.1, the SDP structure is:
+ *   UDW:
+ *     IDENTIFIER (0x51, 0x15)
+ *     LENGTH (total words from IDENTIFIER to SDP CHECKSUM)
+ *     FORMAT CODE (0x02 = WST teletext)
+ *     5 x VBI Packet Descriptor Structure A (field/line info)
+ *     1-5 x Packet Descriptor Structure B (45-byte teletext packets)
+ *     FOOTER ID (0x74)
+ *     FOOTER SEQUENCE COUNTER (2 bytes, 16-bit big-endian)
+ *     SDP CHECKSUM
+ */
+static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
+                                  uint8_t *teletext_data, int num_data_units,
+                                  int field, int sd_line)
+{
+    if (num_data_units < 1 || num_data_units > OP47_MAX_VBI_PACKETS)
+        return 0;
+
+    /* Calculate payload size per OP-47 5.1:
+     * 2 (identifiers) + 1 (length) + 1 (format) + 5 (descriptors A)
+     * + num_data_units * 45 (structure B) + 1 (footer ID) + 2 (FSC) + 1 (SDP checksum)
+     */
+    int sdp_payload_size = 2 + 1 + 1 + 5 + (num_data_units * 45) + 1 + 2 + 1;
+    int total_words = 3 + sdp_payload_size;  /* DID + SDID + DC + payload */
+
+    if (total_words > max_words)
+        return 0;
+
+    int idx = 0;
+    uint8_t checksum = 0;
+
+    /* VANC header - DID, SDID, DC with parity */
+    vanc_words[idx++] = vanc_parity(OP47_DID);
+    vanc_words[idx++] = vanc_parity(field == 1 ? OP47_SDID_FIELD1 : OP47_SDID_FIELD2);
+    vanc_words[idx++] = vanc_parity(sdp_payload_size & 0xFF);
+
+    /* OP47 identifiers */
+    vanc_words[idx++] = vanc_parity(OP47_IDENTIFIER_1);
+    checksum += OP47_IDENTIFIER_1;
+    vanc_words[idx++] = vanc_parity(OP47_IDENTIFIER_2);
+    checksum += OP47_IDENTIFIER_2;
+
+    /* Length word - total from first IDENTIFIER to SDP CHECKSUM inclusive */
+    int length_value = sdp_payload_size;
+    vanc_words[idx++] = vanc_parity(length_value & 0xFF);
+    checksum += (length_value & 0xFF);
+
+    /* Format code: 0x02 = WST teletext */
+    vanc_words[idx++] = vanc_parity(OP47_FORMAT_WST);
+    checksum += OP47_FORMAT_WST;
+
+    /* 5 VBI Packet Descriptor Structure A words (field/line descriptors)
+     * Per OP-47 5.4.1:
+     *   bits 0-4: line number (for field 1: line 6-22, for field 2: line 319-335)
+     *   bits 5-6: reserved/structure B indicator (0x60 = structure B exists per this spec)
+     *   bit 7: field (0=even/field2, 1=odd/field1)
+     *
+     * Australian convention: always set for SD lines 21/334 to allow down-conversion
+     */
+    for (int i = 0; i < 5; i++) {
+        if (i < num_data_units) {
+            uint8_t descriptor;
+            if (field == 1) {
+                /* Field 1 (odd): line 21 -> offset 15 from line 6 */
+                descriptor = (sd_line - 6) | 0x60 | 0x80;
+            } else {
+                /* Field 2 (even): line 334 -> offset 15 from line 319 */
+                descriptor = (sd_line - 319) | 0x60;
+            }
+            vanc_words[idx++] = vanc_parity(descriptor);
+            checksum += descriptor;
+        } else {
+            vanc_words[idx++] = vanc_parity(0x00);  /* Not used */
+        }
+    }
+
+    /* Packet Descriptor Structure B - 45 bytes per teletext packet
+     * Per OP-47 5.5.2:
+     *   run-in code: 2 x 0x55 (reversed from 0xAA)
+     *   framing code: 0x27 (reversed from 0xE4)
+     *   MRAG: 2 bytes (magazine/row address with Hamming)
+     *   data: 40 bytes with parity
+     */
+    for (int i = 0; i < num_data_units; i++) {
+        uint8_t *du = teletext_data + (i * 46);
+        /* Structure B starts at byte 4 of data unit (after data_unit_id, length, field/line, framing)
+         * But we need to reconstruct with proper run-in/framing codes */
+
+        /* Run-in code: 2 x 0x55 (bit-reversed 0xAA pattern) */
+        vanc_words[idx++] = vanc_parity(0x55);
+        checksum += 0x55;
+        vanc_words[idx++] = vanc_parity(0x55);
+        checksum += 0x55;
+
+        /* Framing code: 0x27 (bit-reversed 0xE4) */
+        vanc_words[idx++] = vanc_parity(0x27);
+        checksum += 0x27;
+
+        /* 42 bytes of teletext data (MRAG + 40 data bytes from data unit) */
+        for (int j = 0; j < 42; j++) {
+            uint8_t byte = du[4 + j];  /* Start after header bytes */
+            vanc_words[idx++] = vanc_parity(byte);
+            checksum += byte;
+        }
+    }
+
+    /* Footer ID: 0x74 (lower 8 bits of 0x274) */
+    vanc_words[idx++] = vanc_parity(OP47_FOOTER_ID);
+    checksum += OP47_FOOTER_ID;
+
+    /* Footer Sequence Counter (FSC) - 16-bit big-endian */
+    uint16_t fsc = sdp_sequence_counter++;
+    uint8_t fsc_hi = (fsc >> 8) & 0xFF;
+    uint8_t fsc_lo = fsc & 0xFF;
+    vanc_words[idx++] = vanc_parity(fsc_hi);
+    checksum += fsc_hi;
+    vanc_words[idx++] = vanc_parity(fsc_lo);
+    checksum += fsc_lo;
+
+    /* SDP Checksum - value that makes sum mod 256 = 0 */
+    uint8_t sdp_checksum = (256 - (checksum & 0xFF)) & 0xFF;
+    vanc_words[idx++] = vanc_parity(sdp_checksum);
+
+    return idx;
+}
+
+/* Generate teletext VBI waveform for SD PAL output in V210 format
+ * Per ITU-R BT.653-3 System B:
+ *   - Data rate: 6.9375 Mbit/s
+ *   - Sample rate: 13.5 MHz (PAL)
+ *   - Samples per bit: ~1.946
+ *   - Active samples: 720
+ *
+ * Waveform structure:
+ *   - Clock run-in: 16 bits of alternating 1/0 (0xAAAA)
+ *   - Framing code: 0xE4
+ *   - MRAG: 2 bytes (magazine/row address)
+ *   - Data: 40 bytes with odd parity
+ *
+ * V210 format: 6 pixels per 16 bytes (4 x 32-bit words)
+ *   Word 0: Cb0[9:0], Y0[9:0], Cr0[9:0], xx
+ *   Word 1: Y1[9:0], Cb1[9:0], Y2[9:0], xx
+ *   Word 2: Cr1[9:0], Y3[9:0], Cb2[9:0], xx
+ *   Word 3: Y4[9:0], Cr2[9:0], Y5[9:0], xx
+ */
+static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
+                                            uint8_t *teletext_data, int data_len)
+{
+    /* Teletext timing parameters for PAL/625:
+     * Sample rate: 13.5 MHz
+     * Data rate: 6.9375 Mbps
+     * Samples per bit: 13.5 / 6.9375 = 1.946
+     */
+    const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
+    const int FP_SHIFT = 8;
+
+    /* 10-bit luma levels for teletext signal (legal range 64-940) */
+    const uint16_t LUMA_HIGH = 800;  /* ~70% */
+    const uint16_t LUMA_LOW  = 256;  /* ~25% */
+    const uint16_t LUMA_BLACK = 64;  /* Black level */
+    const uint16_t CHROMA_NEUTRAL = 512;  /* Neutral chroma */
+
+    /* Create array of 10-bit luma values for the line */
+    uint16_t luma[720];
+    for (int i = 0; i < 720; i++)
+        luma[i] = LUMA_BLACK;
+
+    /* Start position for teletext data (after sync and burst) */
+    int pixel_pos = 84;
+    int bit_pos_fp = 0;
+
+    /* Generate clock run-in: 16 bits of alternating 1/0 */
+    for (int bit = 0; bit < 16; bit++) {
+        uint16_t value = (bit & 1) ? LUMA_HIGH : LUMA_LOW;
+        int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
+        int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
+        for (int p = start_pixel; p < end_pixel && p < 720; p++)
+            luma[p] = value;
+        bit_pos_fp += SAMPLES_PER_BIT_FP;
+    }
+
+    /* Generate framing code: 0xE4 (LSB first) */
+    uint8_t framing = 0xE4;
+    for (int bit = 0; bit < 8; bit++) {
+        uint16_t value = (framing & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
+        int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
+        int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
+        for (int p = start_pixel; p < end_pixel && p < 720; p++)
+            luma[p] = value;
+        bit_pos_fp += SAMPLES_PER_BIT_FP;
+    }
+
+    /* Generate 42 bytes of teletext data (MRAG + 40 data bytes), LSB first */
+    for (int byte_idx = 0; byte_idx < 42 && byte_idx < data_len; byte_idx++) {
+        uint8_t byte = teletext_data[byte_idx];
+        for (int bit = 0; bit < 8; bit++) {
+            uint16_t value = (byte & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
+            int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
+            int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
+            for (int p = start_pixel; p < end_pixel && p < 720; p++)
+                luma[p] = value;
+            bit_pos_fp += SAMPLES_PER_BIT_FP;
+        }
+    }
+
+    /* Convert to V210 format: 6 pixels per 16 bytes */
+    uint32_t *v210 = (uint32_t *)line_buf;
+    for (int i = 0; i < 720; i += 6) {
+        uint16_t y0 = luma[i];
+        uint16_t y1 = luma[i + 1];
+        uint16_t y2 = luma[i + 2];
+        uint16_t y3 = luma[i + 3];
+        uint16_t y4 = luma[i + 4];
+        uint16_t y5 = luma[i + 5];
+
+        /* V210 packing (little-endian 32-bit words):
+         * Word 0: Cb0 | Y0 | Cr0
+         * Word 1: Y1 | Cb1 | Y2
+         * Word 2: Cr1 | Y3 | Cb2
+         * Word 3: Y4 | Cr2 | Y5
+         */
+        *v210++ = (CHROMA_NEUTRAL) | (y0 << 10) | (CHROMA_NEUTRAL << 20);
+        *v210++ = (y1) | (CHROMA_NEUTRAL << 10) | (y2 << 20);
+        *v210++ = (CHROMA_NEUTRAL) | (y3 << 10) | (CHROMA_NEUTRAL << 20);
+        *v210++ = (y4) | (CHROMA_NEUTRAL << 10) | (y5 << 20);
+    }
+}
+
 /* Build OP47 VANC packet from teletext data units
- * OP47 is SMPTE RDD-8 which wraps EBU teletext for SDI VANC transport
- * VANC packet format: DID=0x43, SDID=0x02 (field 1) or 0x03 (field 2)
+ * Supports both HD VANC (OP47 SDP) and SD PAL VBI modes per Australian OP-47
  */
 static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                struct klvanc_line_set_s *vanc_lines)
@@ -1059,84 +1324,131 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
         /* Log teletext content at debug level */
         log_teletext_packet(avctx, &teletext_pkt);
 
-        /* The teletext encoder outputs data units (46 bytes each)
-         * We build an OP47/SDP VANC packet per SMPTE RDD-8.
-         *
-         * VANC packet structure (10-bit words with parity):
-         *   DID = 0x43
-         *   SDID = 0x02 (field 1)
-         *   DC = data count
-         *   Payload = OP47 structure
-         *
-         * OP47 payload structure:
-         *   [0-1]: Identifier (0x51, 0x15)
-         *   [2]: Format code (0x02 = WST teletext)
-         *   [3-12]: 5 line descriptors (2 bytes each)
-         *   [13+]: Up to 5 x 45-byte teletext packets
-         */
         if (teletext_pkt.size >= 46) {
             int num_data_units = teletext_pkt.size / 46;
-            if (num_data_units > 5)
-                num_data_units = 5;  /* OP47 supports max 5 data units */
+            if (num_data_units > OP47_MAX_VBI_PACKETS)
+                num_data_units = OP47_MAX_VBI_PACKETS;
 
-            /* Calculate payload size:
-             * 2 (identifier) + 1 (format) + 10 (5 line descriptors) + N*45 (teletext data)
+            /* Build OP47 SDP packets for both fields per Australian convention
+             * For HD modes: Insert on VANC line 12 (field 1) and appropriate field 2 line
+             * For SD PAL: VBI waveform insertion is handled separately
              */
-            int payload_size = 2 + 1 + 10 + (num_data_units * 45);
 
-            /* VANC words: DID + SDID + DC + payload */
-            int vanc_word_count = 3 + payload_size;
-            uint16_t *vanc_words = (uint16_t *)av_malloc(vanc_word_count * sizeof(uint16_t));
+            /* Determine field 2 line based on video mode */
+            int f2_line;
+            switch (ctx->bmd_mode) {
+            case bmdModeHD1080i50:
+            case bmdModeHD1080i5994:
+            case bmdModeHD1080i6000:
+                f2_line = AUS_HD_LINE_FIELD2;  /* Line 575 for 1080i */
+                break;
+            case bmdModePAL:
+                f2_line = AUS_SD_LINE_FIELD2;  /* Line 334 for SD PAL */
+                break;
+            default:
+                f2_line = 0;  /* Progressive modes don't have field 2 */
+                break;
+            }
+
+            /* Allocate buffer for VANC words (max size for 5 packets) */
+            int max_vanc_words = 3 + 2 + 1 + 1 + 5 + (5 * 45) + 1 + 2 + 1;
+            uint16_t *vanc_words = (uint16_t *)av_malloc(max_vanc_words * sizeof(uint16_t));
             if (!vanc_words) {
                 av_packet_unref(&teletext_pkt);
                 continue;
             }
 
-            int idx = 0;
-
-            /* VANC header - DID, SDID, DC with parity */
-            vanc_words[idx++] = vanc_parity(0x43);       /* DID for OP47 */
-            vanc_words[idx++] = vanc_parity(0x02);       /* SDID for field 1 */
-            vanc_words[idx++] = vanc_parity(payload_size & 0xFF);  /* DC */
-
-            /* OP47 identifier */
-            vanc_words[idx++] = vanc_parity(0x51);
-            vanc_words[idx++] = vanc_parity(0x15);
-
-            /* Format code: 0x02 = WST teletext */
-            vanc_words[idx++] = vanc_parity(0x02);
-
-            /* 5 line descriptors (2 bytes each) */
-            for (int i = 0; i < 5; i++) {
-                if (i < num_data_units) {
-                    uint8_t *du = teletext_pkt.data + (i * 46);
-                    /* First byte: field_parity (bit 7) + line_offset (bits 0-4) */
-                    uint8_t field_line = du[2];  /* Already has field/line info */
-                    vanc_words[idx++] = vanc_parity(field_line);
-                    /* Second byte: wrapping/framing info */
-                    vanc_words[idx++] = vanc_parity(du[3]);  /* Framing code */
-                } else {
-                    vanc_words[idx++] = vanc_parity(0xFF);  /* Not used */
-                    vanc_words[idx++] = vanc_parity(0xFF);
+            /* Build and insert field 1 packet */
+            int word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
+                                                    teletext_pkt.data, num_data_units,
+                                                    1, AUS_SD_LINE_FIELD1);
+            if (word_count > 0) {
+                ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                         word_count, AUS_HD_LINE_FIELD1, 0);
+                if (ret != 0) {
+                    av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line (field 1): %d\n", ret);
                 }
             }
 
-            /* Teletext data - 45 bytes per data unit (skip data_unit_id byte) */
-            for (int i = 0; i < num_data_units; i++) {
-                uint8_t *du = teletext_pkt.data + (i * 46);
-                /* Copy bytes 1-45 (skip byte 0 which is data_unit_id) */
-                for (int j = 1; j < 46; j++) {
-                    vanc_words[idx++] = vanc_parity(du[j]);
+            /* Build and insert field 2 packet for interlaced modes */
+            if (f2_line > 0) {
+                word_count = build_op47_sdp_packet(vanc_words, max_vanc_words,
+                                                    teletext_pkt.data, num_data_units,
+                                                    2, AUS_SD_LINE_FIELD2);
+                if (word_count > 0) {
+                    ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
+                                             word_count, f2_line, 0);
+                    if (ret != 0) {
+                        av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line (field 2): %d\n", ret);
+                    }
                 }
             }
 
-            /* Insert into VANC line 12 (typical for OP47 teletext in PAL) */
-            ret = klvanc_line_insert(ctx->vanc_ctx, vanc_lines, vanc_words,
-                                     idx, 12, 0);
             av_free(vanc_words);
+        }
 
-            if (ret != 0) {
-                av_log(avctx, AV_LOG_WARNING, "Failed to insert teletext VANC line: %d\n", ret);
+        av_packet_unref(&teletext_pkt);
+    }
+}
+
+/* Insert teletext VBI waveforms directly into SD PAL VBI lines
+ * This is called for SD PAL mode where we write raw teletext waveforms
+ * to VBI lines 21 (field 1) and 334 (field 2) per Australian OP-47
+ */
+static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                       IDeckLinkVideoFrameAncillary *vanc)
+{
+    AVPacket teletext_pkt;
+    int ret;
+    void *line_buf;
+    HRESULT result;
+
+    /* Only process if we're in SD PAL mode */
+    if (ctx->bmd_mode != bmdModePAL)
+        return;
+
+    /* Process pending teletext packets */
+    while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
+        int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
+        if (pts > ctx->last_pts) {
+            break;
+        }
+
+        ret = ff_decklink_packet_queue_get(&ctx->teletext_queue, &teletext_pkt, 0);
+        if (ret <= 0)
+            break;
+
+        if (teletext_pkt.pts + 1 < ctx->last_pts) {
+            av_log(avctx, AV_LOG_WARNING, "Teletext packet too old, discarding\n");
+            av_packet_unref(&teletext_pkt);
+            continue;
+        }
+
+        log_teletext_packet(avctx, &teletext_pkt);
+
+        if (teletext_pkt.size >= 46) {
+            /* Get first data unit's teletext data (bytes 4-45 contain the 42-byte payload) */
+            uint8_t *du = teletext_pkt.data;
+            uint8_t *teletext_data = du + 4;
+
+            /* Insert on VBI line 21 (field 1) */
+            result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD1, &line_buf);
+            if (result == S_OK) {
+                generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
+                                                teletext_data, 42);
+                av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD1);
+            } else {
+                av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD1);
+            }
+
+            /* Insert on VBI line 334 (field 2) - duplicate for Australian compliance */
+            result = vanc->GetBufferForVerticalBlankingLine(AUS_SD_LINE_FIELD2, &line_buf);
+            if (result == S_OK) {
+                generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
+                                                teletext_data, 42);
+                av_log(avctx, AV_LOG_DEBUG, "Inserted teletext VBI on line %d\n", AUS_SD_LINE_FIELD2);
+            } else {
+                av_log(avctx, AV_LOG_WARNING, "Failed to get VBI line %d buffer\n", AUS_SD_LINE_FIELD2);
             }
         }
 
@@ -1173,8 +1485,9 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
     construct_cc(avctx, ctx, pkt, &vanc_lines);
     construct_afd(avctx, ctx, pkt, &vanc_lines, st);
 
-    /* Process any pending teletext packets */
-    if (ctx->teletext_st)
+    /* Process any pending teletext packets for HD modes (OP47 VANC)
+     * SD PAL VBI teletext is handled separately after VANC creation */
+    if (ctx->teletext_st && ctx->bmd_mode != bmdModePAL)
         construct_teletext(avctx, ctx, &vanc_lines);
 
     /* See if there any pending data packets to process */
@@ -1230,16 +1543,22 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
     }
 
     IDeckLinkVideoFrameAncillary *vanc;
+    /* Always use 10-bit YUV to match v210 video format */
     int result = ctx->dlo->CreateAncillaryData(bmdFormat10BitYUV, &vanc);
     if (result != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create vanc\n");
+        av_log(avctx, AV_LOG_ERROR, "Failed to create ancillary data\n");
         ret = AVERROR(EIO);
         goto done;
     }
 
+    /* For SD PAL mode, insert teletext as raw VBI waveforms on lines 21/334
+     * This must be done after ancillary data creation so we can access VBI line buffers */
+    if (ctx->teletext_st && ctx->bmd_mode == bmdModePAL)
+        construct_teletext_vbi_sd(avctx, ctx, vanc);
+
     /* Now that we've got all the VANC lines in a nice orderly manner, generate the
-       final VANC sections for the Decklink output */
-    for (i = 0; i < vanc_lines.num_lines; i++) {
+       final VANC sections for the Decklink output (HD modes only) */
+    for (i = 0; i < vanc_lines.num_lines && ctx->bmd_mode != bmdModePAL; i++) {
         struct klvanc_line_s *line = vanc_lines.lines[i];
         int real_line;
         void *buf;
