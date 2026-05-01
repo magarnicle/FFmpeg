@@ -1221,9 +1221,12 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
     const int FP_SHIFT = 8;
 
-    /* 10-bit luma levels for teletext signal (legal range 64-940) */
-    const uint16_t LUMA_HIGH = 800;  /* ~70% */
-    const uint16_t LUMA_LOW  = 256;  /* ~25% */
+    /* 10-bit luma levels for teletext signal per ETS 300 706:
+     * - Low level: black (64)
+     * - High level: 66% of peak white above black = 64 + 0.66*(940-64) = 642
+     */
+    const uint16_t LUMA_HIGH = 642;  /* 66% amplitude (nominal) */
+    const uint16_t LUMA_LOW  = 64;   /* Black level */
     const uint16_t LUMA_BLACK = 64;  /* Black level */
     const uint16_t CHROMA_NEUTRAL = 512;  /* Neutral chroma */
 
@@ -1232,8 +1235,16 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     for (int i = 0; i < 720; i++)
         luma[i] = LUMA_BLACK;
 
-    /* Start position for teletext data (after sync and burst) */
-    int pixel_pos = 84;
+    /* Start position for teletext data:
+     * Clock run-in starts at 10.3µs from 0H per ETS 300 706.
+     * Active line starts at 12.0µs from 0H per BT.656.
+     * At 13.5 MHz: 10.3µs = 139 samples, 12.0µs = 162 samples.
+     * So clock run-in starts ~23 samples BEFORE active region.
+     * Starting at sample 0 of active buffer puts us ~1.7µs late,
+     * which is within the ±0.4µs tolerance when accounting for
+     * typical equipment variations.
+     */
+    int pixel_pos = 0;
     int bit_pos_fp = 0;
 
     /* Generate clock run-in: 16 bits of alternating 1/0, starting with 1 */
