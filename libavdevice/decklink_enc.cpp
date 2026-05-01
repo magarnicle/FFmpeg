@@ -1257,8 +1257,8 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         bit_pos_fp += SAMPLES_PER_BIT_FP;
     }
 
-    /* Generate framing code: 0x27 (0xE4 bit-reversed for LSB-first transmission) */
-    uint8_t framing = 0x27;
+    /* Generate framing code: 0xE4 per ETS 300 706, transmitted LSB-first */
+    uint8_t framing = 0xE4;
     for (int bit = 0; bit < 8; bit++) {
         uint16_t value = (framing & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
         int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
