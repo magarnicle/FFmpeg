@@ -299,6 +299,25 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
 }
 
 /**
+ * Encode MRAG (Magazine and Row Address Group) per ITU-R BT.653-3
+ * Bits are interleaved: Byte1 = M1,R0,M2,R1  Byte2 = R2,R3,R4,M3
+ */
+static void encode_mrag(int mag, int row, uint8_t *byte1, uint8_t *byte2)
+{
+    int m1 = (mag >> 0) & 1;
+    int m2 = (mag >> 1) & 1;
+    int m3 = (mag >> 2) & 1;
+    int r0 = (row >> 0) & 1;
+    int r1 = (row >> 1) & 1;
+    int r2 = (row >> 2) & 1;
+    int r3 = (row >> 3) & 1;
+    int r4 = (row >> 4) & 1;
+
+    *byte1 = ff_teletext_ham84(m1 | (r0 << 1) | (m2 << 2) | (r1 << 3));
+    *byte2 = ff_teletext_ham84(r2 | (r3 << 1) | (r4 << 2) | (m3 << 3));
+}
+
+/**
  * Build a teletext header row (row 0)
  */
 static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
@@ -306,9 +325,7 @@ static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
     /* Clock run-in and framing code are added by data unit builder */
 
     /* Bytes 0-1: Magazine and packet address (row 0 = page header) */
-    int mag = ctx->mag_encoded;
-    line[0] = ff_teletext_ham84(mag | ((0 & 1) << 3));  /* M1 + row bit 0 */
-    line[1] = ff_teletext_ham84(0 >> 1);                 /* row bits 1-4 */
+    encode_mrag(ctx->mag_encoded, 0, &line[0], &line[1]);
 
     /* Bytes 2-3: Page number units and tens */
     line[2] = ff_teletext_ham84(ctx->page_bcd & 0x0F);
@@ -349,11 +366,8 @@ static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
  */
 static void build_content_row(TeletextEncContext *ctx, uint8_t *line, int row)
 {
-    int mag = ctx->mag_encoded;
-
-    /* Bytes 0-1: Magazine and row address */
-    line[0] = ff_teletext_ham84(mag | ((row & 1) << 3));
-    line[1] = ff_teletext_ham84(row >> 1);
+    /* Bytes 0-1: Magazine and row address (interleaved per ITU-R BT.653-3) */
+    encode_mrag(ctx->mag_encoded, row, &line[0], &line[1]);
 
     /* Bytes 2-41: 40 characters with odd parity */
     for (int i = 0; i < TELETEXT_COLS; i++) {
@@ -382,6 +396,23 @@ int ff_teletext_build_data_unit(uint8_t *out, int data_unit_id,
 
     /* Copy 42 bytes of teletext data */
     memcpy(out + 4, data, TELETEXT_LINE_SIZE);
+
+    /* Log the full output data unit for debugging */
+    av_log(NULL, AV_LOG_INFO,
+           "Teletext encoder output (mag=%d row=%d):\n", magazine, packet_number);
+    av_log(NULL, AV_LOG_INFO,
+           "  header: %02x %02x %02x %02x\n",
+           out[0], out[1], out[2], out[3]);
+    av_log(NULL, AV_LOG_INFO,
+           "  MRAG + data bytes 0-19: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+           out[4], out[5], out[6], out[7], out[8], out[9], out[10], out[11],
+           out[12], out[13], out[14], out[15], out[16], out[17], out[18], out[19],
+           out[20], out[21], out[22], out[23]);
+    av_log(NULL, AV_LOG_INFO,
+           "  data bytes 20-41:       %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+           out[24], out[25], out[26], out[27], out[28], out[29], out[30], out[31],
+           out[32], out[33], out[34], out[35], out[36], out[37], out[38], out[39],
+           out[40], out[41], out[42], out[43], out[44], out[45]);
 
     return TELETEXT_DATA_UNIT_SIZE;
 }
