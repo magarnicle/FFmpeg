@@ -1235,8 +1235,12 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     for (int i = 0; i < 720; i++)
         luma[i] = LUMA_BLACK;
 
-    /* Start position for teletext data (after sync and burst) */
-    int pixel_pos = 84;
+    /* Start position for teletext data
+     * Per ETS 300 706, clock run-in starts at 10.3µs from 0H.
+     * DeckLink VBI buffer may include blanking, so start near beginning.
+     * TODO: May need adjustment based on actual DeckLink buffer layout.
+     */
+    int pixel_pos = 0;
     int bit_pos_fp = 0;
 
     /* Generate clock run-in: 16 bits of alternating 1/0, starting with 1 */
