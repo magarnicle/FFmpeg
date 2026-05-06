@@ -1117,6 +1117,14 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     uint32_t buffered;
 
+    /* Shared memory client mode - just cleanup shm and exit */
+    if (ctx->shm_buffer && !ctx->shm_is_server) {
+        decklink_cleanup_shm(ctx);
+        av_log(avctx, AV_LOG_INFO, "Shared memory client finished\n");
+        av_freep(&cctx->ctx);
+        return 0;
+    }
+
     /* Stop shared memory first so no more frames come in */
     decklink_cleanup_shm(ctx);
 
@@ -2624,6 +2632,18 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     if (ctx->list_devices) {
         ff_decklink_list_devices_legacy(avctx, 0, 1);
         return AVERROR_EXIT;
+    }
+
+    /* Shared memory client mode - skip Decklink init, just attach to shm */
+    if (cctx->shm_name && cctx->shm_client) {
+        ctx->avctx = avctx;
+        ret = decklink_init_shm_client(avctx, ctx, cctx->shm_name);
+        if (ret < 0) {
+            av_freep(&cctx->ctx);
+            return ret;
+        }
+        av_log(avctx, AV_LOG_INFO, "Running in shared memory client mode\n");
+        return 0;
     }
 
     ret = ff_decklink_init_device(avctx, avctx->url);
