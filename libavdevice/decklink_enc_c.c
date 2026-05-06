@@ -71,6 +71,10 @@ static const AVOption options[] = {
     { "even"        , "insert on even field (field 2) only",        0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "socket_path" , "Unix socket path for external frame input", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "socket_listen", "Listen on socket for external frame input", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "shm_name", "Shared memory name for cross-process frame buffer", OFFSET(shm_name), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "shm_server", "Run as shared memory server (playout instance)", OFFSET(shm_server), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "shm_client", "Run as shared memory client (encoder instance)", OFFSET(shm_client), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "shm_max_frames", "Maximum frames in shared memory buffer", OFFSET(shm_max_frames), AV_OPT_TYPE_INT, { .i64 = 60 }, 8, 240, ENC },
     { NULL },
 };
 

@@ -19,7 +19,7 @@ OBJS-$(CONFIG_ANDROID_CAMERA_INDEV)      += android_camera.o
 OBJS-$(CONFIG_AUDIOTOOLBOX_OUTDEV)       += audiotoolbox.o
 OBJS-$(CONFIG_AVFOUNDATION_INDEV)        += avfoundation.o
 OBJS-$(CONFIG_CACA_OUTDEV)               += caca.o
-OBJS-$(CONFIG_DECKLINK_OUTDEV)           += decklink_enc.o decklink_enc_c.o decklink_common.o
+OBJS-$(CONFIG_DECKLINK_OUTDEV)           += decklink_enc.o decklink_enc_c.o decklink_common.o decklink_shm.o
 OBJS-$(CONFIG_DECKLINK_INDEV)            += decklink_dec.o decklink_dec_c.o decklink_common.o
 OBJS-$(CONFIG_DSHOW_INDEV)               += dshow_crossbar.o dshow.o dshow_enummediatypes.o \
                                             dshow_enumpins.o dshow_filter.o \
@@ -61,7 +61,7 @@ SHLIBOBJS-$(HAVE_GNU_WINDRES)            += avdeviceres.o
 
 SKIPHEADERS                              += decklink_common.h
 SKIPHEADERS-$(CONFIG_DECKLINK)           += decklink_enc.h decklink_dec.h \
-                                            decklink_common_c.h
+                                            decklink_common_c.h decklink_shm.h
 SKIPHEADERS-$(CONFIG_DSHOW_INDEV)        += dshow_capture.h
 SKIPHEADERS-$(CONFIG_FBDEV_INDEV)        += fbdev_common.h
 SKIPHEADERS-$(CONFIG_FBDEV_OUTDEV)       += fbdev_common.h

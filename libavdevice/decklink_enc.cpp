@@ -82,6 +82,7 @@ extern "C" {
 
 #include "decklink_common.h"
 #include "decklink_enc.h"
+#include "decklink_shm.h"
 #if CONFIG_LIBKLVANC
 #include "libklvanc/vanc.h"
 #include "libklvanc/vanc-lines.h"
@@ -667,6 +668,216 @@ static void decklink_cleanup_socket_server(struct decklink_ctx *ctx)
     }
 }
 
+/*
+ * Shared memory reader thread - reads frames from shared memory buffer
+ * and queues them for DeckLink output.
+ */
+static void *decklink_shm_reader_thread(void *arg)
+{
+    struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    DecklinkShmBuffer *shm = (DecklinkShmBuffer *)ctx->shm_buffer;
+    DecklinkShmFrameHeader header;
+    uint8_t *frame_data = NULL;
+    uint32_t frame_data_size = 0;
+    int64_t video_frames = 0, audio_packets = 0;
+
+    av_log(avctx, AV_LOG_INFO, "Shared memory reader thread started\n");
+
+    /* Allocate frame buffer */
+    frame_data_size = shm->frame_data_size;
+    frame_data = (uint8_t *)av_malloc(frame_data_size);
+    if (!frame_data) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to allocate frame buffer\n");
+        ctx->output_thread_error = AVERROR(ENOMEM);
+        return NULL;
+    }
+
+    while (!ctx->shm_reader_stop) {
+        int ret = decklink_shm_server_read(shm, &header, frame_data, frame_data_size, 100);
+
+        if (ret == AVERROR(EAGAIN)) {
+            continue;  /* Timeout, check stop flag */
+        }
+        if (ret == AVERROR_EOF) {
+            av_log(avctx, AV_LOG_INFO, "Shared memory shutdown signaled\n");
+            break;
+        }
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Shared memory read error: %d\n", ret);
+            ctx->output_thread_error = ret;
+            break;
+        }
+
+        /* Create packet and queue it */
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to allocate packet\n");
+            continue;
+        }
+
+        if (av_new_packet(pkt, header.size) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to allocate packet data\n");
+            av_packet_free(&pkt);
+            continue;
+        }
+
+        memcpy(pkt->data, frame_data, header.size);
+        pkt->pts = header.pts;
+        pkt->dts = header.dts;
+        pkt->duration = header.duration;
+
+        if (header.type == DECKLINK_SHM_FRAME_VIDEO) {
+            pkt->stream_index = ctx->video_st ? ctx->video_st->index : 0;
+            if (ctx->output_thread_started) {
+                decklink_output_queue_put_blocking(ctx, &ctx->output_video_queue, pkt);
+            }
+            video_frames++;
+        } else if (header.type == DECKLINK_SHM_FRAME_AUDIO) {
+            pkt->stream_index = ctx->audio_st ? ctx->audio_st->index : 0;
+            if (ctx->output_thread_started) {
+                decklink_output_queue_put_blocking(ctx, &ctx->output_audio_queue, pkt);
+            }
+            audio_packets++;
+        }
+
+        av_packet_free(&pkt);
+
+        /* Periodic logging */
+        if ((video_frames + audio_packets) % 1000 == 0) {
+            av_log(avctx, AV_LOG_INFO, "SHM reader: %"PRId64" video, %"PRId64" audio, "
+                   "buffer: %u/%u frames\n",
+                   video_frames, audio_packets, shm->frame_count, shm->max_frames);
+        }
+    }
+
+    av_free(frame_data);
+    av_log(avctx, AV_LOG_INFO, "Shared memory reader thread exiting: %"PRId64" video, %"PRId64" audio\n",
+           video_frames, audio_packets);
+    return NULL;
+}
+
+/* Initialize shared memory server (playout instance) */
+static int decklink_init_shm_server(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                     const char *name, int max_frames, uint32_t frame_size)
+{
+    DecklinkShmBuffer *shm = NULL;
+    int ret;
+
+    ret = decklink_shm_server_create(name, max_frames, frame_size, &shm);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create shared memory server: %d\n", ret);
+        return ret;
+    }
+
+    ctx->shm_buffer = shm;
+    ctx->shm_name = av_strdup(name);
+    ctx->shm_is_server = 1;
+
+    /* Set video/audio format in shared memory */
+    shm->video_width = ctx->bmd_width;
+    shm->video_height = ctx->bmd_height;
+    shm->video_fps_num = ctx->bmd_tb_den;
+    shm->video_fps_den = ctx->bmd_tb_num;
+    shm->audio_sample_rate = 48000;  /* TODO: get from audio stream */
+    shm->audio_channels = ctx->channels;
+
+    /* Start reader thread */
+    ctx->shm_reader_stop = 0;
+    ret = pthread_create(&ctx->shm_reader_thread, NULL, decklink_shm_reader_thread, ctx);
+    if (ret != 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create shm reader thread: %s\n", strerror(ret));
+        decklink_shm_server_destroy(name, shm);
+        ctx->shm_buffer = NULL;
+        av_freep(&ctx->shm_name);
+        return AVERROR(ret);
+    }
+
+    ctx->shm_reader_started = 1;
+    av_log(avctx, AV_LOG_INFO, "Shared memory server initialized: %s, %d frames, %u bytes/frame\n",
+           name, max_frames, frame_size);
+    return 0;
+}
+
+/* Initialize shared memory client (encoder instance) */
+static int decklink_init_shm_client(AVFormatContext *avctx, struct decklink_ctx *ctx,
+                                     const char *name)
+{
+    DecklinkShmBuffer *shm = NULL;
+    int ret;
+
+    ret = decklink_shm_client_attach(name, &shm);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to attach to shared memory: %d\n", ret);
+        return ret;
+    }
+
+    ctx->shm_buffer = shm;
+    ctx->shm_name = av_strdup(name);
+    ctx->shm_is_server = 0;
+
+    av_log(avctx, AV_LOG_INFO, "Shared memory client attached: %s\n", name);
+    return 0;
+}
+
+/* Cleanup shared memory */
+static void decklink_cleanup_shm(struct decklink_ctx *ctx)
+{
+    DecklinkShmBuffer *shm = (DecklinkShmBuffer *)ctx->shm_buffer;
+
+    if (!shm)
+        return;
+
+    if (ctx->shm_reader_started) {
+        ctx->shm_reader_stop = 1;
+        if (ctx->shm_is_server) {
+            decklink_shm_server_shutdown(shm);
+        }
+        pthread_join(ctx->shm_reader_thread, NULL);
+        ctx->shm_reader_started = 0;
+    }
+
+    if (ctx->shm_is_server) {
+        decklink_shm_server_destroy(ctx->shm_name, shm);
+    } else {
+        decklink_shm_client_detach(shm);
+    }
+
+    ctx->shm_buffer = NULL;
+    av_freep(&ctx->shm_name);
+}
+
+/* Write frame to shared memory (client mode) */
+static int decklink_shm_write_packet(AVFormatContext *avctx, AVPacket *pkt, int type)
+{
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    DecklinkShmBuffer *shm = (DecklinkShmBuffer *)ctx->shm_buffer;
+    DecklinkShmFrameHeader header;
+
+    if (!shm || ctx->shm_is_server)
+        return AVERROR(EINVAL);
+
+    memset(&header, 0, sizeof(header));
+    header.magic = DECKLINK_SHM_MAGIC;
+    header.type = type;
+    header.size = pkt->size;
+    header.pts = pkt->pts;
+    header.dts = pkt->dts;
+    header.duration = pkt->duration;
+    header.stream_index = pkt->stream_index;
+
+    if (type == DECKLINK_SHM_FRAME_VIDEO) {
+        header.width = ctx->bmd_width;
+        header.height = ctx->bmd_height;
+    } else if (type == DECKLINK_SHM_FRAME_AUDIO) {
+        header.sample_rate = 48000;
+        header.channels = ctx->channels;
+    }
+
+    return decklink_shm_client_write(shm, &header, pkt->data, 1000);
+}
+
 static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
@@ -905,6 +1116,9 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     uint32_t buffered;
+
+    /* Stop shared memory first so no more frames come in */
+    decklink_cleanup_shm(ctx);
 
     /* Stop socket server first so no more frames come in */
     decklink_cleanup_socket_server(ctx);
@@ -2166,6 +2380,16 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
+    /* If shared memory client mode, write to shm buffer */
+    if (ctx->shm_buffer && !ctx->shm_is_server) {
+        int ret = decklink_shm_write_packet(avctx, pkt, DECKLINK_SHM_FRAME_VIDEO);
+        if (ret < 0 && ret != AVERROR(EAGAIN)) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to write video to shared memory: %d\n", ret);
+            return ret;
+        }
+        return 0;
+    }
+
     /* If async buffer is enabled, queue the packet to the video queue */
     if (ctx->output_thread_started) {
         /* Check for fatal errors from output thread */
@@ -2285,6 +2509,16 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+
+    /* If shared memory client mode, write to shm buffer */
+    if (ctx->shm_buffer && !ctx->shm_is_server) {
+        int ret = decklink_shm_write_packet(avctx, pkt, DECKLINK_SHM_FRAME_AUDIO);
+        if (ret < 0 && ret != AVERROR(EAGAIN)) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to write audio to shared memory: %d\n", ret);
+            return ret;
+        }
+        return 0;
+    }
 
     /* If async buffer is enabled, queue the packet to the audio queue */
     if (ctx->output_thread_started) {
@@ -2527,9 +2761,43 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
         }
     }
 
+    /* Initialize shared memory if requested */
+    if (cctx->shm_name) {
+        /* Calculate frame size for v210: 128-byte aligned rows */
+        uint32_t frame_size;
+        if (ctx->video) {
+            int blocks_per_row = (ctx->bmd_width + 5) / 6;
+            int row_bytes = ((blocks_per_row * 16 + 127) / 128) * 128;
+            frame_size = row_bytes * ctx->bmd_height;
+            /* Add some headroom for audio interleaving */
+            frame_size = FFMAX(frame_size, 16 * 1024 * 1024);  /* 16MB minimum */
+        } else {
+            frame_size = 16 * 1024 * 1024;
+        }
+
+        if (cctx->shm_server) {
+            if (!ctx->output_thread_started) {
+                av_log(avctx, AV_LOG_ERROR, "Shared memory server requires output_buffer_size to be set\n");
+                ret = AVERROR(EINVAL);
+                goto error;
+            }
+            ret = decklink_init_shm_server(avctx, ctx, cctx->shm_name,
+                                           cctx->shm_max_frames, frame_size);
+            if (ret < 0) {
+                goto error;
+            }
+        } else if (cctx->shm_client) {
+            ret = decklink_init_shm_client(avctx, ctx, cctx->shm_name);
+            if (ret < 0) {
+                goto error;
+            }
+        }
+    }
+
     return 0;
 
 error:
+    decklink_cleanup_shm(ctx);
     decklink_cleanup_socket_server(ctx);
     ff_decklink_cleanup(avctx);
     return ret;

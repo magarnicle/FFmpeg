@@ -211,6 +211,14 @@ struct decklink_ctx {
     int socket_thread_stop;
     char *socket_path;
 
+    /* Shared memory state */
+    void *shm_buffer;           /* DecklinkShmBuffer* */
+    char *shm_name;
+    int shm_is_server;
+    pthread_t shm_reader_thread;
+    int shm_reader_started;
+    int shm_reader_stop;
+
     /* Async output buffer - separate queues and threads for audio and video */
     DecklinkPacketQueue output_video_queue;
     DecklinkPacketQueue output_audio_queue;

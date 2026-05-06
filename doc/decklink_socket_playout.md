@@ -143,6 +143,71 @@ New options:
 
 This requires `-output_buffer_size` to be set for the async output buffer.
 
+## Shared Memory Ring Buffer (Fastest)
+
+For the lowest latency cross-process frame transfer, use the shared memory ring buffer:
+
+### Server (Playout Instance)
+
+```bash
+./ffmpeg -re -f lavfi -i "color=black:s=1920x1080:r=25" \
+    -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+    -t 999999 -c:v v210 -c:a pcm_s16le \
+    -output_buffer_size 500000000 \
+    -shm_name /decklink_buffer -shm_server 1 -shm_max_frames 120 \
+    -f decklink "DeckLink SDI 4K"
+```
+
+### Clients (Encoder Instances)
+
+```bash
+# Encoder 1
+./ffmpeg -i input1.mov -c:v v210 -c:a pcm_s16le \
+    -shm_name /decklink_buffer -shm_client 1 \
+    -f decklink "DeckLink SDI 4K"
+
+# Encoder 2 (can start immediately, frames queue in shared memory)
+./ffmpeg -i input2.mov -c:v v210 -c:a pcm_s16le \
+    -shm_name /decklink_buffer -shm_client 1 \
+    -f decklink "DeckLink SDI 4K"
+```
+
+### Shared Memory Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| -shm_name | - | POSIX shared memory name (e.g., /decklink_buffer) |
+| -shm_server | 0 | Run as server (creates shm, reads frames) |
+| -shm_client | 0 | Run as client (attaches to shm, writes frames) |
+| -shm_max_frames | 60 | Maximum frames in ring buffer (8-240) |
+
+### Architecture
+
+```
+Encoder 1 ─┐                              ┌─ Video Thread ─┐
+Encoder 2 ──┼──▶ [Shared Memory Buffer] ──┼─ Audio Thread ──┼──▶ DeckLink SDK
+Encoder 3 ─┘    (POSIX shm, ~16MB/frame)  └────────────────┘
+```
+
+The shared memory buffer uses:
+- POSIX shared memory (`shm_open`)
+- Process-shared pthread mutex and condition variables
+- Lock-free ring buffer indices for minimal contention
+- Automatic frame size calculation based on video format
+
+### Advantages over Socket Approach
+
+1. **Zero-copy potential**: Frames written directly to shared memory
+2. **Lower latency**: No socket overhead or kernel transitions for data
+3. **Better for large frames**: V210 frames are ~5MB each
+4. **Multiple simultaneous writers**: Ring buffer handles concurrent access
+
+### Limitations
+
+1. Same machine only (shared memory is local)
+2. Requires `-output_buffer_size` on server
+3. All clients must use same video/audio format as server
+
 ## Subtitle Handling
 
 Currently subtitles are received and logged. Future extensions could:

@@ -89,6 +89,12 @@ struct decklink_cctx {
     /* Socket server options */
     char *socket_path;
     int socket_listen;
+
+    /* Shared memory options */
+    char *shm_name;
+    int shm_server;
+    int shm_client;
+    int shm_max_frames;
 };
 
 #endif /* AVDEVICE_DECKLINK_COMMON_C_H */
