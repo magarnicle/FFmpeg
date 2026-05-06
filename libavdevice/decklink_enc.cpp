@@ -697,6 +697,9 @@ static void *decklink_shm_reader_thread(void *arg)
     int64_t last_outgoing_audio_pts = 0;
     int64_t video_frame_duration = 1;
     int64_t audio_packet_duration = 1;
+    int64_t last_frame_walltime = 0;  /* Wall clock time of last frame received */
+    const int64_t GAP_THRESHOLD_US = 2000000;  /* 2 seconds - if gap longer, rebase to current time */
+    int video_gap_detected = 0;  /* Set when video detects a gap, cleared when audio processes its first packet */
 
     av_log(avctx, AV_LOG_INFO, "Shared memory reader thread started\n");
 
@@ -726,6 +729,10 @@ static void *decklink_shm_reader_thread(void *arg)
         }
 
         /* PTS rebasing - track video and audio separately */
+        int64_t current_walltime = av_gettime_relative();
+        int has_gap = last_frame_walltime > 0 &&
+                      (current_walltime - last_frame_walltime) > GAP_THRESHOLD_US;
+
         if (header.type == DECKLINK_SHM_FRAME_VIDEO) {
             int64_t incoming_pts = header.pts;
 
@@ -735,14 +742,32 @@ static void *decklink_shm_reader_thread(void *arg)
             /* Detect new client: PTS jumped backward (new video starting from 0) */
             if (last_incoming_video_pts != AV_NOPTS_VALUE &&
                 incoming_pts < last_incoming_video_pts) {
-                video_pts_offset = last_outgoing_video_pts + video_frame_duration;
-                av_log(avctx, AV_LOG_INFO, "SHM: New video client (PTS %"PRId64" -> %"PRId64"), "
-                       "offset now %"PRId64"\n",
-                       last_incoming_video_pts, incoming_pts, video_pts_offset);
+
+                if (has_gap && ctx->playback_started && ctx->dlo) {
+                    /* Gap detected - rebase to current Decklink stream time */
+                    BMDTimeValue stream_time;
+                    double speed;
+                    if (ctx->dlo->GetScheduledStreamTime(ctx->bmd_tb_den, &stream_time, &speed) == S_OK) {
+                        int64_t current_stream_pts = stream_time / ctx->bmd_tb_num;
+                        video_pts_offset = current_stream_pts - incoming_pts;
+                        video_gap_detected = 1;  /* Signal audio to also rebase */
+                        av_log(avctx, AV_LOG_INFO, "SHM: New video client after gap (%.1fs), "
+                               "rebasing to stream time %"PRId64", offset %"PRId64"\n",
+                               (current_walltime - last_frame_walltime) / 1000000.0,
+                               current_stream_pts, video_pts_offset);
+                    }
+                } else {
+                    /* No gap - seamless continuation */
+                    video_pts_offset = last_outgoing_video_pts + video_frame_duration;
+                    av_log(avctx, AV_LOG_INFO, "SHM: New video client (PTS %"PRId64" -> %"PRId64"), "
+                           "offset now %"PRId64"\n",
+                           last_incoming_video_pts, incoming_pts, video_pts_offset);
+                }
             }
 
             last_incoming_video_pts = incoming_pts;
             last_outgoing_video_pts = incoming_pts + video_pts_offset;
+            last_frame_walltime = current_walltime;
         } else if (header.type == DECKLINK_SHM_FRAME_AUDIO) {
             int64_t incoming_pts = header.pts;
 
@@ -752,10 +777,25 @@ static void *decklink_shm_reader_thread(void *arg)
             /* Detect new client: PTS jumped backward (new audio starting from 0) */
             if (last_incoming_audio_pts != AV_NOPTS_VALUE &&
                 incoming_pts < last_incoming_audio_pts) {
-                audio_pts_offset = last_outgoing_audio_pts + audio_packet_duration;
-                av_log(avctx, AV_LOG_INFO, "SHM: New audio client (PTS %"PRId64" -> %"PRId64"), "
-                       "offset now %"PRId64"\n",
-                       last_incoming_audio_pts, incoming_pts, audio_pts_offset);
+
+                if ((has_gap || video_gap_detected) && ctx->playback_started && ctx->dlo) {
+                    /* Gap detected (either directly or via video) - rebase to current stream time */
+                    BMDTimeValue stream_time;
+                    double speed;
+                    if (ctx->dlo->GetScheduledStreamTime(48000, &stream_time, &speed) == S_OK) {
+                        audio_pts_offset = stream_time - incoming_pts;
+                        av_log(avctx, AV_LOG_INFO, "SHM: New audio client after gap, "
+                               "rebasing to stream time %"PRId64", offset %"PRId64"\n",
+                               stream_time, audio_pts_offset);
+                    }
+                    video_gap_detected = 0;  /* Clear the flag */
+                } else {
+                    /* No gap - seamless continuation */
+                    audio_pts_offset = last_outgoing_audio_pts + audio_packet_duration;
+                    av_log(avctx, AV_LOG_INFO, "SHM: New audio client (PTS %"PRId64" -> %"PRId64"), "
+                           "offset now %"PRId64"\n",
+                           last_incoming_audio_pts, incoming_pts, audio_pts_offset);
+                }
             }
 
             last_incoming_audio_pts = incoming_pts;
