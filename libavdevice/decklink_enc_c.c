@@ -69,6 +69,8 @@ static const AVOption options[] = {
     { "both"        , "insert on both fields (default, per OP-47)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "odd"         , "insert on odd field (field 1) only",         0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "even"        , "insert on even field (field 2) only",        0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, ENC, .unit = "teletext_fields"},
+    { "socket_path" , "Unix socket path for external frame input", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "socket_listen", "Listen on socket for external frame input", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { NULL },
 };
 

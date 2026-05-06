@@ -21,11 +21,42 @@
 
 #include <atomic>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <errno.h>
 #if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
 #define DECKLINK_CAN_GET_TOTAL_RAM 1
 #endif
 
 using std::atomic;
+
+/*
+ * Socket frame protocol for external frame input.
+ * Allows other FFmpeg instances to send frames to the Decklink output.
+ *
+ * Each frame is sent as:
+ *   - 4 bytes: magic number (0x444B4C4B = "DKLK")
+ *   - 1 byte:  stream type (0 = video, 1 = audio)
+ *   - 4 bytes: data size (network byte order)
+ *   - 8 bytes: pts (network byte order)
+ *   - 4 bytes: width (video only, network byte order)
+ *   - 4 bytes: height (video only, network byte order)
+ *   - N bytes: frame data
+ */
+#define DECKLINK_SOCKET_MAGIC 0x444B4C4B
+#define DECKLINK_SOCKET_TYPE_VIDEO 0
+#define DECKLINK_SOCKET_TYPE_AUDIO 1
+
+struct decklink_socket_header {
+    uint32_t magic;
+    uint8_t  stream_type;
+    uint32_t data_size;
+    int64_t  pts;
+    uint32_t width;
+    uint32_t height;
+} __attribute__((packed));
 
 /* Include internal.h first to avoid conflict between winsock.h (used by
  * DeckLink headers) and winsock2.h (used by libavformat) in MSVC++ builds */
@@ -425,6 +456,217 @@ static int decklink_output_queue_put_blocking(struct decklink_ctx *ctx, Decklink
     return ret;
 }
 
+/* Read exactly n bytes from socket, handling partial reads */
+static int socket_read_exact(int fd, void *buf, size_t n)
+{
+    size_t total = 0;
+    uint8_t *p = (uint8_t *)buf;
+    while (total < n) {
+        ssize_t r = read(fd, p + total, n - total);
+        if (r <= 0) {
+            if (r == 0) return -1;  /* EOF */
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        total += r;
+    }
+    return 0;
+}
+
+/* Socket listener thread - accepts connections and queues frames from external sources */
+static void *decklink_socket_thread(void *arg)
+{
+    struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    struct decklink_socket_header header;
+    uint8_t *frame_data = NULL;
+    size_t frame_data_size = 0;
+    int connection_count = 0;
+
+    av_log(avctx, AV_LOG_INFO, "Socket server thread started, listening on %s\n", ctx->socket_path);
+
+    while (!ctx->socket_thread_stop) {
+        struct sockaddr_un client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        /* Accept with timeout using poll */
+        struct pollfd pfd = { ctx->socket_fd, POLLIN, 0 };
+        int poll_ret = poll(&pfd, 1, 100);  /* 100ms timeout */
+        if (poll_ret <= 0) {
+            if (poll_ret < 0 && errno != EINTR) {
+                av_log(avctx, AV_LOG_ERROR, "Socket poll error: %s\n", strerror(errno));
+            }
+            continue;
+        }
+
+        int client_fd = accept(ctx->socket_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (errno != EINTR && errno != EAGAIN) {
+                av_log(avctx, AV_LOG_ERROR, "Socket accept error: %s\n", strerror(errno));
+            }
+            continue;
+        }
+
+        connection_count++;
+        av_log(avctx, AV_LOG_INFO, "Socket: client %d connected\n", connection_count);
+        int64_t frames_received = 0;
+
+        /* Read frames from this client */
+        while (!ctx->socket_thread_stop) {
+            /* Read header */
+            if (socket_read_exact(client_fd, &header, sizeof(header)) < 0) {
+                break;  /* Client disconnected */
+            }
+
+            /* Validate magic */
+            uint32_t magic = ntohl(header.magic);
+            if (magic != DECKLINK_SOCKET_MAGIC) {
+                av_log(avctx, AV_LOG_ERROR, "Socket: invalid magic 0x%08X, expected 0x%08X\n",
+                       magic, DECKLINK_SOCKET_MAGIC);
+                break;
+            }
+
+            uint32_t data_size = ntohl(header.data_size);
+            int64_t pts = (int64_t)av_be2ne64(header.pts);
+
+            /* Allocate/reallocate frame buffer if needed */
+            if (data_size > frame_data_size) {
+                av_free(frame_data);
+                frame_data = (uint8_t *)av_malloc(data_size);
+                if (!frame_data) {
+                    av_log(avctx, AV_LOG_ERROR, "Socket: failed to allocate %u bytes\n", data_size);
+                    frame_data_size = 0;
+                    break;
+                }
+                frame_data_size = data_size;
+            }
+
+            /* Read frame data */
+            if (socket_read_exact(client_fd, frame_data, data_size) < 0) {
+                av_log(avctx, AV_LOG_ERROR, "Socket: failed to read frame data\n");
+                break;
+            }
+
+            /* Create packet and queue it */
+            AVPacket *pkt = av_packet_alloc();
+            if (!pkt) {
+                av_log(avctx, AV_LOG_ERROR, "Socket: failed to allocate packet\n");
+                break;
+            }
+
+            if (av_new_packet(pkt, data_size) < 0) {
+                av_log(avctx, AV_LOG_ERROR, "Socket: failed to allocate packet data\n");
+                av_packet_free(&pkt);
+                break;
+            }
+
+            memcpy(pkt->data, frame_data, data_size);
+            pkt->pts = pts;
+            pkt->dts = pts;
+
+            if (header.stream_type == DECKLINK_SOCKET_TYPE_VIDEO) {
+                pkt->stream_index = ctx->video_st ? ctx->video_st->index : 0;
+                if (ctx->output_thread_started) {
+                    decklink_output_queue_put_blocking(ctx, &ctx->output_video_queue, pkt);
+                }
+            } else if (header.stream_type == DECKLINK_SOCKET_TYPE_AUDIO) {
+                pkt->stream_index = ctx->audio_st ? ctx->audio_st->index : 0;
+                if (ctx->output_thread_started) {
+                    decklink_output_queue_put_blocking(ctx, &ctx->output_audio_queue, pkt);
+                }
+            }
+
+            av_packet_free(&pkt);
+
+            frames_received++;
+        }
+
+        close(client_fd);
+        av_log(avctx, AV_LOG_INFO, "Socket: client %d disconnected after %"PRId64" frames\n",
+               connection_count, frames_received);
+    }
+
+    av_free(frame_data);
+    av_log(avctx, AV_LOG_INFO, "Socket server thread exiting\n");
+    return NULL;
+}
+
+/* Initialize socket server for external frame input */
+static int decklink_init_socket_server(AVFormatContext *avctx, struct decklink_ctx *ctx, const char *path)
+{
+    struct sockaddr_un addr;
+
+    /* Create socket */
+    ctx->socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctx->socket_fd < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create socket: %s\n", strerror(errno));
+        return AVERROR(errno);
+    }
+
+    /* Remove existing socket file if present */
+    unlink(path);
+
+    /* Bind to path */
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    if (bind(ctx->socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to bind socket to %s: %s\n", path, strerror(errno));
+        close(ctx->socket_fd);
+        ctx->socket_fd = -1;
+        return AVERROR(errno);
+    }
+
+    /* Listen for connections */
+    if (listen(ctx->socket_fd, 5) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to listen on socket: %s\n", strerror(errno));
+        close(ctx->socket_fd);
+        unlink(path);
+        ctx->socket_fd = -1;
+        return AVERROR(errno);
+    }
+
+    /* Store path for cleanup */
+    ctx->socket_path = av_strdup(path);
+
+    /* Start listener thread */
+    ctx->socket_thread_stop = 0;
+    int ret = pthread_create(&ctx->socket_thread, NULL, decklink_socket_thread, ctx);
+    if (ret != 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create socket thread: %s\n", strerror(ret));
+        close(ctx->socket_fd);
+        unlink(path);
+        av_freep(&ctx->socket_path);
+        ctx->socket_fd = -1;
+        return AVERROR(ret);
+    }
+
+    ctx->socket_thread_started = 1;
+    av_log(avctx, AV_LOG_INFO, "Socket server initialized on %s\n", path);
+    return 0;
+}
+
+/* Cleanup socket server */
+static void decklink_cleanup_socket_server(struct decklink_ctx *ctx)
+{
+    if (ctx->socket_thread_started) {
+        ctx->socket_thread_stop = 1;
+        pthread_join(ctx->socket_thread, NULL);
+        ctx->socket_thread_started = 0;
+    }
+
+    if (ctx->socket_fd >= 0) {
+        close(ctx->socket_fd);
+        ctx->socket_fd = -1;
+    }
+
+    if (ctx->socket_path) {
+        unlink(ctx->socket_path);
+        av_freep(&ctx->socket_path);
+    }
+}
+
 static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
@@ -663,6 +905,10 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
     uint32_t buffered;
+
+    /* Stop socket server first so no more frames come in */
+    decklink_cleanup_socket_server(ctx);
+
     /* Stop async output thread if running */
     if (ctx->output_thread_started) {
         av_log(avctx, AV_LOG_INFO, "Waiting for async output buffer to drain...\n");
@@ -2128,6 +2374,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
     ctx->first_pts    = AV_NOPTS_VALUE;
+    ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
         ctx->link = decklink_link_conf_map[cctx->link];
     cctx->ctx = ctx;
@@ -2267,9 +2514,23 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
                video_buffer_size, audio_buffer_size);
     }
 
+    /* Initialize socket server if requested */
+    if (cctx->socket_path && cctx->socket_listen) {
+        if (!ctx->output_thread_started) {
+            av_log(avctx, AV_LOG_ERROR, "Socket server requires output_buffer_size to be set\n");
+            ret = AVERROR(EINVAL);
+            goto error;
+        }
+        ret = decklink_init_socket_server(avctx, ctx, cctx->socket_path);
+        if (ret < 0) {
+            goto error;
+        }
+    }
+
     return 0;
 
 error:
+    decklink_cleanup_socket_server(ctx);
     ff_decklink_cleanup(avctx);
     return ret;
 }
