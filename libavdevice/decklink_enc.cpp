@@ -671,6 +671,10 @@ static void decklink_cleanup_socket_server(struct decklink_ctx *ctx)
 /*
  * Shared memory reader thread - reads frames from shared memory buffer
  * and queues them for DeckLink output.
+ *
+ * Handles PTS rebasing: when a new client connects (detected by PTS going
+ * backward), we recalculate the PTS offset to make frames appear "on time"
+ * relative to the current stream position.
  */
 static void *decklink_shm_reader_thread(void *arg)
 {
@@ -681,6 +685,18 @@ static void *decklink_shm_reader_thread(void *arg)
     uint8_t *frame_data = NULL;
     uint32_t frame_data_size = 0;
     int64_t video_frames = 0, audio_packets = 0;
+
+    /* PTS rebasing state - each client sends PTS starting from 0,
+     * server adds cumulative offset so videos concatenate seamlessly.
+     * Track video and audio separately since they have different timebases. */
+    int64_t video_pts_offset = 0;
+    int64_t audio_pts_offset = 0;
+    int64_t last_incoming_video_pts = AV_NOPTS_VALUE;
+    int64_t last_incoming_audio_pts = AV_NOPTS_VALUE;
+    int64_t last_outgoing_video_pts = 0;
+    int64_t last_outgoing_audio_pts = 0;
+    int64_t video_frame_duration = 1;
+    int64_t audio_packet_duration = 1;
 
     av_log(avctx, AV_LOG_INFO, "Shared memory reader thread started\n");
 
@@ -709,6 +725,43 @@ static void *decklink_shm_reader_thread(void *arg)
             break;
         }
 
+        /* PTS rebasing - track video and audio separately */
+        if (header.type == DECKLINK_SHM_FRAME_VIDEO) {
+            int64_t incoming_pts = header.pts;
+
+            if (header.duration > 0)
+                video_frame_duration = header.duration;
+
+            /* Detect new client: PTS jumped backward (new video starting from 0) */
+            if (last_incoming_video_pts != AV_NOPTS_VALUE &&
+                incoming_pts < last_incoming_video_pts) {
+                video_pts_offset = last_outgoing_video_pts + video_frame_duration;
+                av_log(avctx, AV_LOG_INFO, "SHM: New video client (PTS %"PRId64" -> %"PRId64"), "
+                       "offset now %"PRId64"\n",
+                       last_incoming_video_pts, incoming_pts, video_pts_offset);
+            }
+
+            last_incoming_video_pts = incoming_pts;
+            last_outgoing_video_pts = incoming_pts + video_pts_offset;
+        } else if (header.type == DECKLINK_SHM_FRAME_AUDIO) {
+            int64_t incoming_pts = header.pts;
+
+            if (header.duration > 0)
+                audio_packet_duration = header.duration;
+
+            /* Detect new client: PTS jumped backward (new audio starting from 0) */
+            if (last_incoming_audio_pts != AV_NOPTS_VALUE &&
+                incoming_pts < last_incoming_audio_pts) {
+                audio_pts_offset = last_outgoing_audio_pts + audio_packet_duration;
+                av_log(avctx, AV_LOG_INFO, "SHM: New audio client (PTS %"PRId64" -> %"PRId64"), "
+                       "offset now %"PRId64"\n",
+                       last_incoming_audio_pts, incoming_pts, audio_pts_offset);
+            }
+
+            last_incoming_audio_pts = incoming_pts;
+            last_outgoing_audio_pts = incoming_pts + audio_pts_offset;
+        }
+
         /* Create packet and queue it */
         AVPacket *pkt = av_packet_alloc();
         if (!pkt) {
@@ -723,17 +776,20 @@ static void *decklink_shm_reader_thread(void *arg)
         }
 
         memcpy(pkt->data, frame_data, header.size);
-        pkt->pts = header.pts;
-        pkt->dts = header.dts;
         pkt->duration = header.duration;
 
+        /* Apply appropriate PTS offset based on stream type */
         if (header.type == DECKLINK_SHM_FRAME_VIDEO) {
+            pkt->pts = header.pts + video_pts_offset;
+            pkt->dts = header.dts + video_pts_offset;
             pkt->stream_index = ctx->video_st ? ctx->video_st->index : 0;
             if (ctx->output_thread_started) {
                 decklink_output_queue_put_blocking(ctx, &ctx->output_video_queue, pkt);
             }
             video_frames++;
         } else if (header.type == DECKLINK_SHM_FRAME_AUDIO) {
+            pkt->pts = header.pts + audio_pts_offset;
+            pkt->dts = header.dts + audio_pts_offset;
             pkt->stream_index = ctx->audio_st ? ctx->audio_st->index : 0;
             if (ctx->output_thread_started) {
                 decklink_output_queue_put_blocking(ctx, &ctx->output_audio_queue, pkt);
@@ -746,8 +802,9 @@ static void *decklink_shm_reader_thread(void *arg)
         /* Periodic logging */
         if ((video_frames + audio_packets) % 1000 == 0) {
             av_log(avctx, AV_LOG_INFO, "SHM reader: %"PRId64" video, %"PRId64" audio, "
-                   "buffer: %u/%u frames\n",
-                   video_frames, audio_packets, shm->frame_count, shm->max_frames);
+                   "buffer: %u/%u frames, v_offset=%"PRId64", a_offset=%"PRId64"\n",
+                   video_frames, audio_packets, shm->frame_count, shm->max_frames,
+                   video_pts_offset, audio_pts_offset);
         }
     }
 
@@ -2388,6 +2445,11 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
 
+    /* If shared memory server mode, ignore input - shm reader provides frames */
+    if (ctx->shm_buffer && ctx->shm_is_server) {
+        return 0;
+    }
+
     /* If shared memory client mode, write to shm buffer */
     if (ctx->shm_buffer && !ctx->shm_is_server) {
         int ret = decklink_shm_write_packet(avctx, pkt, DECKLINK_SHM_FRAME_VIDEO);
@@ -2517,6 +2579,11 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+
+    /* If shared memory server mode, ignore input - shm reader provides frames */
+    if (ctx->shm_buffer && ctx->shm_is_server) {
+        return 0;
+    }
 
     /* If shared memory client mode, write to shm buffer */
     if (ctx->shm_buffer && !ctx->shm_is_server) {
