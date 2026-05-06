@@ -972,7 +972,9 @@ static int decklink_shm_write_packet(AVFormatContext *avctx, AVPacket *pkt, int 
         header.channels = ctx->channels;
     }
 
-    return decklink_shm_client_write(shm, &header, pkt->data, 1000);
+    /* Block indefinitely (-1) or timeout after 1 second based on option */
+    int timeout_ms = cctx->shm_block ? -1 : 1000;
+    return decklink_shm_client_write(shm, &header, pkt->data, timeout_ms);
 }
 
 static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)

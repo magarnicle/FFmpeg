@@ -95,6 +95,7 @@ struct decklink_cctx {
     int shm_server;
     int shm_client;
     int shm_max_frames;
+    int shm_block;  /* Block indefinitely when buffer full */
 };
 
 #endif /* AVDEVICE_DECKLINK_COMMON_C_H */

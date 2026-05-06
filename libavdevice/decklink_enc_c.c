@@ -75,6 +75,7 @@ static const AVOption options[] = {
     { "shm_server", "Run as shared memory server (playout instance)", OFFSET(shm_server), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "shm_client", "Run as shared memory client (encoder instance)", OFFSET(shm_client), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "shm_max_frames", "Maximum frames in shared memory buffer", OFFSET(shm_max_frames), AV_OPT_TYPE_INT, { .i64 = 60 }, 8, 240, ENC },
+    { "shm_block", "Block indefinitely when shared memory buffer is full", OFFSET(shm_block), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ENC },
     { NULL },
 };
 
