@@ -148,8 +148,6 @@ struct decklink_ctx {
 
     /* Teletext output queue and state */
     DecklinkPacketQueue teletext_queue;
-    int teletext_page;
-    int teletext_magazine;
     DecklinkTeletextFields teletext_fields;
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
