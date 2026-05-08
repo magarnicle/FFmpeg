@@ -1301,43 +1301,35 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
 }
 
 /* Dummy header teletext packet per OP-42 Section 8 (Time Filling Headers)
- * Magazine 8 (encoded as 0), Row 0 (page header), Page FF, Subcode 0x3F7E
+ * Magazine 8 (encoded as 0), Row 0 (page header), Page FF
  *
  * Per OP-42: "time filling headers... are by convention 0,FF (Magazine 0
  * known as 8, page FF) with a subcode of 0x3F7E"
  *
- * MRAG for magazine 8 (encoded as 0), row 0:
- *   Byte 0: ham84(M1=0, R0=0, M2=0, R1=0) = ham84(0) = 0x15
- *   Byte 1: ham84(R2=0, R3=0, R4=0, M3=0) = ham84(0) = 0x15
+ * Page header structure per ETS 300 706:
+ *   Bytes 0-1:   MRAG (magazine 8 encoded as 0, row 0)
+ *   Bytes 2-3:   Page FF
+ *   Bytes 4-9:   Subcode + C4-C7 (all 0 for dummy header)
+ *   Bytes 10-11: C8-C14 (all 0)
+ *   Bytes 12-41: 30 display characters (spaces)
  *
- * Page FF:
- *   Byte 2: ham84(0xF) = 0xEA (page units)
- *   Byte 3: ham84(0xF) = 0xEA (page tens)
- *
- * Subcode 0x3F7E (S1=0xE, S2=0x7, S3=0xF, S4=0x3):
- *   Byte 4: ham84(S1[0:3]=0xE) = 0xFD
- *   Byte 5: ham84(S2[0:2]=0x7 | C4=0) = 0x2F
- *   Byte 6: ham84(S3[0:3]=0xF) = 0xEA
- *   Byte 7: ham84(S4[0:1]=0x3 | C5=0 | C6=0) = 0x5E
- *   Byte 8: ham84(C7=0 | C8=0 | C9=0 | C10=0) = 0x15
- *   Byte 9: ham84(C11=0 | C12-14=0) = 0x15
- *
- * Display characters: 32 spaces with odd parity
+ * Hamming 8/4 values: ham84(0)=0x15, ham84(0xF)=0xEA
  */
 static const uint8_t teletext_filler_packet[42] = {
     0x15, 0x15,  /* MRAG: magazine 8 (encoded 0), row 0 */
-    0xEA, 0xEA,  /* Page FF */
-    0xFD, 0x2F,  /* S1=0xE, S2=0x7 | C4=0 */
-    0xEA, 0x5E,  /* S3=0xF, S4=0x3 | C5=0 | C6=0 */
-    0x15, 0x15,  /* Control bits all 0 */
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 32 spaces */
+    0xEA, 0xEA,  /* Page FF (units=F, tens=F) */
+    0x15, 0x15,  /* S1 low, S1 high + C4=0 */
+    0x15, 0x15,  /* S2 low, S2 high + C5=0 */
+    0x15, 0x15,  /* S3, S4 + C6=0 + C7=0 */
+    0x15, 0x15,  /* C8-C11=0, C12-C14=0 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 30 spaces */
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
 /* Filler teletext data unit for HD VANC (OP-47 SDP format)
- * Contains dummy header per OP-42 Section 8 (page 8FF, subcode 0x3F7E)
+ * Contains dummy header per OP-42 Section 8 (page 8FF)
  * Structure: data_unit_id (0x02=non-subtitle), length (0x2C=44),
  *            field/line (0x00), framing_code (0xE4),
  *            42-byte payload (dummy header for page 8FF)
@@ -1348,14 +1340,15 @@ static const uint8_t teletext_filler_data_unit[46] = {
     0x00,        /* reserved/field/line */
     0xE4,        /* framing_code */
     0x15, 0x15,  /* MRAG: magazine 8 (encoded 0), row 0 */
-    0xEA, 0xEA,  /* Page FF */
-    0xFD, 0x2F,  /* S1=0xE, S2=0x7 | C4=0 */
-    0xEA, 0x5E,  /* S3=0xF, S4=0x3 | C5=0 | C6=0 */
-    0x15, 0x15,  /* Control bits all 0 */
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 32 spaces */
+    0xEA, 0xEA,  /* Page FF (units=F, tens=F) */
+    0x15, 0x15,  /* S1 low, S1 high + C4=0 */
+    0x15, 0x15,  /* S2 low, S2 high + C5=0 */
+    0x15, 0x15,  /* S3, S4 + C6=0 + C7=0 */
+    0x15, 0x15,  /* C8-C11=0, C12-C14=0 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 30 spaces */
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
 /* Insert OP-47 VANC packet on specified line */

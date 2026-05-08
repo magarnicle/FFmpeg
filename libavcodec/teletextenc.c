@@ -327,17 +327,20 @@ static void encode_mrag(int mag, int row, uint8_t *byte1, uint8_t *byte2)
 }
 
 /**
- * Build a teletext header row (row 0)
+ * Build a teletext header row (row 0) per ETS 300 706
  *
- * Page header structure (after MRAG):
+ * Page header structure (42 bytes total):
+ *   Bytes 0-1:   MRAG (Hamming 8/4)
  *   Bytes 2-3:   Page units, page tens (Hamming 8/4)
- *   Bytes 4-5:   S1 bits 0-3, S1 bits 4-6 + C4 (Hamming 8/4)
- *   Bytes 6-7:   S2 bits 0-3, S2 bits 4-6 + C5 (Hamming 8/4)
- *   Bytes 8-9:   S3 bits 0-3, S3 bits 4-6 + C6 (Hamming 8/4)
- *   Bytes 10-11: S4 bits 0-3, C7+C8+C9+C10 (Hamming 8/4)
- *   Byte 12:     C11 + national option charset (Hamming 8/4)
- *   Byte 13:     Reserved (Hamming 8/4)
- *   Bytes 14-41: 28 characters page header display (odd parity)
+ *   Byte 4:      S1 bits 0-3 (Hamming 8/4)
+ *   Byte 5:      S1 bits 4-6 (bits 0-2) + C4 (bit 3) (Hamming 8/4)
+ *   Byte 6:      S2 bits 0-3 (Hamming 8/4)
+ *   Byte 7:      S2 bits 4-6 (bits 0-2) + C5 (bit 3) (Hamming 8/4)
+ *   Byte 8:      S3 bits 0-3 (Hamming 8/4)
+ *   Byte 9:      S4 bits 0-1 (bits 0-1) + C6 (bit 2) + C7 (bit 3) (Hamming 8/4)
+ *   Byte 10:     C8 (bit 0) + C9 (bit 1) + C10 (bit 2) + C11 (bit 3) (Hamming 8/4)
+ *   Byte 11:     C12-C14 national charset (bits 0-2) + spare (bit 3) (Hamming 8/4)
+ *   Bytes 12-41: 30 characters page header display (odd parity)
  *
  * Control bits per OP-42:
  *   C4 = Erase Page (set to 1 between caption transmissions)
@@ -348,6 +351,7 @@ static void encode_mrag(int mag, int row, uint8_t *byte1, uint8_t *byte2)
  *   C9 = Interrupted Sequence (0)
  *   C10 = Inhibit Display (0)
  *   C11 = Magazine Serial (0 for parallel mode per OP-42 4e)
+ *   C12-C14 = National Option Character Subset (region)
  */
 static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
 {
@@ -358,34 +362,33 @@ static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
     line[2] = ff_teletext_ham84(ctx->page_bcd & 0x0F);
     line[3] = ff_teletext_ham84((ctx->page_bcd >> 4) & 0x0F);
 
-    /* Bytes 4-5: Subcode S1 (0) + C4 (erase page) in high nibble bit 3 */
+    /* Byte 4: S1 bits 0-3 (subcode low nibble) */
     line[4] = ff_teletext_ham84(0);
-    line[5] = ff_teletext_ham84((ctx->erase_page ? 0x08 : 0));
 
-    /* Bytes 6-7: Subcode S2 (0) + C5 (newsflash=0) in high nibble bit 3 */
+    /* Byte 5: S1 bits 4-6 (bits 0-2) + C4 erase page (bit 3) */
+    line[5] = ff_teletext_ham84(ctx->erase_page ? 0x08 : 0);
+
+    /* Byte 6: S2 bits 0-3 (subcode low nibble) */
     line[6] = ff_teletext_ham84(0);
-    line[7] = ff_teletext_ham84(0);
 
-    /* Bytes 8-9: Subcode S3 (0) + C6 (subtitle) in high nibble bit 3 */
+    /* Byte 7: S2 bits 4-6 (bits 0-2) + C5 newsflash (bit 3) */
+    line[7] = ff_teletext_ham84(0);  /* C5 = 0 */
+
+    /* Byte 8: S3 bits 0-3 */
     line[8] = ff_teletext_ham84(0);
-    line[9] = ff_teletext_ham84(ctx->subtitle_flag ? 0x08 : 0);
 
-    /* Bytes 10-11: Subcode S4 (0), then C7+C8+C9+C10 nibble
-     * Nibble = C7(bit0) + C8(bit1) + C9(bit2) + C10(bit3)
-     * C7=0 (suppress header), C8=update_indicator, C9=0, C10=0 */
-    line[10] = ff_teletext_ham84(0);
-    line[11] = ff_teletext_ham84((ctx->update_indicator ? 0x02 : 0));
+    /* Byte 9: S4 bits 0-1 (bits 0-1) + C6 subtitle (bit 2) + C7 suppress header (bit 3) */
+    line[9] = ff_teletext_ham84(ctx->subtitle_flag ? 0x04 : 0);  /* C6 at bit 2 */
 
-    /* Byte 12: C11 (magazine serial/parallel) + national option charset (region)
-     * C11=0 for parallel mode (OP-42 4e), region in bits 1-3 */
-    line[12] = ff_teletext_ham84((ctx->region & 0x07) << 1);
+    /* Byte 10: C8 update (bit 0) + C9 interrupted (bit 1) + C10 inhibit (bit 2) + C11 serial (bit 3) */
+    line[10] = ff_teletext_ham84(ctx->update_indicator ? 0x01 : 0);  /* C8 at bit 0, C11=0 for parallel */
 
-    /* Byte 13: Reserved */
-    line[13] = ff_teletext_ham84(0);
+    /* Byte 11: C12-C14 national option charset = region (bits 0-2) + spare (bit 3) */
+    line[11] = ff_teletext_ham84(ctx->region & 0x07);
 
-    /* Bytes 14-41: 28 characters page header display (odd parity) */
-    for (int i = 0; i < 28; i++) {
-        line[14 + i] = ff_teletext_odd_parity(' ');
+    /* Bytes 12-41: 30 characters page header display (odd parity) */
+    for (int i = 0; i < 30; i++) {
+        line[12 + i] = ff_teletext_odd_parity(' ');
     }
 }
 
