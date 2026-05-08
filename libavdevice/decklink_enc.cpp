@@ -1236,12 +1236,26 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     for (int i = 0; i < 720; i++)
         luma[i] = LUMA_BLACK;
 
-    /* Start position for teletext data
-     * Per ETS 300 706, clock run-in starts at 10.3µs from 0H.
-     * DeckLink VBI buffer may include blanking, so start near beginning.
-     * TODO: May need adjustment based on actual DeckLink buffer layout.
+    /* Start position for teletext data in the VBI buffer
+     *
+     * The DeckLink VBI buffer is 720 samples (same width as PAL active video).
+     * The teletext waveform requires approximately 700 samples:
+     *   - 16 bits clock run-in × 1.946 samples/bit = 31 samples
+     *   - 8 bits framing code × 1.946 = 16 samples
+     *   - 336 bits data × 1.946 = 654 samples
+     *   - Total: ~700 samples
+     *
+     * To fit the waveform within the buffer: max start = 720 - 700 = 20 samples.
+     *
+     * Per ETS 300 706, clock run-in starts at 10.3µs from 0H (analog sync).
+     * At 13.5 MHz this is sample 139, but the DeckLink VBI buffer timing
+     * reference places sample 0 approximately where clock run-in should begin.
+     *
+     * Testing indicates sample 18 provides correct alignment for Australian
+     * broadcast receivers. This positions the waveform near the end of the
+     * available window, matching the timing offset expected by decoders.
      */
-    int pixel_pos = 0;
+    int pixel_pos = 18;
     int bit_pos_fp = 0;
 
     /* Generate clock run-in: 16 bits of alternating 1/0, starting with 1 */
