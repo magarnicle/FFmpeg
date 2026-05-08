@@ -85,6 +85,7 @@ struct decklink_cctx {
     int64_t output_buffer_size;
     double late_threshold;
     DecklinkTeletextFields teletext_fields;
+    int teletext_vbi_offset;
 };
 
 #endif /* AVDEVICE_DECKLINK_COMMON_C_H */

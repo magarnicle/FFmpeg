@@ -1211,7 +1211,8 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  *   Word 3: Y4[9:0], Cr2[9:0], Y5[9:0], xx
  */
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
-                                            const uint8_t *teletext_data, int data_len)
+                                            const uint8_t *teletext_data, int data_len,
+                                            int vbi_offset)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -1246,16 +1247,10 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      *   - Total: ~700 samples
      *
      * To fit the waveform within the buffer: max start = 720 - 700 = 20 samples.
-     *
-     * Per ETS 300 706, clock run-in starts at 10.3µs from 0H (analog sync).
-     * At 13.5 MHz this is sample 139, but the DeckLink VBI buffer timing
-     * reference places sample 0 approximately where clock run-in should begin.
-     *
-     * Testing indicates sample 18 provides correct alignment for Australian
-     * broadcast receivers. This positions the waveform near the end of the
-     * available window, matching the timing offset expected by decoders.
+     * The vbi_offset parameter (configurable via -teletext_vbi_offset) sets
+     * the start position, defaulting to 18.
      */
-    int pixel_pos = 18;
+    int pixel_pos = vbi_offset;
     int bit_pos_fp = 0;
 
     /* Generate clock run-in: 16 bits of alternating 1/0, starting with 1 */
@@ -1502,7 +1497,7 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                        teletext_data, 42);
+                                        teletext_data, 42, ctx->teletext_vbi_offset);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -2159,6 +2154,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->block_until_available      = cctx->block_until_available;
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
+    ctx->teletext_vbi_offset = cctx->teletext_vbi_offset;
     ctx->first_pts    = AV_NOPTS_VALUE;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
         ctx->link = decklink_link_conf_map[cctx->link];
