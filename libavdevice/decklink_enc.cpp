@@ -1221,11 +1221,12 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
     const int FP_SHIFT = 8;
 
-    /* 10-bit luma levels for teletext signal per ETS 300 706 / ITU-R BT.653-3
-     * Logic 1: 66% of peak white above black = 64 + 0.66*(940-64) = 642
-     * Logic 0: Black level (0 IRE) = 64
+    /* 10-bit luma levels for teletext signal per OP-42 Section 3
+     * Binary "1": 70% +/- 3% of peak white = 64 + 0.70*(940-64) = 677
+     * Binary "0": 0% +/- 2% (black level) = 64
+     * Note: ETS 300 706 specifies 66%, but OP-42 requires 70% for Australian broadcast
      */
-    const uint16_t LUMA_HIGH = 642;   /* 66% per ETS 300 706 */
+    const uint16_t LUMA_HIGH = 677;   /* 70% per OP-42 */
     const uint16_t LUMA_LOW  = 64;    /* Black level (0 IRE) */
     const uint16_t LUMA_BLACK = 64;   /* Black level */
     const uint16_t CHROMA_NEUTRAL = 512;  /* Neutral chroma */
