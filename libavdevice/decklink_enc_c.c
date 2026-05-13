@@ -76,6 +76,9 @@ static const AVOption options[] = {
     { "shm_client", "Run as shared memory client (encoder instance)", OFFSET(shm_client), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "shm_max_frames", "Maximum frames in shared memory buffer", OFFSET(shm_max_frames), AV_OPT_TYPE_INT, { .i64 = 60 }, 8, 240, ENC },
     { "shm_block", "Block indefinitely when shared memory buffer is full", OFFSET(shm_block), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ENC },
+    { "pre_render", "Buffer frames before starting DeckLink playback", OFFSET(pre_render), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "pre_render_until", "Wall clock time to start playback (HH:MM:SS or Unix timestamp)", OFFSET(pre_render_until), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "pre_render_frames", "Number of frames to buffer before starting (0 = use time trigger)", OFFSET(pre_render_frames), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 10000, ENC },
     { NULL },
 };
 

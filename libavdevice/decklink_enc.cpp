@@ -26,6 +26,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <errno.h>
+#include <time.h>
 #if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
 #define DECKLINK_CAN_GET_TOTAL_RAM 1
 #endif
@@ -318,10 +319,23 @@ static void *decklink_video_output_thread(void *arg)
     int idle_count = 0;
     int64_t frames_scheduled = 0;
     int64_t last_log_time = av_gettime_relative();
+    int pre_render_logged = 0;
 
     av_log(avctx, AV_LOG_INFO, "Video output thread started\n");
 
     while (!ctx->output_thread_stop) {
+        /* In pre-render mode, wait for device to be ready */
+        if (ctx->pre_render_mode && !ctx->pre_render_device_ready) {
+            if (!pre_render_logged) {
+                av_log(avctx, AV_LOG_INFO, "Video thread: waiting for pre-render device init (buffer: %d frames)\n",
+                       vq->nb_packets);
+                pre_render_logged = 1;
+            }
+            usleep(10000);
+            continue;
+        }
+        pre_render_logged = 0;
+
         ret = ff_decklink_packet_queue_get(vq, &pkt, 0);
         if (ret <= 0) {
             idle_count++;
@@ -376,10 +390,22 @@ static void *decklink_audio_output_thread(void *arg)
     int idle_count = 0;
     int64_t packets_scheduled = 0;
     int64_t last_log_time = av_gettime_relative();
+    int pre_render_logged = 0;
 
     av_log(avctx, AV_LOG_INFO, "Audio output thread started\n");
 
     while (!ctx->output_thread_stop) {
+        /* In pre-render mode, wait for device to be ready */
+        if (ctx->pre_render_mode && !ctx->pre_render_device_ready) {
+            if (!pre_render_logged) {
+                av_log(avctx, AV_LOG_INFO, "Audio thread: waiting for pre-render device init\n");
+                pre_render_logged = 1;
+            }
+            usleep(10000);
+            continue;
+        }
+        pre_render_logged = 0;
+
         ret = ff_decklink_packet_queue_get(aq, &pkt, 0);
         if (ret <= 0) {
             idle_count++;
@@ -944,6 +970,197 @@ static void decklink_cleanup_shm(struct decklink_ctx *ctx)
     av_freep(&ctx->shm_name);
 }
 
+/* Pre-render mode: parse time string (HH:MM:SS or Unix timestamp) to microseconds */
+static int64_t parse_pre_render_time(const char *time_str)
+{
+    if (!time_str || !*time_str)
+        return 0;
+
+    /* Try HH:MM:SS format first */
+    int hour, min, sec;
+    if (sscanf(time_str, "%d:%d:%d", &hour, &min, &sec) == 3) {
+        /* Get current time and compute target time today */
+        time_t now = time(NULL);
+        struct tm *tm_now = localtime(&now);
+        struct tm tm_target = *tm_now;
+        tm_target.tm_hour = hour;
+        tm_target.tm_min = min;
+        tm_target.tm_sec = sec;
+        time_t target = mktime(&tm_target);
+        /* If time has passed today, assume tomorrow */
+        if (target <= now)
+            target += 24 * 60 * 60;
+        return (int64_t)target * 1000000LL;
+    }
+
+    /* Try Unix timestamp (seconds or microseconds) */
+    char *endptr;
+    int64_t ts = strtoll(time_str, &endptr, 10);
+    if (*endptr == '\0' && ts > 0) {
+        /* If value is small enough to be seconds, convert to microseconds */
+        if (ts < 1e12)
+            ts *= 1000000LL;
+        return ts;
+    }
+
+    return 0;  /* Invalid format */
+}
+
+/* Pre-render mode: complete device initialization (called when trigger fires) */
+static int decklink_pre_render_init_device(AVFormatContext *avctx)
+{
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    int ret;
+    int already_logged = 0;
+
+    av_log(avctx, AV_LOG_INFO, "Pre-render: initializing DeckLink device\n");
+
+    /* Initialize DeckLink device */
+    ret = ff_decklink_init_device(avctx, avctx->url);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Pre-render: failed to initialize device\n");
+        return ret;
+    }
+
+    /* Get output device */
+    if (ctx->dl->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void **) &ctx->dlo) != S_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Pre-render: could not open output device\n");
+        ff_decklink_cleanup(avctx);
+        return AVERROR(EIO);
+    }
+
+    /* Apply stored format */
+    if (ff_decklink_set_configs(avctx, DIRECTION_OUT) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Pre-render: could not set output configuration\n");
+        ff_decklink_cleanup(avctx);
+        return AVERROR(EIO);
+    }
+
+    if (ff_decklink_set_format(avctx, ctx->deferred_video_width, ctx->deferred_video_height,
+                               ctx->deferred_video_tb.num, ctx->deferred_video_tb.den,
+                               (AVFieldOrder)ctx->deferred_video_field_order)) {
+        av_log(avctx, AV_LOG_ERROR, "Pre-render: unsupported video format\n");
+        ff_decklink_cleanup(avctx);
+        return AVERROR(EIO);
+    }
+
+    /* Enable video output with retry loop */
+    if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
+        av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
+        ctx->supports_vanc = 0;
+    }
+    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
+        if (!ctx->block_until_available) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: could not enable video output\n");
+            ff_decklink_cleanup(avctx);
+            return AVERROR(EIO);
+        }
+        if (!already_logged) {
+            av_log(avctx, AV_LOG_DEBUG, "Pre-render: waiting for device...\n");
+            already_logged = 1;
+        }
+        usleep(1000);
+    }
+
+    /* Set callback */
+    ctx->output_callback = new decklink_output_callback();
+    ctx->dlo->SetScheduledFrameCompletionCallback(ctx->output_callback);
+
+    /* Configure buffer sizes */
+    ctx->frames_preroll = ctx->deferred_video_tb.den * ctx->preroll;
+    if (ctx->deferred_video_tb.den > 1000)
+        ctx->frames_preroll /= 1000;
+    ctx->frames_buffer = ctx->frames_preroll * 2;
+    ctx->frames_buffer = FFMAX(ctx->frames_buffer, 8);
+    if (cctx->output_buffer_size > 0)
+        ctx->frames_buffer = 60;
+    ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
+
+    pthread_mutex_init(&ctx->mutex, NULL);
+    pthread_cond_init(&ctx->cond, NULL);
+    ctx->frames_buffer_available_spots = ctx->frames_buffer;
+
+    /* Enable audio output if we have audio */
+    if (ctx->audio) {
+        if (ctx->dlo->EnableAudioOutput(bmdAudioSampleRate48kHz,
+                                        ctx->audio_depth == 32 ? bmdAudioSampleType32bitInteger : bmdAudioSampleType16bitInteger,
+                                        ctx->channels,
+                                        bmdAudioOutputStreamTimestamped) != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: could not enable audio output\n");
+            ff_decklink_cleanup(avctx);
+            return AVERROR(EIO);
+        }
+        if (ctx->dlo->BeginAudioPreroll() != S_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: could not begin audio preroll\n");
+            ff_decklink_cleanup(avctx);
+            return AVERROR(EIO);
+        }
+    }
+
+    ctx->pre_render_device_ready = 1;
+    av_log(avctx, AV_LOG_INFO, "Pre-render: device initialized successfully\n");
+
+    return 0;
+}
+
+/* Pre-render mode: trigger thread monitors conditions and starts playback */
+static void *decklink_pre_render_trigger_thread(void *arg)
+{
+    struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    int ret;
+
+    av_log(avctx, AV_LOG_INFO, "Pre-render trigger thread started\n");
+
+    /* Wait for trigger condition */
+    while (!ctx->pre_render_trigger_stop) {
+        int should_trigger = 0;
+
+        /* Check frame count trigger */
+        if (ctx->pre_render_target_frames > 0) {
+            int buffered = ctx->output_video_queue.nb_packets;
+            if (buffered >= ctx->pre_render_target_frames) {
+                av_log(avctx, AV_LOG_INFO, "Pre-render: frame count trigger (%d frames buffered)\n", buffered);
+                should_trigger = 1;
+            }
+        }
+
+        /* Check time trigger */
+        if (!should_trigger && ctx->pre_render_start_time > 0) {
+            int64_t now = av_gettime();
+            if (now >= ctx->pre_render_start_time) {
+                av_log(avctx, AV_LOG_INFO, "Pre-render: time trigger fired\n");
+                should_trigger = 1;
+            }
+        }
+
+        /* If no specific trigger, wait for buffer to have some content and device to be available */
+        if (!should_trigger && ctx->pre_render_target_frames == 0 && ctx->pre_render_start_time == 0) {
+            int buffered = ctx->output_video_queue.nb_packets;
+            if (buffered > 0) {
+                av_log(avctx, AV_LOG_INFO, "Pre-render: default trigger (buffer has %d frames)\n", buffered);
+                should_trigger = 1;
+            }
+        }
+
+        if (should_trigger) {
+            /* Initialize device */
+            ret = decklink_pre_render_init_device(avctx);
+            if (ret < 0) {
+                av_log(avctx, AV_LOG_ERROR, "Pre-render: failed to initialize device, error %d\n", ret);
+                ctx->output_thread_error = ret;
+            }
+            break;
+        }
+
+        usleep(10000);  /* Check every 10ms */
+    }
+
+    av_log(avctx, AV_LOG_INFO, "Pre-render trigger thread exiting\n");
+    return NULL;
+}
+
 /* Write frame to shared memory (client mode) */
 static int decklink_shm_write_packet(AVFormatContext *avctx, AVPacket *pkt, int type)
 {
@@ -1222,6 +1439,14 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
         av_log(avctx, AV_LOG_INFO, "Shared memory client finished\n");
         av_freep(&cctx->ctx);
         return 0;
+    }
+
+    /* Stop pre-render trigger thread first */
+    if (ctx->pre_render_trigger_started) {
+        ctx->pre_render_trigger_stop = 1;
+        pthread_join(ctx->pre_render_trigger_thread, NULL);
+        ctx->pre_render_trigger_started = 0;
+        av_log(avctx, AV_LOG_INFO, "Pre-render trigger thread stopped\n");
     }
 
     /* Stop shared memory first so no more frames come in */
@@ -2752,6 +2977,157 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
             return ret;
         }
         av_log(avctx, AV_LOG_INFO, "Running in shared memory client mode\n");
+        return 0;
+    }
+
+    /* Pre-render mode - buffer frames before initializing DeckLink */
+    if (cctx->pre_render) {
+        ctx->avctx = avctx;
+        ctx->pre_render_mode = 1;
+        ctx->pre_render_device_ready = 0;
+
+        /* Parse time trigger if specified */
+        if (cctx->pre_render_until) {
+            ctx->pre_render_start_time = parse_pre_render_time(cctx->pre_render_until);
+            if (ctx->pre_render_start_time > 0) {
+                time_t start_sec = ctx->pre_render_start_time / 1000000LL;
+                struct tm *tm_start = localtime(&start_sec);
+                char time_buf[64];
+                strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_start);
+                av_log(avctx, AV_LOG_INFO, "Pre-render: will start playback at %s\n", time_buf);
+            } else {
+                av_log(avctx, AV_LOG_ERROR, "Pre-render: invalid time format '%s'\n", cctx->pre_render_until);
+                av_freep(&cctx->ctx);
+                return AVERROR(EINVAL);
+            }
+        }
+
+        /* Set frame trigger if specified */
+        ctx->pre_render_target_frames = cctx->pre_render_frames;
+        if (ctx->pre_render_target_frames > 0) {
+            av_log(avctx, AV_LOG_INFO, "Pre-render: will start playback after %d frames buffered\n",
+                   ctx->pre_render_target_frames);
+        }
+
+        /* Extract video format from streams */
+        for (n = 0; n < avctx->nb_streams; n++) {
+            AVStream *st = avctx->streams[n];
+            AVCodecParameters *c = st->codecpar;
+            if (c->codec_type == AVMEDIA_TYPE_VIDEO) {
+                ctx->deferred_video_width = c->width;
+                ctx->deferred_video_height = c->height;
+                ctx->deferred_video_tb = st->time_base;
+                ctx->deferred_video_field_order = c->field_order;
+                ctx->video_st = st;
+                ctx->video = 1;
+
+                /* Validate codec */
+                if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+                    if (c->format != AV_PIX_FMT_UYVY422) {
+                        av_log(avctx, AV_LOG_ERROR, "Pre-render: unsupported pixel format\n");
+                        av_freep(&cctx->ctx);
+                        return AVERROR(EINVAL);
+                    }
+                    ctx->raw_format = bmdFormat8BitYUV;
+                } else if (c->codec_id == AV_CODEC_ID_V210) {
+                    ctx->raw_format = bmdFormat10BitYUV;
+                } else {
+                    av_log(avctx, AV_LOG_ERROR, "Pre-render: unsupported video codec\n");
+                    av_freep(&cctx->ctx);
+                    return AVERROR(EINVAL);
+                }
+
+                /* Set pts info for proper timing */
+                avpriv_set_pts_info(st, 64, st->time_base.num, st->time_base.den);
+                break;
+            }
+        }
+
+        /* Extract audio format from streams */
+        for (n = 0; n < avctx->nb_streams; n++) {
+            AVStream *st = avctx->streams[n];
+            AVCodecParameters *c = st->codecpar;
+            if (c->codec_type == AVMEDIA_TYPE_AUDIO) {
+                ctx->audio_st = st;
+                ctx->audio = 1;
+                if (c->codec_id == AV_CODEC_ID_AC3) {
+                    ctx->channels = 2;
+                } else {
+                    ctx->channels = c->ch_layout.nb_channels;
+                }
+                ctx->audio_depth = c->bits_per_raw_sample == 32 ? 32 : 16;
+                avpriv_set_pts_info(st, 64, 1, 48000);
+                break;
+            }
+        }
+
+        if (!ctx->video) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: no video stream found\n");
+            av_freep(&cctx->ctx);
+            return AVERROR(EINVAL);
+        }
+
+        /* Pre-render requires output_buffer_size */
+        if (cctx->output_buffer_size <= 0) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render mode requires output_buffer_size to be set\n");
+            av_freep(&cctx->ctx);
+            return AVERROR(EINVAL);
+        }
+
+        /* Initialize output buffers */
+        int64_t total_ram = get_total_system_ram();
+        int64_t max_buffer_size = cctx->output_buffer_size;
+        if (total_ram > 0) {
+            int64_t ram_limit = (int64_t)(total_ram * 0.8);
+            if (cctx->output_buffer_size > ram_limit)
+                max_buffer_size = ram_limit;
+        }
+        int64_t audio_buffer_size = FFMAX(max_buffer_size / 20, 100 * 1024 * 1024);
+        int64_t video_buffer_size = FFMAX(max_buffer_size - audio_buffer_size, 100 * 1024 * 1024);
+
+        ctx->output_thread_stop = 0;
+        ctx->output_thread_error = 0;
+        ff_decklink_packet_queue_init(avctx, &ctx->output_video_queue, video_buffer_size);
+        ff_decklink_packet_queue_init(avctx, &ctx->output_audio_queue, audio_buffer_size);
+
+        /* Create output threads (they will wait for device ready) */
+        ret = pthread_create(&ctx->output_video_thread, NULL, decklink_video_output_thread, ctx);
+        if (ret != 0) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: failed to create video output thread\n");
+            ff_decklink_packet_queue_end(&ctx->output_video_queue);
+            ff_decklink_packet_queue_end(&ctx->output_audio_queue);
+            av_freep(&cctx->ctx);
+            return AVERROR(ret);
+        }
+
+        ret = pthread_create(&ctx->output_audio_thread, NULL, decklink_audio_output_thread, ctx);
+        if (ret != 0) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: failed to create audio output thread\n");
+            ctx->output_thread_stop = 1;
+            pthread_join(ctx->output_video_thread, NULL);
+            ff_decklink_packet_queue_end(&ctx->output_video_queue);
+            ff_decklink_packet_queue_end(&ctx->output_audio_queue);
+            av_freep(&cctx->ctx);
+            return AVERROR(ret);
+        }
+        ctx->output_thread_started = 1;
+
+        /* Start trigger thread to monitor conditions and initialize device */
+        ctx->pre_render_trigger_stop = 0;
+        ret = pthread_create(&ctx->pre_render_trigger_thread, NULL, decklink_pre_render_trigger_thread, ctx);
+        if (ret != 0) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: failed to create trigger thread\n");
+            ctx->output_thread_stop = 1;
+            pthread_join(ctx->output_video_thread, NULL);
+            pthread_join(ctx->output_audio_thread, NULL);
+            ff_decklink_packet_queue_end(&ctx->output_video_queue);
+            ff_decklink_packet_queue_end(&ctx->output_audio_queue);
+            av_freep(&cctx->ctx);
+            return AVERROR(ret);
+        }
+        ctx->pre_render_trigger_started = 1;
+
+        av_log(avctx, AV_LOG_INFO, "Pre-render mode enabled: buffering frames until trigger\n");
         return 0;
     }
 

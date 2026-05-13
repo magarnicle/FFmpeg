@@ -96,6 +96,11 @@ struct decklink_cctx {
     int shm_client;
     int shm_max_frames;
     int shm_block;  /* Block indefinitely when buffer full */
+
+    /* Pre-render options */
+    int pre_render;           /* Enable pre-render mode */
+    char *pre_render_until;   /* Wall clock time to start playback (HH:MM:SS or Unix timestamp) */
+    int pre_render_frames;    /* Number of frames to buffer before starting (0 = use time trigger) */
 };
 
 #endif /* AVDEVICE_DECKLINK_COMMON_C_H */

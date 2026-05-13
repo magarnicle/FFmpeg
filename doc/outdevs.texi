@@ -270,6 +270,31 @@ Set to @option{0} to disable the error threshold (always drop late frames,
 never error).
 Defaults to @option{5.0}.
 
+@item pre_render
+Enable pre-render mode. When enabled, FFmpeg buffers frames without
+initializing the DeckLink device, waiting for a trigger condition before
+starting playback. This allows building up a buffer before going on-air
+or scheduling playback at a specific time.
+
+Requires @option{output_buffer_size} to be set.
+Defaults to @option{0} (disabled).
+
+@item pre_render_until
+Sets the wall clock time to start playback in pre-render mode. Can be
+specified as @samp{HH:MM:SS} (24-hour format, uses today's date, or tomorrow
+if the time has passed) or as a Unix timestamp in seconds.
+
+When this time is reached, the DeckLink device is initialized and playback
+begins from the buffered frames.
+
+@item pre_render_frames
+Sets the number of frames to buffer before starting playback in pre-render
+mode. When the buffer reaches this count, the DeckLink device is initialized
+and playback begins.
+
+Set to @option{0} to use time-based triggering via @option{pre_render_until}.
+Defaults to @option{0}.
+
 @end table
 
 @subsection Examples
@@ -305,6 +330,22 @@ Play with async buffering (pre-render complex filtergraph, 10GB buffer, error if
 @example
 ffmpeg -i test.avi -vf "complex_filtergraph" -f decklink -pix_fmt uyvy422 \
     -output_buffer_size 10000000000 -late_threshold 10 'DeckLink Mini Monitor'
+@end example
+
+@item
+Pre-render and start playback at a specific time (2:30 PM):
+@example
+ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 \
+    -output_buffer_size 2000000000 -pre_render 1 -pre_render_until 14:30:00 \
+    'DeckLink Mini Monitor'
+@end example
+
+@item
+Pre-render 250 frames (~10 seconds at 25fps) before starting playback:
+@example
+ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 \
+    -output_buffer_size 2000000000 -pre_render 1 -pre_render_frames 250 \
+    'DeckLink Mini Monitor'
 @end example
 
 @end itemize

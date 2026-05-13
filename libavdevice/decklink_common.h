@@ -228,6 +228,21 @@ struct decklink_ctx {
     int output_thread_stop;
     int output_thread_error;   // Fatal error from output thread
     AVFormatContext *avctx;  // for consumer thread access
+
+    /* Pre-render state */
+    int pre_render_mode;          /* 0=normal, 1=buffering, 2=triggered/playing */
+    int64_t pre_render_start_time; /* Unix timestamp (microseconds) when playback should start */
+    int pre_render_target_frames;  /* Number of frames to buffer before starting */
+    int pre_render_device_ready;   /* Device initialization complete */
+    pthread_t pre_render_trigger_thread;
+    int pre_render_trigger_started;
+    int pre_render_trigger_stop;
+
+    /* Stored format info for deferred device init */
+    int deferred_video_width;
+    int deferred_video_height;
+    AVRational deferred_video_tb;
+    int deferred_video_field_order;
 };
 
 typedef enum { DIRECTION_IN, DIRECTION_OUT} decklink_direction_t;
