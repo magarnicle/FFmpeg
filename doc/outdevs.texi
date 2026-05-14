@@ -280,9 +280,10 @@ Requires @option{output_buffer_size} to be set.
 Defaults to @option{0} (disabled).
 
 @item pre_render_until
-Sets the wall clock time to start playback in pre-render mode. Can be
-specified as @samp{HH:MM:SS} (24-hour format, uses today's date, or tomorrow
-if the time has passed) or as a Unix timestamp in seconds.
+Sets the wall clock time to start playback in pre-render mode. Must be
+specified in ISO 8601 format with UTC timezone:
+@samp{YYYY-MM-DDTHH:MM:SS.ffffffZ} (e.g., @samp{2026-05-14T14:30:00.000000Z}).
+The fractional seconds are optional (e.g., @samp{2026-05-14T14:30:00Z} is valid).
 
 When this time is reached, the DeckLink device is initialized and playback
 begins from the buffered frames.
@@ -333,11 +334,11 @@ ffmpeg -i test.avi -vf "complex_filtergraph" -f decklink -pix_fmt uyvy422 \
 @end example
 
 @item
-Pre-render and start playback at a specific time (2:30 PM):
+Pre-render and start playback at a specific UTC time:
 @example
 ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 \
-    -output_buffer_size 2000000000 -pre_render 1 -pre_render_until 14:30:00 \
-    'DeckLink Mini Monitor'
+    -output_buffer_size 2000000000 -pre_render 1 \
+    -pre_render_until 2026-05-14T14:30:00Z 'DeckLink Mini Monitor'
 @end example
 
 @item

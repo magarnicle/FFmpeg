@@ -976,34 +976,47 @@ static int64_t parse_pre_render_time(const char *time_str)
     if (!time_str || !*time_str)
         return 0;
 
-    /* Try HH:MM:SS format first */
-    int hour, min, sec;
-    if (sscanf(time_str, "%d:%d:%d", &hour, &min, &sec) == 3) {
-        /* Get current time and compute target time today */
-        time_t now = time(NULL);
-        struct tm *tm_now = localtime(&now);
-        struct tm tm_target = *tm_now;
-        tm_target.tm_hour = hour;
-        tm_target.tm_min = min;
-        tm_target.tm_sec = sec;
-        time_t target = mktime(&tm_target);
-        /* If time has passed today, assume tomorrow */
-        if (target <= now)
-            target += 24 * 60 * 60;
-        return (int64_t)target * 1000000LL;
+    /* Parse ISO 8601 format: YYYY-MM-DDTHH:MM:SS[.ffffff]Z (UTC) */
+    int year, month, day, hour, min, sec;
+    int n;
+
+    n = sscanf(time_str, "%d-%d-%dT%d:%d:%d",
+               &year, &month, &day, &hour, &min, &sec);
+    if (n != 6)
+        return 0;  /* Invalid format */
+
+    /* Verify Z suffix (must be UTC) */
+    const char *z = strrchr(time_str, 'Z');
+    if (!z || z[1] != '\0')
+        return 0;  /* Must end with Z */
+
+    /* Find and parse fractional seconds if present */
+    int64_t microsec = 0;
+    const char *dot = strchr(time_str, '.');
+    if (dot && dot < z) {
+        char frac_buf[7] = "000000";
+        const char *frac_start = dot + 1;
+        int i = 0;
+        while (*frac_start >= '0' && *frac_start <= '9' && i < 6) {
+            frac_buf[i++] = *frac_start++;
+        }
+        microsec = strtol(frac_buf, NULL, 10);
     }
 
-    /* Try Unix timestamp (seconds or microseconds) */
-    char *endptr;
-    int64_t ts = strtoll(time_str, &endptr, 10);
-    if (*endptr == '\0' && ts > 0) {
-        /* If value is small enough to be seconds, convert to microseconds */
-        if (ts < 1e12)
-            ts *= 1000000LL;
-        return ts;
-    }
+    /* Convert to Unix timestamp (UTC) using timegm */
+    struct tm tm_utc = {0};
+    tm_utc.tm_year = year - 1900;
+    tm_utc.tm_mon = month - 1;
+    tm_utc.tm_mday = day;
+    tm_utc.tm_hour = hour;
+    tm_utc.tm_min = min;
+    tm_utc.tm_sec = sec;
 
-    return 0;  /* Invalid format */
+    time_t target = timegm(&tm_utc);
+    if (target == (time_t)-1)
+        return 0;
+
+    return (int64_t)target * 1000000LL + microsec;
 }
 
 /* Pre-render mode: complete device initialization (called when trigger fires) */
