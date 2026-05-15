@@ -71,6 +71,7 @@ typedef struct CEA608EmbedContext {
     int roll_up;            /* Roll-up rows (0=pop-on, 2-4=roll-up) */
     int data_field;         /* 0=field1, 1=field2 */
     int start_row;          /* Starting row (0=auto) */
+    int continuous;         /* Output padding when no caption data */
 
     /* Subtitle events */
     SubtitleEvent *events;
@@ -988,10 +989,17 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVF
     }
 
     /* Inject single CC triplet as side data */
-    if (have_output) {
+    if (have_output || ctx->continuous) {
         AVFrameSideData *sd = av_frame_new_side_data(frame, AV_FRAME_DATA_A53_CC, 3);
         if (sd) {
-            memcpy(sd->data, out_triplet, 3);
+            if (have_output) {
+                memcpy(sd->data, out_triplet, 3);
+            } else {
+                /* Output padding: null characters (0x80 with odd parity) */
+                sd->data[0] = ctx->data_field ? 0xFD : 0xFC;
+                sd->data[1] = 0x80;
+                sd->data[2] = 0x80;
+            }
         } else {
             av_log(avctx, AV_LOG_WARNING, "Failed to allocate CC side data\n");
         }
@@ -1083,6 +1091,7 @@ static const AVOption cea608embed_options[] = {
     { "roll_up",  "roll-up mode (0=pop-on, 2-4=roll-up rows)", OFFSET(roll_up), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 4, FLAGS },
     { "data_field", "select data field (0=first, 1=second)", OFFSET(data_field), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, FLAGS },
     { "start_row", "starting row (0=auto, 1-15=fixed)", OFFSET(start_row), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 15, FLAGS },
+    { "continuous", "output padding when no caption data", OFFSET(continuous), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
     { NULL }
 };
 
