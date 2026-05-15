@@ -235,6 +235,13 @@ Enable SMPTE Level A mode on the used output.
 Must be @samp{unset}, @samp{true} or @samp{false}.
 Defaults to @option{unset}.
 
+@item audio_output
+Sets the audio output connection. Must be @samp{unset}, @samp{aes_ebu} or
+@samp{analog}. This controls the audio output routing for cards that have
+switchable AES/EBU and analog outputs. SDI embedded audio is always enabled
+and does not require this option.
+Defaults to @samp{unset}.
+
 @item vanc_queue_size
 Sets maximum output buffer size in bytes for VANC data. If the buffering reaches this value,
 outgoing VANC data will be dropped.
