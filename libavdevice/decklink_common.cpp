@@ -154,6 +154,28 @@ static int decklink_select_input(AVFormatContext *avctx, BMDDeckLinkConfiguratio
     return 0;
 }
 
+static int decklink_select_audio_output(AVFormatContext *avctx)
+{
+    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    HRESULT res;
+
+    if (cctx->audio_output) {
+        BMDAudioOutputAnalogAESSwitch bmd_switch = (cctx->audio_output == 1) ?
+            bmdAudioOutputSwitchAESEBU : bmdAudioOutputSwitchAnalog;
+        res = ctx->cfg->SetInt(bmdDeckLinkConfigAudioOutputAESAnalogSwitch, bmd_switch);
+        if (res != S_OK) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to set audio output to %s "
+                   "(device may not support switchable audio outputs).\n",
+                   (cctx->audio_output == 1) ? "AES/EBU" : "analog");
+        } else {
+            av_log(avctx, AV_LOG_VERBOSE, "Successfully set audio output to %s.\n",
+                   (cctx->audio_output == 1) ? "AES/EBU" : "analog");
+        }
+    }
+    return 0;
+}
+
 static DECKLINK_BOOL field_order_eq(enum AVFieldOrder field_order, BMDFieldDominance bmd_field_order)
 {
     if (field_order == AV_FIELD_UNKNOWN)
@@ -216,6 +238,11 @@ int ff_decklink_set_configs(AVFormatContext *avctx,
         if (ret < 0)
             return ret;
         ret = decklink_select_input(avctx, bmdDeckLinkConfigVideoInputConnection);
+        if (ret < 0)
+            return ret;
+    }
+    if (direction == DIRECTION_OUT) {
+        int ret = decklink_select_audio_output(avctx);
         if (ret < 0)
             return ret;
     }
