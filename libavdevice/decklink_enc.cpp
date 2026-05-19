@@ -2016,7 +2016,8 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  *   Word 3: Y4[9:0], Cr2[9:0], Y5[9:0], xx
  */
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
-                                            const uint8_t *teletext_data, int data_len)
+                                            const uint8_t *teletext_data, int data_len,
+                                            int vbi_offset)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -2026,11 +2027,12 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
     const int FP_SHIFT = 8;
 
-    /* 10-bit luma levels for teletext signal per ETS 300 706 / ITU-R BT.653-3
-     * Logic 1: 66% of peak white above black = 64 + 0.66*(940-64) = 642
-     * Logic 0: Black level (0 IRE) = 64
+    /* 10-bit luma levels for teletext signal per OP-42 Section 3
+     * Binary "1": 70% +/- 3% of peak white = 64 + 0.70*(940-64) = 677
+     * Binary "0": 0% +/- 2% (black level) = 64
+     * Note: ETS 300 706 specifies 66%, but OP-42 requires 70% for Australian broadcast
      */
-    const uint16_t LUMA_HIGH = 642;   /* 66% per ETS 300 706 */
+    const uint16_t LUMA_HIGH = 677;   /* 70% per OP-42 */
     const uint16_t LUMA_LOW  = 64;    /* Black level (0 IRE) */
     const uint16_t LUMA_BLACK = 64;   /* Black level */
     const uint16_t CHROMA_NEUTRAL = 512;  /* Neutral chroma */
@@ -2040,12 +2042,20 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     for (int i = 0; i < 720; i++)
         luma[i] = LUMA_BLACK;
 
-    /* Start position for teletext data
-     * Per ETS 300 706, clock run-in starts at 10.3µs from 0H.
-     * DeckLink VBI buffer may include blanking, so start near beginning.
-     * TODO: May need adjustment based on actual DeckLink buffer layout.
+    /* Start position for teletext data in the VBI buffer
+     *
+     * The DeckLink VBI buffer is 720 samples (same width as PAL active video).
+     * The teletext waveform requires approximately 700 samples:
+     *   - 16 bits clock run-in × 1.946 samples/bit = 31 samples
+     *   - 8 bits framing code × 1.946 = 16 samples
+     *   - 336 bits data × 1.946 = 654 samples
+     *   - Total: ~700 samples
+     *
+     * To fit the waveform within the buffer: max start = 720 - 700 = 20 samples.
+     * The vbi_offset parameter (configurable via -teletext_vbi_offset) sets
+     * the start position, defaulting to 18.
      */
-    int pixel_pos = 0;
+    int pixel_pos = vbi_offset;
     int bit_pos_fp = 0;
 
     /* Generate clock run-in: 16 bits of alternating 1/0, starting with 1 */
@@ -2105,38 +2115,55 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     }
 }
 
-/* Filler teletext packet: magazine 8, row 23 with 40 spaces
- * Used when no new teletext data is available to maintain decoder sync.
- * MRAG uses Hamming 8/4 encoding per ITU-R BT.653-3:
- *   Byte 0: M1=0, R0=1, M2=0, R1=1 -> 0x8C
- *   Byte 1: R2=1, R3=0, R4=1, M3=0 -> 0x73
- * Data bytes: 0x20 (space with odd parity)
+/* Dummy header teletext packet per OP-42 Section 8 (Time Filling Headers)
+ * Magazine 8 (encoded as 0), Row 0 (page header), Page FF
+ *
+ * Per OP-42: "time filling headers... are by convention 0,FF (Magazine 0
+ * known as 8, page FF) with a subcode of 0x3F7E"
+ *
+ * Page header structure per ETS 300 706:
+ *   Bytes 0-1:   MRAG (magazine 8 encoded as 0, row 0)
+ *   Bytes 2-3:   Page FF
+ *   Bytes 4-9:   Subcode + C4-C7 (all 0 for dummy header)
+ *   Bytes 10-11: C8-C14 (all 0)
+ *   Bytes 12-41: 30 display characters (spaces)
+ *
+ * Hamming 8/4 values: ham84(0)=0x15, ham84(0xF)=0xEA
  */
 static const uint8_t teletext_filler_packet[42] = {
-    0x8C, 0x73,  /* MRAG: magazine 8, row 23 */
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 40 spaces */
+    0x15, 0x15,  /* MRAG: magazine 8 (encoded 0), row 0 */
+    0xEA, 0xEA,  /* Page FF (units=F, tens=F) */
+    0x15, 0x15,  /* S1 low, S1 high + C4=0 */
+    0x15, 0x15,  /* S2 low, S2 high + C5=0 */
+    0x15, 0x15,  /* S3, S4 + C6=0 + C7=0 */
+    0x15, 0x15,  /* C8-C11=0, C12-C14=0 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 30 spaces */
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
 /* Filler teletext data unit for HD VANC (OP-47 SDP format)
- * Structure: data_unit_id (0x03=subtitle), length (0x2C=44),
+ * Contains dummy header per OP-42 Section 8 (page 8FF)
+ * Structure: data_unit_id (0x02=non-subtitle), length (0x2C=44),
  *            field/line (0x00), framing_code (0xE4),
- *            42-byte payload (MRAG for M8/row23 + 40 spaces)
+ *            42-byte payload (dummy header for page 8FF)
  */
 static const uint8_t teletext_filler_data_unit[46] = {
-    0x03,        /* data_unit_id: EBU teletext subtitle */
+    0x02,        /* data_unit_id: EBU teletext non-subtitle (dummy header) */
     0x2C,        /* data_unit_length: 44 */
     0x00,        /* reserved/field/line */
     0xE4,        /* framing_code */
-    0x8C, 0x73,  /* MRAG: magazine 8, row 23 */
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 40 spaces */
+    0x15, 0x15,  /* MRAG: magazine 8 (encoded 0), row 0 */
+    0xEA, 0xEA,  /* Page FF (units=F, tens=F) */
+    0x15, 0x15,  /* S1 low, S1 high + C4=0 */
+    0x15, 0x15,  /* S2 low, S2 high + C5=0 */
+    0x15, 0x15,  /* S3, S4 + C6=0 + C7=0 */
+    0x15, 0x15,  /* C8-C11=0, C12-C14=0 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 30 spaces */
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
 /* Insert OP-47 VANC packet on specified line */
@@ -2275,7 +2302,7 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                        teletext_data, 42);
+                                        teletext_data, 42, ctx->teletext_vbi_offset);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -2962,6 +2989,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->block_until_available      = cctx->block_until_available;
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
+    ctx->teletext_vbi_offset = cctx->teletext_vbi_offset;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))

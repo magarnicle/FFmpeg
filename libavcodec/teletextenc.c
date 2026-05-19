@@ -82,9 +82,13 @@ uint8_t ff_teletext_odd_parity(uint8_t c)
 
 typedef struct TeletextEncContext {
     AVClass *class;
-    int page;           /* Page number (100-899) */
-    int magazine;       /* Magazine number (1-8) */
-    int region;         /* Character set region (0-15) */
+    int page;             /* Page number (100-899) */
+    int magazine;         /* Magazine number (1-8) */
+    int region;           /* Character set region (0-15) */
+    int double_height;    /* Use double height text (OP-42 4d) */
+    int erase_page;       /* C4: Erase page flag (OP-42 4h) */
+    int update_indicator; /* C8: Update indicator flag (OP-42 4g) */
+    int subtitle_flag;    /* C6: Subtitle indicator flag (OP-42 4f) */
 
     /* Internal state */
     uint16_t page_bcd;  /* Page number in BCD */
@@ -275,6 +279,7 @@ static void clear_page_buffer(TeletextEncContext *ctx)
 
 /**
  * Write text to page buffer at specified row
+ * Optionally applies double height formatting per OP-42 4d
  */
 static void write_to_page(TeletextEncContext *ctx, int row, int col,
                           const uint8_t *text, int len, int color)
@@ -284,8 +289,12 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
     if (col < 0)
         col = 0;
 
+    /* Insert double height code if enabled (OP-42 4d) */
+    if (ctx->double_height && col < TELETEXT_COLS) {
+        ctx->page_buffer[row][col++] = TELETEXT_DOUBLE_HEIGHT;
+    }
+
     /* Insert color code at start if not white */
-    int start_col = col;
     if (color != TELETEXT_ALPHA_WHITE && col < TELETEXT_COLS) {
         ctx->page_buffer[row][col++] = color;
     }
@@ -318,12 +327,34 @@ static void encode_mrag(int mag, int row, uint8_t *byte1, uint8_t *byte2)
 }
 
 /**
- * Build a teletext header row (row 0)
+ * Build a teletext header row (row 0) per ETS 300 706
+ *
+ * Page header structure (42 bytes total):
+ *   Bytes 0-1:   MRAG (Hamming 8/4)
+ *   Bytes 2-3:   Page units, page tens (Hamming 8/4)
+ *   Byte 4:      S1 bits 0-3 (Hamming 8/4)
+ *   Byte 5:      S1 bits 4-6 (bits 0-2) + C4 (bit 3) (Hamming 8/4)
+ *   Byte 6:      S2 bits 0-3 (Hamming 8/4)
+ *   Byte 7:      S2 bits 4-6 (bits 0-2) + C5 (bit 3) (Hamming 8/4)
+ *   Byte 8:      S3 bits 0-3 (Hamming 8/4)
+ *   Byte 9:      S4 bits 0-1 (bits 0-1) + C6 (bit 2) + C7 (bit 3) (Hamming 8/4)
+ *   Byte 10:     C8 (bit 0) + C9 (bit 1) + C10 (bit 2) + C11 (bit 3) (Hamming 8/4)
+ *   Byte 11:     C12-C14 national charset (bits 0-2) + spare (bit 3) (Hamming 8/4)
+ *   Bytes 12-41: 30 characters page header display (odd parity)
+ *
+ * Control bits per OP-42:
+ *   C4 = Erase Page (set to 1 between caption transmissions)
+ *   C5 = Newsflash (0)
+ *   C6 = Subtitle indicator (1 for closed captions)
+ *   C7 = Suppress Header (0)
+ *   C8 = Update Indicator (1 for closed captions)
+ *   C9 = Interrupted Sequence (0)
+ *   C10 = Inhibit Display (0)
+ *   C11 = Magazine Serial (0 for parallel mode per OP-42 4e)
+ *   C12-C14 = National Option Character Subset (region)
  */
 static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
 {
-    /* Clock run-in and framing code are added by data unit builder */
-
     /* Bytes 0-1: Magazine and packet address (row 0 = page header) */
     encode_mrag(ctx->mag_encoded, 0, &line[0], &line[1]);
 
@@ -331,33 +362,33 @@ static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
     line[2] = ff_teletext_ham84(ctx->page_bcd & 0x0F);
     line[3] = ff_teletext_ham84((ctx->page_bcd >> 4) & 0x0F);
 
-    /* Bytes 4-5: Subcode S1 (always 0 for subtitles) */
+    /* Byte 4: S1 bits 0-3 (subcode low nibble) */
     line[4] = ff_teletext_ham84(0);
-    line[5] = ff_teletext_ham84(0);
 
-    /* Bytes 6-7: Subcode S2 + C4 */
+    /* Byte 5: S1 bits 4-6 (bits 0-2) + C4 erase page (bit 3) */
+    line[5] = ff_teletext_ham84(ctx->erase_page ? 0x08 : 0);
+
+    /* Byte 6: S2 bits 0-3 (subcode low nibble) */
     line[6] = ff_teletext_ham84(0);
-    line[7] = ff_teletext_ham84(0);
 
-    /* Bytes 8-9: Subcode S3 + C5,C6 */
+    /* Byte 7: S2 bits 4-6 (bits 0-2) + C5 newsflash (bit 3) */
+    line[7] = ff_teletext_ham84(0);  /* C5 = 0 */
+
+    /* Byte 8: S3 bits 0-3 */
     line[8] = ff_teletext_ham84(0);
-    /* C5=0 (no newsflash), C6=1 (subtitle), C7=0 (no header inhibit) */
-    line[9] = ff_teletext_ham84(0x02);  /* C6 set = subtitle */
 
-    /* Bytes 10-11: Subcode S4 + C8-C11 */
-    line[10] = ff_teletext_ham84(0);
-    /* C8=0, C9=0, C10=0 (serial), C11=0 (region) */
+    /* Byte 9: S4 bits 0-1 (bits 0-1) + C6 subtitle (bit 2) + C7 suppress header (bit 3) */
+    line[9] = ff_teletext_ham84(ctx->subtitle_flag ? 0x04 : 0);  /* C6 at bit 2 */
+
+    /* Byte 10: C8 update (bit 0) + C9 interrupted (bit 1) + C10 inhibit (bit 2) + C11 serial (bit 3) */
+    line[10] = ff_teletext_ham84(ctx->update_indicator ? 0x01 : 0);  /* C8 at bit 0, C11=0 for parallel */
+
+    /* Byte 11: C12-C14 national option charset = region (bits 0-2) + spare (bit 3) */
     line[11] = ff_teletext_ham84(ctx->region & 0x07);
 
-    /* Bytes 12-31: Page header display (20 characters with parity) */
-    const char *header = "                    ";  /* 20 spaces */
-    for (int i = 0; i < 20; i++) {
-        line[12 + i] = ff_teletext_odd_parity(header[i]);
-    }
-
-    /* Bytes 32-41: More header space (10 characters) */
-    for (int i = 0; i < 10; i++) {
-        line[32 + i] = ff_teletext_odd_parity(' ');
+    /* Bytes 12-41: 30 characters page header display (odd parity) */
+    for (int i = 0; i < 30; i++) {
+        line[12 + i] = ff_teletext_odd_parity(' ');
     }
 }
 
@@ -594,6 +625,10 @@ static const AVOption teletext_options[] = {
     { "page", "Teletext page number (100-899)", OFFSET(page), AV_OPT_TYPE_INT, { .i64 = 888 }, 100, 899, VE },
     { "magazine", "Magazine number (1-8)", OFFSET(magazine), AV_OPT_TYPE_INT, { .i64 = 8 }, 1, 8, VE },
     { "region", "Character set region (0-15)", OFFSET(region), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 15, VE },
+    { "double_height", "Use double height text (OP-42 4d)", OFFSET(double_height), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "erase_page", "C4: Erase page between transmissions (OP-42 4h)", OFFSET(erase_page), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "update_indicator", "C8: Update indicator flag (OP-42 4g)", OFFSET(update_indicator), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "subtitle_flag", "C6: Subtitle indicator flag (OP-42 4f)", OFFSET(subtitle_flag), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { NULL }
 };
 
