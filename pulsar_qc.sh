@@ -26,9 +26,11 @@ echo "============================================" | tee -a "$REPORT"
 
 ERRORS=0
 WARNINGS=0
+CURIOSITIES=0
 
 error() { echo "[ERROR] $1" | tee -a "$REPORT"; ((ERRORS++)); }
 warn()  { echo "[WARN]  $1" | tee -a "$REPORT"; ((WARNINGS++)); }
+curio()  { echo "[CURIO]  $1" | tee -a "$REPORT"; ((CURIOSITIES++)); }
 info()  { echo "[INFO]  $1" | tee -a "$REPORT"; }
 
 # ============================================================
@@ -173,8 +175,8 @@ info "Running all quality checks in one pass..."
              #solidcolordetect=d=0.1:grid=3:section_th=0.02 potentially only this is needed
 QC_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -i "$INPUT" \
     -filter_complex "
-        [0:v]blackdetect=d=3:pix_th=0.0784:pic_th=0.98,
-             solidcolordetect=d=0.1:grid=3:section_th=0.02:pix_th=0.05:pic_th=0.99:dev_th=0.60,
+        [0:v]solidcolordetect@batman=d=3:grid=3:section_th=0.02:pix_th=0.05:pic_th=0.99:dev_th=0.60,
+             solidcolordetect@robin=d=0.1:grid=9:section_th=0.05:pix_th=0.1:pic_th=0.99:dev_th=0.55,
              freezedetect=n=0.001:d=20,
              colorbarsdetect=d=0.5[vout];
         [0:a]asplit=4[a1][a2][a3][a4];
@@ -190,22 +192,31 @@ QC_OUTPUT=$($FFMPEG -noprogress -nostdin -hide_banner -i "$INPUT" \
 echo "" | tee -a "$REPORT"
 echo "--- VIDEO QUALITY ---" | tee -a "$REPORT"
 
+get_screenshots() {
+    start="$(echo "$1" | grep -o "start: \d+" | sed -e "s/start: //")"
+    end="$(echo "$1" | grep -o "end: \d+" | sed -e "s/end: //")"
+    duration=$(( end - start ))
+    mkdir -p $REPORT_DIR/$2
+    echo ffmpeg -ss $start -i "$INPUT" -r 3 -t $duration "$REPORT_DIR/$2/screenshots_%02.jpg" | tee -a "$REPORT"
+}
 # Black frames
-BLACKDETECT=$(echo "$QC_OUTPUT" | grep "black_start:" || true)
+BLACKDETECT=$(echo "$QC_OUTPUT" | grep "batman.*solid_start:" | grep "color:black"  || true)
 if [[ -n "$BLACKDETECT" ]]; then
     echo "$BLACKDETECT" | tee -a "$REPORT"
     warn "Black frames detected"
+    get_screenshots "$BLACKDETECT" "black_frames"
 else
     info "No black frames detected"
 fi
 
 # Solid color frames (excluding black, which blackdetect handles)
-SOLIDCOLOR=$(echo "$QC_OUTPUT" | grep "solid_start:" | grep -v "color:black" || true)
+SOLIDCOLOR=$(echo "$QC_OUTPUT" | grep "robin.*solid_start:" | grep -v "color:black" || true)
 if [[ -n "$SOLIDCOLOR" ]]; then
     echo "$SOLIDCOLOR" | tee -a "$REPORT"
-    warn "Solid color frames detected"
+    curio "Solid colour frames detected"
+    get_screenshots "$SOLIDCOLOR" "coloured_frames"
 else
-    info "No solid color frames detected"
+    info "No solid colour frames detected"
 fi
 
 # Freeze frames
@@ -213,6 +224,7 @@ FREEZEDETECT=$(echo "$QC_OUTPUT" | grep "freezedetect" || true)
 if [[ -n "$FREEZEDETECT" ]]; then
     echo "$FREEZEDETECT" | tee -a "$REPORT"
     error "Freeze frames detected"
+    get_screenshots "$FREEZEDETECT"f "freeze_frames"
 else
     info "No freeze frames detected"
 fi
@@ -221,9 +233,10 @@ fi
 COLORBARS=$(echo "$QC_OUTPUT" | grep "colorbars_type" || true)
 if [[ -n "$COLORBARS" ]]; then
     echo "$COLORBARS" | tee -a "$REPORT"
-    error "Color bars detected"
+    error "Colour bars detected"
+    get_screenshots "$COLORBARS" "colour_bars"
 else
-    info "No color bars detected"
+    info "No colour bars detected"
 fi
 
 echo "" | tee -a "$REPORT"

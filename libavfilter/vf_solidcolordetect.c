@@ -556,8 +556,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
         /* Reject frame if max deviation exceeds dev_th */
         dev_th_i = full ? s->dev_th * max :
             s->dev_th * (235 - 16) * factor;
-        if (frame_dev > dev_th_i)
+
+        av_log(ctx, AV_LOG_DEBUG,
+               "DETAIL frame:%"PRId64" ref_y:%u frame_dev:%u dev_th_i:%u Y:%u U:%u V:%u\n",
+               inl->frame_count_out, ref_y, frame_dev, dev_th_i, s->avg_y, s->avg_u, s->avg_v);
+
+        if (frame_dev > dev_th_i) {
+            av_log(ctx, AV_LOG_DEBUG, "REJECT frame:%"PRId64" - frame_dev:%u > dev_th_i:%u\n",
+                   inl->frame_count_out, frame_dev, dev_th_i);
             picture_ratio = 0;
+        }
 
         /* Grid uniformity check: reject frames with non-uniform sections */
         if (picture_ratio >= s->picture_ratio_th && s->grid_size > 0) {
@@ -565,6 +573,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
             int chroma_h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
             unsigned section_tol_i = full ? s->section_th * max :
                 s->section_th * (235 - 16) * factor;
+
+            av_log(ctx, AV_LOG_DEBUG,
+                   "GRID frame:%"PRId64" grid_size:%d section_tol_i:%u\n",
+                   inl->frame_count_out, s->grid_size, section_tol_i);
+
             int uniform = check_grid_uniformity(
                 picref->data[0], picref->linesize[0],
                 desc->nb_components >= 3 ? picref->data[1] : NULL,
@@ -575,8 +588,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
                 desc->log2_chroma_w, desc->log2_chroma_h,
                 s->avg_y, s->avg_u, s->avg_v,
                 s->grid_size, section_tol_i, s->depth);
-            if (!uniform)
+
+            av_log(ctx, AV_LOG_DEBUG,
+                   "GRID frame:%"PRId64" uniform:%d\n",
+                   inl->frame_count_out, uniform);
+
+            if (!uniform) {
+                av_log(ctx, AV_LOG_DEBUG, "REJECT frame:%"PRId64" - grid not uniform\n",
+                       inl->frame_count_out);
                 picture_ratio = 0;
+            }
         }
 
         if (picture_ratio < s->picture_ratio_th) {
