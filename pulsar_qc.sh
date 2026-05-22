@@ -64,7 +64,7 @@ else
 fi
 
 # MD5 checksum
-MD5=$(md5sum "$INPUT" | awk '{print $1}')
+MD5="" #$(md5sum "$INPUT" | awk '{print $1}')
 info "MD5 Checksum: $MD5"
 
 # ============================================================
@@ -193,11 +193,20 @@ echo "" | tee -a "$REPORT"
 echo "--- VIDEO QUALITY ---" | tee -a "$REPORT"
 
 get_screenshots() {
-    start="$(echo "$1" | grep -o "start: \d+" | sed -e "s/start: //")"
-    end="$(echo "$1" | grep -o "end: \d+" | sed -e "s/end: //")"
-    duration=$(( end - start ))
-    mkdir -p $REPORT_DIR/$2
-    echo ffmpeg -ss $start -i "$INPUT" -r 3 -t $duration "$REPORT_DIR/$2/screenshots_%02.jpg" | tee -a "$REPORT"
+    issue_idx=0                
+    IFS=$'\n\t'
+    for issue in $(echo "$1" | \grep -o "start: \?[[:digit:]]\+.*end: \?[[:digit:]]\+\.[[:digit:]]\+")
+    do                         
+        start="$(echo "$issue" | grep -o "start: \?[[:digit:]]\+.[[:digit:]]\+" | sed -e "s/start: \?//")"
+        start="$(echo "$start - 1" | bc)"
+        end="$(echo "$issue" | grep -o "end: \?[[:digit:]]\+.[[:digit:]]\+" | sed -e "s/end: \?//")"
+        end="$(echo "$end + 1" | bc)"
+        duration=$(echo "$end - $start" | bc | xargs printf "%.2f\n")
+        ss_dir="$REPORT_DIR/$2/${BASENAME%.*}"
+        mkdir -p "$ss_dir"
+        ffmpeg -ss $start -i "$INPUT" -r 15 -t $duration "${ss_dir}/screenshots_${issue_idx}_%03d.jpg" | tee -a "$REPORT"
+        issue_idx=$(( issue_idx + 1 ))
+    done                       
 }
 # Black frames
 BLACKDETECT=$(echo "$QC_OUTPUT" | grep "batman.*solid_start:" | grep "color:black"  || true)
@@ -256,6 +265,7 @@ echo "$QC_OUTPUT" | grep -E "^\s+(I:|LRA:|Threshold:|Peak:)" | grep -v "Stream" 
 
 TOO_LOUD=0
 TOO_QUIET=0
+LOUD_ZONE=0
 TP_OVER=0
 INTEGRATED=$(echo "$QC_OUTPUT" | grep -E "^\s+I:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
 if [[ -n "$INTEGRATED" ]]; then
@@ -267,6 +277,15 @@ if [[ -n "$INTEGRATED" ]]; then
         warn "Integrated loudness is ${INTEGRATED} LKFS, below min -27 LKFS (target -26 +/- 1)"
     else
         info "Integrated loudness: ${INTEGRATED} LKFS (OK, within -25 to -23)"
+    fi
+fi
+
+# Check for loud zones (LRA high = 95th percentile of short-term loudness)
+LRA_HIGH=$(echo "$QC_OUTPUT" | grep -E "^\s+LRA high:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
+if [[ -n "$LRA_HIGH" ]]; then
+    LOUD_ZONE=$(python3 -c "print(1 if $LRA_HIGH > -23 else 0)")
+    if [[ "$LOUD_ZONE" == "1" ]]; then
+        warn "Audio loud zone found with max short-term loudness ${LRA_HIGH} LKFS (exceeds -23 LKFS)"
     fi
 fi
 
