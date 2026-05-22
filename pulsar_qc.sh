@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FILE_DIR="$(dirname "$1")"
 FFPROBE="${SCRIPT_DIR}/ffprobe"
 FFMPEG="${SCRIPT_DIR}/ffmpeg"
-REPORT_DIR="${SCRIPT_DIR}/qc_reports"
+REPORT_DIR="${SCRIPT_DIR}/qc_reports/$(datetime -Is)"
 mkdir -p "$REPORT_DIR"
 BASENAME=$(basename "$INPUT")
 REPORT="$REPORT_DIR/${BASENAME%.*}_qc_report.txt"
