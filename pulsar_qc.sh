@@ -272,20 +272,11 @@ if [[ -n "$INTEGRATED" ]]; then
     TOO_LOUD=$(python3 -c "print(1 if $INTEGRATED > -23 else 0)")
     TOO_QUIET=$(python3 -c "print(1 if $INTEGRATED < -27 else 0)")
     if [[ "$TOO_LOUD" == "1" ]]; then
-        warn "Integrated loudness is ${INTEGRATED} LKFS, exceeds max -23 LKFS (target -24 +/- 1)"
+        warn "Audio loud zone found using OP-59 Integrated Relative method with max loudness value ${INTEGRATED} LKFS"
     elif [[ "$TOO_QUIET" == "1" ]]; then
         warn "Integrated loudness is ${INTEGRATED} LKFS, below min -27 LKFS (target -26 +/- 1)"
     else
-        info "Integrated loudness: ${INTEGRATED} LKFS (OK, within -25 to -23)"
-    fi
-fi
-
-# Check for loud zones (LRA high = 95th percentile of short-term loudness)
-LRA_HIGH=$(echo "$QC_OUTPUT" | grep -E "^\s+LRA high:" | tail -1 | grep -oP '[-0-9.]+' | head -1)
-if [[ -n "$LRA_HIGH" ]]; then
-    LOUD_ZONE=$(python3 -c "print(1 if $LRA_HIGH > -23 else 0)")
-    if [[ "$LOUD_ZONE" == "1" ]]; then
-        warn "Audio loud zone found with max short-term loudness ${LRA_HIGH} LKFS (exceeds -23 LKFS)"
+        info "Integrated loudness: ${INTEGRATED} LKFS (OK, within -27 to -23)"
     fi
 fi
 
