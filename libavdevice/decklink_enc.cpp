@@ -2728,8 +2728,30 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     if (pkt->pts > 2 && buffered <= 2)
         av_log(avctx, AV_LOG_WARNING, "Low video buffer: %d frames. Video may stutter!\n", (int) buffered);
 
-    /* Preroll video frames. */
+    /* Preroll video frames.  Don't tear down audio preroll / start playback
+     * until the audio thread has also buffered roughly preroll-seconds of
+     * audio.  With separate output threads and a fully pre-buffered pipeline
+     * (pre_render), the video thread can otherwise reach the preroll threshold
+     * in microseconds while the audio thread has scheduled only a single
+     * packet; starting playback with the audio stream barely primed makes the
+     * next ScheduleAudioSamples fail (-5).  The audio thread keeps draining
+     * independently, so on the next video packet this re-checks and the audio
+     * buffer is reached almost immediately (well before the 60-frame video
+     * buffer can fill), so there is no stall. */
     if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
+        if (ctx->audio) {
+            uint32_t audio_buffered = 0;
+            /* At least 100ms of audio, and never less than the video preroll. */
+            uint32_t audio_target = FFMAX((uint32_t)(48000 * ctx->preroll), 4800);
+            ctx->dlo->GetBufferedAudioSampleFrameCount(&audio_buffered);
+            if (audio_buffered < audio_target &&
+                ctx->output_audio_queue.nb_packets > 0) {
+                /* Audio thread is still catching up; wait for it before we end
+                 * preroll.  If the audio queue has drained (EOF / very short
+                 * audio) we fall through and start anyway to avoid stalling. */
+                return 0;
+            }
+        }
         av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
         if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
             av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
@@ -2869,9 +2891,12 @@ static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
         outbuf = pkt->data;
     }
 
-    if (ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
-                                       bmdAudioSampleRate48kHz, NULL) != S_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Could not schedule audio samples.\n");
+    HRESULT audio_hr = ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
+                                                      bmdAudioSampleRate48kHz, NULL);
+    if (audio_hr != S_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Could not schedule audio samples."
+               " error %08x (pts=%"PRId64", samples=%d, playback_started=%d).\n",
+               (uint32_t) audio_hr, pkt->pts, sample_count, ctx->playback_started);
         ret = AVERROR(EIO);
     }
 
