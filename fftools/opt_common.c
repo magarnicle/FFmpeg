@@ -1217,11 +1217,12 @@ int init_report(const char *env, FILE **file)
     av_log(NULL, AV_LOG_INFO,
            "%s started on %04d-%02d-%02d at %02d:%02d:%02d\n"
            "Report written to \"%s\"\n"
+           "%s version %s\n"
            "Log level: %d\n",
            program_name,
            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
            tm->tm_hour, tm->tm_min, tm->tm_sec,
-           filename.str, report_file_level);
+           filename.str, program_name, FFMPEG_VERSION, report_file_level);
     av_bprint_finalize(&filename, NULL);
 
     if (file)
