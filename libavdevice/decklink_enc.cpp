@@ -1092,7 +1092,6 @@ static int decklink_pre_render_init_device(AVFormatContext *avctx)
 
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
-    pthread_mutex_init(&ctx->playback_mutex, NULL);
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
 
     /* Enable audio output if we have audio */
@@ -1287,7 +1286,6 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
-    pthread_mutex_init(&ctx->playback_mutex, NULL);
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
 
     av_log(avctx, AV_LOG_DEBUG, "output: %s, preroll: %d, frames buffer size: %d\n",
@@ -1550,7 +1548,6 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 
     pthread_mutex_destroy(&ctx->mutex);
     pthread_cond_destroy(&ctx->cond);
-    pthread_mutex_destroy(&ctx->playback_mutex);
 
 #if CONFIG_LIBKLVANC
     klvanc_context_destroy(ctx->vanc_ctx);
@@ -2731,49 +2728,30 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     if (pkt->pts > 2 && buffered <= 2)
         av_log(avctx, AV_LOG_WARNING, "Low video buffer: %d frames. Video may stutter!\n", (int) buffered);
 
-    /* Preroll video frames.  Don't tear down audio preroll / start playback
-     * until the audio thread has also buffered roughly preroll-seconds of
-     * audio, so playback never starts with the audio stream barely primed. */
+    /* Preroll video frames, then end audio preroll and start playback.
+     *
+     * This transition runs on the video thread WITHOUT a lock and may execute
+     * concurrently with the audio thread's ScheduleAudioSamples().  That is
+     * deliberate: in pre_render the audio thread floods the DeckLink audio
+     * buffer during preroll, and ScheduleAudioSamples() blocks once that buffer
+     * is full - it only drains after StartScheduledPlayback() runs here.  Any
+     * lock held across both would deadlock (audio waits for playback to start,
+     * playback waits for the lock the blocked audio thread holds).  Instead the
+     * audio thread tolerates the brief E_ACCESSDENIED that ScheduleAudioSamples
+     * returns while this transition is in flight (see decklink_schedule_audio_
+     * packet). */
     if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
-        if (ctx->audio) {
-            uint32_t audio_buffered = 0;
-            /* At least 100ms of audio, and never less than the video preroll. */
-            uint32_t audio_target = FFMAX((uint32_t)(48000 * ctx->preroll), 4800);
-            ctx->dlo->GetBufferedAudioSampleFrameCount(&audio_buffered);
-            if (audio_buffered < audio_target &&
-                ctx->output_audio_queue.nb_packets > 0) {
-                /* Audio thread is still catching up; wait for it before we end
-                 * preroll.  If the audio queue has drained (EOF / very short
-                 * audio) we fall through and start anyway to avoid stalling. */
-                return 0;
-            }
-        }
-        /* The preroll->playback transition must not run concurrently with the
-         * audio thread's ScheduleAudioSamples().  EndAudioPreroll() takes the
-         * audio output out of preroll, and a ScheduleAudioSamples() racing that
-         * transition fails with E_ACCESSDENIED (observed -5 in pre_render, where
-         * both threads drain full queues at once).  Serialize via playback_mutex
-         * (also held by the audio thread around ScheduleAudioSamples). */
         av_log(avctx, AV_LOG_DEBUG, "Ending audio preroll.\n");
-        pthread_mutex_lock(&ctx->playback_mutex);
-        HRESULT end_hr = (ctx->audio) ? ctx->dlo->EndAudioPreroll() : S_OK;
-        HRESULT start_hr = S_OK;
-        if (end_hr == S_OK) {
-            av_log(avctx, AV_LOG_INFO, "Starting scheduled playback.\n");
-            start_hr = ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num,
-                                                        ctx->bmd_tb_den, 1.0);
-            if (start_hr == S_OK)
-                ctx->playback_started = 1;
-        }
-        pthread_mutex_unlock(&ctx->playback_mutex);
-        if (end_hr != S_OK) {
+        if (ctx->audio && ctx->dlo->EndAudioPreroll() != S_OK) {
             av_log(avctx, AV_LOG_ERROR, "Could not end audio preroll!\n");
             return AVERROR(EIO);
         }
-        if (start_hr != S_OK) {
+        av_log(avctx, AV_LOG_INFO, "Starting scheduled playback.\n");
+        if (ctx->dlo->StartScheduledPlayback(ctx->first_pts * ctx->bmd_tb_num, ctx->bmd_tb_den, 1.0) != S_OK) {
             av_log(avctx, AV_LOG_ERROR, "Could not start scheduled playback!\n");
             return AVERROR(EIO);
         }
+        ctx->playback_started = 1;
     }
 
     return 0;
@@ -2902,18 +2880,29 @@ static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
         outbuf = pkt->data;
     }
 
-    /* Serialize against the video thread's preroll->playback transition
-     * (EndAudioPreroll/StartScheduledPlayback); scheduling audio concurrently
-     * with that transition fails with E_ACCESSDENIED. */
-    pthread_mutex_lock(&ctx->playback_mutex);
-    HRESULT audio_hr = ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
-                                                      bmdAudioSampleRate48kHz, NULL);
-    int playback_started = ctx->playback_started;
-    pthread_mutex_unlock(&ctx->playback_mutex);
+    /* ScheduleAudioSamples() can briefly return E_ACCESSDENIED (0x80000009)
+     * while the video thread takes the audio stream out of preroll: EndAudio-
+     * Preroll()/StartScheduledPlayback() run concurrently and without a lock
+     * (see decklink_schedule_video_packet for why a lock would deadlock). The
+     * transition completes in well under a millisecond, so retry the same
+     * packet for a bounded window instead of aborting the whole output. */
+    HRESULT audio_hr;
+    int access_denied_retries = 0;
+    for (;;) {
+        audio_hr = ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
+                                                  bmdAudioSampleRate48kHz, NULL);
+        if (audio_hr != E_ACCESSDENIED || access_denied_retries >= 1000)
+            break;
+        if (access_denied_retries == 0)
+            av_log(avctx, AV_LOG_DEBUG, "Audio schedule denied during preroll->playback "
+                   "transition; retrying (pts=%"PRId64").\n", pkt->pts);
+        access_denied_retries++;
+        usleep(1000);
+    }
     if (audio_hr != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Could not schedule audio samples."
-               " error %08x (pts=%"PRId64", samples=%d, playback_started=%d).\n",
-               (uint32_t) audio_hr, pkt->pts, sample_count, playback_started);
+               " error %08x (pts=%"PRId64", samples=%d, playback_started=%d, retries=%d).\n",
+               (uint32_t) audio_hr, pkt->pts, sample_count, ctx->playback_started, access_denied_retries);
         ret = AVERROR(EIO);
     }
 

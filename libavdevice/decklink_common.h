@@ -191,11 +191,6 @@ struct decklink_ctx {
 
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    /* Serializes the preroll->playback transition (EndAudioPreroll/
-     * StartScheduledPlayback on the video thread) against ScheduleAudioSamples
-     * on the audio thread, which otherwise race on the same IDeckLinkOutput
-     * and make audio scheduling fail with E_ACCESSDENIED. */
-    pthread_mutex_t playback_mutex;
     int frames_buffer_available_spots;
     int autodetect;
     int block_until_available;

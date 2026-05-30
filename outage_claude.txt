@@ -1,0 +1,606 @@
+Outage Investigation Summary - outage_20260530082500.log
+======================================================
+
+FAILURE MODE:
+Audio scheduling failed with error -5 (EIO) immediately when playback started,
+causing the entire pipeline to fail.
+
+TIMELINE:
+- 20:09:06 - Process starts with pre_render=1, pre_render_until=2026-05-29T21:27:57.400000Z
+- 20:09:06 - Video/audio threads wait for pre-render device init
+- 20:11:24 onwards - "Failed to queue teletext packet" warnings start appearing
+  (teletext queue filling up because packets aren't being consumed during pre-render)
+- 20:12:43 - Pipeline reaches frame 21796 and STALLS (pre-render buffer full, waiting)
+- 21:27:57.411 - Pre-render: waiting for device (pre_render_until time reached)
+- 21:28:00.511 - CRITICAL FAILURE:
+    * "Ending audio preroll."
+    * "Starting scheduled playback."
+    * "Could not schedule audio samples."
+    * "Audio output thread: schedule failed with error -5. Stopping."
+- 21:28:00.511 - Output thread reports fatal error -5
+- 21:28:03.052 - Concat segment 2 finishes, segment 3 starts
+- 21:28:03.174 - Process terminates with error -5
+
+KEY OBSERVATIONS:
+
+1. TELETEXT QUEUE OVERFLOW DURING PRE-RENDER:
+   From 20:11:24 onwards, many "Failed to queue teletext packet" warnings.
+   The teletext queue (1MB max) fills up because:
+   - Teletext packets are queued via ff_decklink_packet_queue_put()
+   - They're only consumed in construct_teletext() when pts <= ctx->last_pts
+   - During pre-render wait, last_pts doesn't advance, so packets accumulate
+   - Queue eventually fills and drops packets
+
+2. AUDIO FAILURE AT PLAYBACK START:
+   The audio scheduling fails immediately when StartScheduledPlayback is called.
+   Sequence at 21:28:00.511:
+   - Video frame pts=3 scheduled successfully (slots_remaining=56)
+   - "Ending audio preroll."
+   - "Starting scheduled playback."
+   - "Could not schedule audio samples." <- FAILURE
+
+3. CONCAT SEGMENT TRANSITIONS:
+   User pointed to line ~556148 showing concat segment transitions happening
+   around 21:28:03 - but this is AFTER the audio already died at 21:28:00.511.
+   The concat transitions themselves are not the direct cause.
+
+CHANGES SINCE KNOWN-GOOD COMMIT (b98e3f52b110):
+Many changes to decklink_enc.cpp including:
+- Split output thread into separate video and audio threads
+- Added socket frame protocol for external input
+- Added shared memory ring buffer support
+- Multiple teletext-related fixes (OP-42/OP-47 compliance, VBI waveform, etc.)
+- Added pre-render mode
+
+SUSPECT AREAS (per user: teletext code, not ring buffer):
+
+1. The teletext queue overflow during pre-render may not directly cause the
+   failure, but indicates the subtitle/teletext path is under stress.
+
+2. The audio scheduling failure happens at the exact moment playback transitions
+   from preroll to running. Something about the audio preroll state or timing
+   may be wrong.
+
+3. Possible race condition or state issue when transitioning from pre-render
+   wait state to active playback - the video thread is already scheduling
+   frames (pts=3) but audio fails immediately.
+
+NEXT STEPS TO INVESTIGATE:
+- Look at audio preroll logic and what changed since b98e3f52b110
+- Check if teletext encoder initialization affects audio timing
+- Verify audio buffer state when StartScheduledPlayback is called
+- Check if separate video/audio threads introduced a race condition
+
+======================================================
+CONTINUED INVESTIGATION - ROOT CAUSE IDENTIFIED
+======================================================
+
+DETAILED TIMELINE AT FAILURE (all within 21:28:00.511):
+
+1. 21:28:00.502 - "Pre-render: device initialized successfully"
+2. 21:28:00.511 - Video thread starts scheduling:
+   - Scheduled video frame pts=0 (slots_remaining=59)
+   - Scheduled video frame pts=1 (slots_remaining=58)
+   - Scheduled video frame pts=2 (slots_remaining=57)
+3. 21:28:00.511 - Audio thread status logged:
+   "Audio thread: 1 packets scheduled, 1024 samples in DeckLink buffer, 40944 in queue"
+   ^^^ CRITICAL: Only 1 audio packet (1024 samples = ~21ms) was scheduled!
+       But 40,944 packets are waiting in queue!
+4. 21:28:00.511 - Video schedules pts=3, triggering preroll end:
+   - "Ending audio preroll."
+   - "Starting scheduled playback."
+5. 21:28:00.511 - Audio thread tries to schedule next packet:
+   - "Could not schedule audio samples."
+   - "Audio output thread: schedule failed with error -5. Stopping."
+
+ROOT CAUSE: RACE CONDITION IN SEPARATE VIDEO/AUDIO THREADS
+
+The code was changed to use separate threads for video and audio scheduling:
+- decklink_video_output_thread() - schedules video to DeckLink
+- decklink_audio_output_thread() - schedules audio to DeckLink
+
+The preroll end logic is in decklink_schedule_video_packet() (line 2732):
+```cpp
+if (!ctx->playback_started && pkt->pts > (ctx->first_pts + ctx->frames_preroll)) {
+    ctx->dlo->EndAudioPreroll();
+    ctx->dlo->StartScheduledPlayback(...);
+    ctx->playback_started = 1;
+}
+```
+
+PROBLEM: The video thread decides to end preroll based solely on video frame count,
+without checking if the audio thread has scheduled sufficient audio samples.
+
+With preroll=0.1s and 25fps, frames_preroll ~= 2-3 frames. So when video hits
+pts=3, it ends preroll. But the audio thread had only processed 1 packet by then.
+
+WHY AUDIO FAILS AFTER StartScheduledPlayback():
+- DeckLink requires minimum audio buffer before starting playback
+- With only 1024 samples (~21ms) buffered, the DeckLink rejects further
+  audio scheduling because playback has started with insufficient buffer
+- Error -5 (EIO) indicates the operation failed at the hardware/API level
+
+WHY THIS DIDN'T HAPPEN BEFORE (commit b98e3f52b110):
+- The original code likely used a single output thread or synchronized
+  video/audio scheduling together
+- Audio and video would progress at similar rates
+- Preroll would see both audio and video adequately buffered before starting
+
+THE FIX NEEDED:
+The video thread should not end audio preroll until BOTH conditions are met:
+1. Video has enough frames buffered (current check)
+2. Audio has enough samples buffered (NEW check needed)
+
+Something like:
+```cpp
+uint32_t audio_buffered = 0;
+ctx->dlo->GetBufferedAudioSampleFrameCount(&audio_buffered);
+int min_audio_samples = 48000 * ctx->preroll;  // preroll seconds of audio
+
+if (!ctx->playback_started &&
+    pkt->pts > (ctx->first_pts + ctx->frames_preroll) &&
+    audio_buffered >= min_audio_samples) {
+    // Now safe to end preroll and start playback
+}
+```
+
+TELETEXT CONNECTION (per user's suspicion):
+The teletext code itself doesn't directly cause this failure. However:
+- The teletext queue overflow during pre-render shows the system was under stress
+- The separate thread model affects all packet types (video, audio, teletext)
+- If similar race conditions exist in teletext path, they could cause other issues
+
+NOT THE RING BUFFER (confirmed):
+This bug is in the core preroll/playback start logic, not the ring buffer code.
+The ring buffer queues were working correctly - they had 21,784 video frames
+and 40,944 audio packets ready. The problem is the coordination when consuming
+them.
+
+======================================================
+COMMIT THAT INTRODUCED THE BUG
+======================================================
+
+Commit 600d2e6aca "decklink: fix async output audio starvation with separate threads"
+
+This commit changed from:
+- SINGLE output thread, SINGLE queue with interleaved A/V packets
+- Audio and video processed in order, naturally synchronized
+
+To:
+- SEPARATE video and audio threads
+- SEPARATE video and audio queues
+- Threads race independently
+
+The original problem this solved (from commit message):
+"When video scheduling blocked waiting for DeckLink buffer slots, audio
+packets were stuck in the queue, causing audio starvation"
+
+The NEW problem it created:
+When video preroll completes (pts=3), the video thread calls EndAudioPreroll()
+and StartScheduledPlayback() without ensuring audio thread has buffered enough.
+With separate threads, audio may have only scheduled 1 packet by then.
+
+OLD CODE (b98e3f52b110) - single thread, single queue:
+```cpp
+static void *decklink_output_thread(void *arg) {
+    while (!stop) {
+        ff_decklink_packet_queue_get(&ctx->output_queue, &pkt);
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            decklink_schedule_video_packet(&pkt);  // May block
+        else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            decklink_schedule_audio_packet(&pkt);  // Won't run while video blocks
+    }
+}
+```
+In this model, packets are processed in order. By the time video triggers preroll
+end, all audio packets that were queued before it have been scheduled.
+
+NEW CODE (current) - separate threads, separate queues:
+```cpp
+static void *decklink_video_output_thread(void *arg) {
+    while (!stop) {
+        ff_decklink_packet_queue_get(&ctx->output_video_queue, &pkt);
+        decklink_schedule_video_packet(&pkt);  // Triggers preroll end at pts=3
+    }
+}
+static void *decklink_audio_output_thread(void *arg) {
+    while (!stop) {
+        ff_decklink_packet_queue_get(&ctx->output_audio_queue, &pkt);
+        decklink_schedule_audio_packet(&pkt);  // Racing, may only have 1 pkt done
+    }
+}
+```
+Now the threads race. Video can hit preroll threshold while audio lags behind.
+
+ADDITIONAL CONTRIBUTING FACTOR - commit c845d66dd5:
+"decklink: minimize preroll for fast on-air startup with async output"
+
+This commit REDUCED preroll from 30 frames to 2 frames when async output is used:
+```cpp
+// Before:
+ctx->frames_preroll = FFMAX(ctx->frames_preroll, 30);  // At least 30 frames
+
+// After:
+ctx->frames_preroll = FFMIN(ctx->frames_preroll, 2);   // Cap at 2 frames
+```
+
+The comment says "the large async buffer upstream provides timing safety, not the
+preroll" - but this is INCORRECT for audio. The preroll period is when
+BeginAudioPreroll()/EndAudioPreroll() allow audio to be buffered. With only 2
+frames of preroll and separate threads, there's almost no time for audio to
+buffer before video triggers playback start.
+
+COMBINED EFFECT:
+1. 600d2e6aca: Split to separate threads (video can race ahead of audio)
+2. c845d66dd5: Minimize preroll to 2 frames (almost no time for audio to buffer)
+Result: Video hits pts=2-3, triggers playback with only ~1 audio packet buffered
+
+======================================================
+RECOMMENDED FIXES
+======================================================
+
+OPTION 1: Add audio buffer check before starting playback
+In decklink_schedule_video_packet(), before ending preroll:
+```cpp
+uint32_t audio_buffered = 0;
+ctx->dlo->GetBufferedAudioSampleFrameCount(&audio_buffered);
+int min_audio_samples = 48000 * ctx->preroll;  // preroll seconds of audio
+
+if (!ctx->playback_started &&
+    pkt->pts > (ctx->first_pts + ctx->frames_preroll) &&
+    (!ctx->audio || audio_buffered >= min_audio_samples)) {
+    // Now safe to end preroll and start playback
+    ctx->dlo->EndAudioPreroll();
+    ctx->dlo->StartScheduledPlayback(...);
+}
+```
+
+OPTION 2: Increase preroll when using async output with separate threads
+Revert c845d66dd5's preroll reduction, or set a minimum based on ensuring
+adequate audio buffering time.
+
+OPTION 3: Coordinate threads with a barrier
+Have video thread wait for audio thread to signal it has buffered enough
+before allowing preroll to end. This adds complexity but ensures proper sync.
+
+OPTION 4: Hybrid approach - use single queue for preroll phase
+Keep separate threads for normal operation, but use interleaved queue during
+preroll phase to ensure audio is processed alongside video.
+
+======================================================
+ADDITIONAL FINDING - SLEEP TIME MISMATCH
+======================================================
+
+Another contributing factor found in the pre-render wait loops:
+
+Video thread wait loop:
+```cpp
+if (ctx->pre_render_mode && !ctx->pre_render_device_ready) {
+    usleep(1000);  // 1ms sleep
+    continue;
+}
+```
+
+Audio thread wait loop:
+```cpp
+if (ctx->pre_render_mode && !ctx->pre_render_device_ready) {
+    usleep(10000);  // 10ms sleep - 10x longer!
+    continue;
+}
+```
+
+TIMELINE CORRELATION:
+- 21:28:00.502 - Device initialized (pre_render_device_ready = 1)
+- 21:28:00.511 - Failure occurs (9ms later)
+
+The 9ms gap is almost exactly the 10ms sleep time. When device became ready:
+1. Video thread woke within 1ms and started scheduling
+2. Audio thread was sleeping for 10ms and didn't wake up until after
+3. Video scheduled pts=0,1,2,3 and triggered preroll end
+4. Audio thread finally woke up but too late - playback already started
+
+This sleep time mismatch should also be fixed:
+```cpp
+// Both threads should use same short sleep time:
+usleep(1000);  // 1ms for both video and audio
+```
+
+======================================================
+SUMMARY OF ALL BUGS FOUND
+======================================================
+
+1. PRIMARY: Preroll end check doesn't verify audio buffer level
+   - Video decides to start playback without checking audio is ready
+   - Fix: Check GetBufferedAudioSampleFrameCount() before EndAudioPreroll()
+
+2. CONTRIBUTING: Preroll minimized to 2 frames (c845d66dd5)
+   - Not enough time for audio to buffer even if threads were synchronized
+   - Fix: Increase preroll or base it on audio buffer requirements
+
+3. CONTRIBUTING: Audio thread sleep 10x longer than video (10ms vs 1ms)
+   - Audio thread wakes up late after device ready
+   - Fix: Use same 1ms sleep for both threads
+
+4. ARCHITECTURE: Separate threads race without coordination
+   - Original single-thread model naturally synchronized A/V
+   - The split to fix one problem (video blocking audio) created another
+   - Fix: Add explicit coordination mechanism for preroll phase
+
+USER'S SUSPICION ABOUT TELETEXT:
+The teletext code itself is NOT the direct cause of this failure. However:
+- Teletext queue overflow during pre-render shows system stress
+- Many teletext commits were made, increasing code complexity
+- The concat segment processing with subtitles/teletext exercises these paths
+- Similar race conditions could exist in teletext paths (not investigated yet)
+
+TELETEXT PATH ANALYSIS:
+- decklink_write_subtitle_packet() is NON-BLOCKING (just queues, returns 0)
+- Teletext queue uses standard packet queue (same as audio/video)
+- Queue overflow = packet dropped with warning, NOT blocking
+- construct_teletext() runs on VIDEO thread during frame scheduling
+- Teletext processing COULD slow video, but our failure shows video was FAST
+
+CONCAT SEGMENT TRANSITIONS (user pointed to line ~556148):
+The log shows concat segment transitions at 21:28:03, but the audio failure was at
+21:28:00.511. The concat transitions are:
+- Segment 1 finished at 21:28:01.028
+- Segment 2 started at 21:28:01.144
+- Segment 2 finished at 21:28:03.052
+- Segment 3 started at 21:28:03.053
+
+These happened AFTER the audio thread already died. The concat filter and subtitle
+stream transitions work correctly - the problem is upstream at the DeckLink
+audio/video thread synchronization.
+
+======================================================
+CONCLUSION
+======================================================
+
+ROOT CAUSE: Race condition between separate video and audio output threads.
+Video triggers playback start before audio has buffered enough samples.
+
+COMMITS THAT INTRODUCED/WORSENED THE BUG:
+1. 600d2e6aca - Split to separate video/audio threads (created race condition)
+2. c845d66dd5 - Minimized preroll to 2 frames (reduced time for audio to buffer)
+
+IMMEDIATE FIX NEEDED IN decklink_schedule_video_packet():
+Before calling EndAudioPreroll() and StartScheduledPlayback(), add:
+```cpp
+if (ctx->audio) {
+    uint32_t audio_buffered = 0;
+    ctx->dlo->GetBufferedAudioSampleFrameCount(&audio_buffered);
+    if (audio_buffered < 48000 * 0.1) {  // Less than 100ms of audio
+        return 0;  // Don't end preroll yet, wait for audio
+    }
+}
+```
+
+ALSO FIX: Audio thread sleep time (10ms -> 1ms) in pre-render wait loop.
+
+NOT THE CAUSE: Teletext code changes, ring buffer, concat filter.
+
+======================================================
+PEER REVIEW / CORRECTIONS (second pass against source + log)
+======================================================
+
+The analysis above identified the right FAILURE LOCATION (audio
+ScheduleAudioSamples fails the instant the video thread ends preroll /
+starts playback) and correctly cleared teletext / ring buffer / concat.
+But several specific claims are WRONG, STALE, or UNSUPPORTED, and the
+single most relevant code path (pre_render) was never examined. Details:
+
+--- CORRECTION 1: "Sleep mismatch 10ms vs 1ms" is FABRICATED ---
+Both output-thread pre-render wait loops use usleep(10000):
+  - video thread: decklink_enc.cpp:334  -> usleep(10000)
+  - audio thread: decklink_enc.cpp:404  -> usleep(10000)
+They are identical. There is no 10ms-vs-1ms mismatch. The "9ms gap = 10ms
+sleep" correlation (former section "SLEEP TIME MISMATCH" and summary bug #3)
+is a coincidence: the 9ms is just device init + scheduling 4 video frames.
+=> Disregard that finding entirely. Do NOT change audio sleep to 1ms on its
+   account.
+
+--- CORRECTION 2: c845d66dd5's "cap preroll at 2 frames" is STALE ---
+That commit's `ctx->frames_preroll = FFMIN(ctx->frames_preroll, 2)` no
+longer exists. The pre_render refactor replaced it; preroll is now computed
+in two places:
+  - decklink_enc.cpp:1084 (pre_render init): frames_preroll = tb.den * preroll
+  - decklink_enc.cpp:1269 (normal setup):    frames_preroll = tb.den * preroll
+In THIS outage the ~2-frame preroll comes from the command-line `-preroll 0.1`
+(0.1s * 25fps = 2.5 -> 2), NOT from c845d66dd5.
+=> Reverting c845d66dd5 would have NO effect on this failure.
+
+--- CORRECTION 3: The failure MECHANISM is unproven and likely mis-stated ---
+The claim "DeckLink rejects scheduling because the audio buffer is too small"
+is asserted without evidence. Under-buffering normally causes audio dropouts/
+silence, not a hard EIO from ScheduleAudioSamples. The real reason the API
+call returned non-S_OK was never established because the HRESULT was discarded
+(see ACTION 1).
+
+--- MISSED ITEM A: pre_render path never examined ---
+This outage occurs ONLY in pre_render mode, yet the pre_render device-init
+path was not reviewed. It WAS reviewed in this pass:
+  - decklink_enc.cpp:1097-1112 enables audio (bmdAudioOutputStreamTimestamped)
+    and calls BeginAudioPreroll() — equivalent to the normal path
+    (1337-1347), so the audio SETUP itself is not the bug.
+  - The distinguishing factor is buffer STATE at start: in pre_render the
+    pipeline stalled ~1h18m with BOTH queues completely full (21784 video
+    frames, 40944 audio packets). When the device inits, both output threads
+    drain at maximum speed with no upstream pacing. Video reaches the preroll
+    threshold (pts > first_pts + 2) almost instantly while audio has scheduled
+    only 1 packet. Normal startup feeds gradually and stays interleaved, which
+    is why it doesn't reproduce there — NOT the single-vs-multi-thread history.
+
+--- MISSED ITEM B: unsynchronized concurrent DeckLink calls (stronger RC) ---
+The preroll->playback transition is performed by the VIDEO thread with NO
+lock held (ctx->mutex was released at decklink_enc.cpp:2707):
+  - video thread: EndAudioPreroll() + StartScheduledPlayback()  (2734-2739)
+  - audio thread: ScheduleAudioSamples()                        (2872)
+Both hit the SAME ctx->dlo object concurrently with zero synchronization. In
+pre_render's full-buffer drain both threads hammer the device simultaneously,
+maximizing the collision window. This is a thread-safety defect, not merely a
+buffer-quantity problem. It is a better-supported root cause than the original
+"separate threads buffered audio too slowly" framing.
+
+======================================================
+REVISED ACTIONS (in priority order)
+======================================================
+
+ACTION 1 (DONE - diagnostic first, no guessing):
+Log the actual HRESULT from ScheduleAudioSamples so the next run pins down
+the exact failure code. Implemented at decklink_enc.cpp:2872:
+```cpp
+HRESULT audio_hr = ctx->dlo->ScheduleAudioSamples(outbuf, sample_count,
+                       pkt->pts, bmdAudioSampleRate48kHz, NULL);
+if (audio_hr != S_OK) {
+    av_log(avctx, AV_LOG_ERROR, "Could not schedule audio samples."
+           " error %08x (pts=%"PRId64", samples=%d, playback_started=%d).\n",
+           (uint32_t) audio_hr, pkt->pts, sample_count, ctx->playback_started);
+    ret = AVERROR(EIO);
+}
+```
+Interpretation guide for the captured code:
+  - E_INVALIDARG  -> timestamp/gap/parameter problem (pts alignment)
+  - E_ACCESSDENIED-> audio output not in a state to accept samples
+  - E_FAIL/other  -> consistent with the concurrency collision (Item B)
+
+ACTION 2 (DONE - recommended fix to ship without waiting for a new outage):
+Audio-gated preroll end. In decklink_schedule_video_packet(), before
+EndAudioPreroll()/StartScheduledPlayback(), require the audio thread to have
+buffered ~preroll-seconds of audio (>= max(48000*preroll, 4800) sample frames),
+otherwise return 0 and re-check on the next video packet:
+```cpp
+if (ctx->audio) {
+    uint32_t audio_buffered = 0;
+    uint32_t audio_target = FFMAX((uint32_t)(48000 * ctx->preroll), 4800);
+    ctx->dlo->GetBufferedAudioSampleFrameCount(&audio_buffered);
+    if (audio_buffered < audio_target && ctx->output_audio_queue.nb_packets > 0)
+        return 0;   /* let audio catch up; fall through at EOF to avoid stall */
+}
+```
+Rationale: correct under BOTH open hypotheses. If audio was genuinely
+under-buffered, this fixes it directly. If it is the concurrency collision
+(Item B), the gate makes the video thread spin on re-checks while the audio
+thread keeps draining, so the preroll->playback transition no longer lands in
+the initial microsecond burst where both threads hit the device at once.
+Cannot stall: audio reaches the target in a handful of packets (~ms) — far
+sooner than the 60-frame video buffer can fill — and the nb_packets>0 guard
+lets it start anyway at audio EOF / very short audio.
+
+ACTION 3 (only if ACTION 1 later captures a true concurrency E_FAIL):
+Add real synchronization around the preroll transition - either a lock held
+across EndAudioPreroll()/StartScheduledPlayback() AND ScheduleAudioSamples(),
+or move the transition to a single owner thread. Higher risk (mutex on the hot
+audio path); deferred unless the HRESULT proves it is needed.
+
+REVISED ROOT CAUSE (pending ACTION 1 confirmation):
+pre_render full-buffer drain causes both output threads to race the SAME
+DeckLink device with no synchronization; the video thread tears down audio
+preroll / starts playback while the audio thread is mid-ScheduleAudioSamples,
+producing the -5. The original "audio under-buffered" story is at best a
+contributing symptom, at worst a red herring.
+
+WITHDRAWN FROM ORIGINAL ANALYSIS:
+  - Sleep-time mismatch fix (no mismatch exists).
+  - Reverting c845d66dd5 (cap no longer present; preroll comes from CLI).
+
+======================================================
+CONFIRMED 2026-05-30 - HRESULT captured, root cause proven
+======================================================
+
+A new pre_render run with the ACTION 1 logging produced:
+  "Could not schedule audio samples. error 80000009
+   (pts=20480, samples=1024, playback_started=0)."
+
+0x80000009 = E_ACCESSDENIED. This PROVES MISSED ITEM B (concurrency race),
+and REFUTES the original "audio buffer too small" theory:
+
+Active-process timeline (active.log, device "DeckLink SDI 4K"):
+  04:58:03.806  Pre-render: time trigger fired
+  04:58:04.449  Pre-render: device initialized successfully
+  04:58:04.450  video frames pts=0..4 scheduled
+  04:58:04.451  audio had scheduled ~20 packets (pts up to 20480) FINE
+  04:58:04.451  video thread: "Ending audio preroll" + "Starting scheduled
+                playback"  <-- EndAudioPreroll()/StartScheduledPlayback()
+  04:58:04.451  audio thread: ScheduleAudioSamples(pts=20480) -> E_ACCESSDENIED
+                (playback_started still 0: video thread had not yet reached the
+                 ctx->playback_started=1 line, confirming the two ran at once)
+
+Key proof points:
+  - 19 audio packets (pts 0..19456) scheduled successfully => device is owned
+    and audio output is healthy; NOT under-buffered, NOT cross-process denial.
+  - Failure occurs on the ONE packet that overlaps EndAudioPreroll().
+  - playback_started=0 in the failing log => the audio ScheduleAudioSamples and
+    the video EndAudioPreroll/StartScheduledPlayback executed concurrently.
+  - The ACTION 2 audio gate did NOT prevent it (audio was well past its 4800
+    target at 20480); the gate only changes WHEN the transition fires, not the
+    fact that it races ScheduleAudioSamples. The gate is retained as a
+    robustness nicety but is NOT the fix.
+
+TWO-PROCESS NOTE (active.log + waiting.log):
+  A second pre_render process (waiting.log, pre_render_until 02:59:59.880Z,
+  block_until_available=1) targets the SAME device for the same air window. It
+  did NOT cause this crash: the active process fully owned the device and only
+  the internal transition raced. The waiting process reached "device
+  initialized successfully" only ~1s later (last ts 04:58:05.484), i.e. AFTER
+  the active process crashed and released the device. So failover happened to
+  work here by accident (active died -> waiting grabbed device). Two processes
+  contending for one SDI output at the same air time is a separate operational
+  issue worth fixing in the scheduler, but it is NOT this bug.
+
+FIX ATTEMPT (ACTION 3 - mutex) -- FAILED, DEADLOCKS. REVERTED.
+  Added ctx->playback_mutex and serialized the preroll->playback transition
+  (video thread) against ScheduleAudioSamples (audio thread). This DEADLOCKED
+  and produced total loss of output (blank screen), which is WORSE than the
+  intermittent crash it replaced: a wedged process holds the DeckLink device
+  open, so block_until_available standby can never take over either.
+
+======================================================
+CONFIRMED 2026-05-30 (later) - mutex deadlocks; corrected fix is retry
+======================================================
+
+A pre_render run with the mutex (blank.log) hung at the transition:
+  06:36:32.825  "Ending audio preroll."   <-- last decklink-thread log line
+                (NO "Starting scheduled playback." ever follows)
+  upstream keeps running: "Async buffer" climbs 15% -> 36%, teletext queue
+  overflows; only the two output threads are wedged. Operator killed it.
+
+DEADLOCK MECHANISM (the constraint the mutex design missed):
+  - In pre_render the audio queue is full, so the audio thread floods the
+    DeckLink audio buffer during preroll.
+  - ScheduleAudioSamples() BLOCKS once that buffer fills; it only drains after
+    StartScheduledPlayback() runs.
+  - The mutex made the audio thread hold playback_mutex *while blocked inside*
+    ScheduleAudioSamples. The video thread needs that same lock to call
+    StartScheduledPlayback. => audio waits for playback to start; playback
+    waits for the lock the blocked audio thread holds. Permanent deadlock.
+  - Corollary: mutual exclusion is structurally impossible here. You cannot
+    even "wait for the audio thread to leave ScheduleAudioSamples before
+    starting playback" - it is stuck IN that call until playback starts.
+
+CORRECTED FIX SHIPPED (lock-free + tolerate the transient):
+  1. Reverted the mutex entirely (struct field, both inits, destroy, both
+     critical sections). commit 1c129ace un-applied.
+  2. Removed the ACTION 2 audio-buffer gate. In blank.log the gate is what
+     delayed the transition (to pts=152) and let the buffer fill; it also
+     relies on GetBufferedAudioSampleFrameCount() being meaningful during
+     preroll, which is unreliable. Transition is back to the simple original
+     "end preroll + start playback at pkt->pts > first_pts + frames_preroll".
+  3. The video-thread transition now runs lock-free and may overlap the audio
+     thread's ScheduleAudioSamples (as the original code did). The audio thread
+     ABSORBS the transient E_ACCESSDENIED (0x80000009) by retrying the SAME
+     packet (usleep(1000), up to 1000 tries) instead of aborting the output.
+     The transition is sub-millisecond, so it succeeds on the first retry or
+     two. ACTION 1 HRESULT logging kept (now also logs retries=).
+  Net: no lock -> no deadlock; the race that crashed active.log is absorbed,
+  not fatal.
+
+VERIFY IN NEXT RUN:
+  - "Starting scheduled playback." appears (no wedge).
+  - If it raced: a debug "Audio schedule denied ... retrying" line, then normal
+    output and NO "schedule failed with error -5".
+
+STILL OPEN (separate from this bug):
+  Two pre_render jobs contending for one SDI output at the same air window
+  (active.log + waiting.log). Not the cause of any crash here; an operational/
+  scheduler concern. block_until_available only recovers from the holder
+  RELEASING the device (clean exit/crash), not from a hang.
