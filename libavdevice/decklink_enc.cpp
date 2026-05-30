@@ -2885,17 +2885,22 @@ static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
      * Preroll()/StartScheduledPlayback() run concurrently and without a lock
      * (see decklink_schedule_video_packet for why a lock would deadlock). The
      * transition completes in well under a millisecond, so retry the same
-     * packet for a bounded window instead of aborting the whole output. */
+     * packet for a bounded window instead of aborting the whole output. The
+     * ceiling is configurable via the audio_schedule_retry option (seconds);
+     * 0 disables retry. It is bounded so a genuinely wedged card fails loudly
+     * rather than hanging and holding the device. */
     HRESULT audio_hr;
     int access_denied_retries = 0;
+    int max_retries = (int)(cctx->audio_schedule_retry * 1000);  /* seconds -> 1ms steps */
     for (;;) {
         audio_hr = ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
                                                   bmdAudioSampleRate48kHz, NULL);
-        if (audio_hr != E_ACCESSDENIED || access_denied_retries >= 1000)
+        if (audio_hr != E_ACCESSDENIED || access_denied_retries >= max_retries)
             break;
         if (access_denied_retries == 0)
             av_log(avctx, AV_LOG_DEBUG, "Audio schedule denied during preroll->playback "
-                   "transition; retrying (pts=%"PRId64").\n", pkt->pts);
+                   "transition; retrying up to %.3gs (pts=%"PRId64").\n",
+                   cctx->audio_schedule_retry, pkt->pts);
         access_denied_retries++;
         usleep(1000);
     }

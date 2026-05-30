@@ -85,6 +85,7 @@ struct decklink_cctx {
     DecklinkSignalLossAction signal_loss_action;
     int64_t output_buffer_size;
     double late_threshold;
+    double audio_schedule_retry;
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;
 
