@@ -220,10 +220,14 @@ fi
 
 # Solid color frames (excluding black, which blackdetect handles)
 SOLIDCOLOR=$(echo "$QC_OUTPUT" | grep "robin.*solid_start:" | grep -v "color:black" || true)
+GREENCOLOR=$(echo "$QC_OUTPUT" | grep "robin.*solid_start:" | grep "color:green" || true)
 if [[ -n "$SOLIDCOLOR" ]]; then
     echo "$SOLIDCOLOR" | tee -a "$REPORT"
     curio "Solid colour frames detected"
     get_screenshots "$SOLIDCOLOR" "coloured_frames"
+    if [[ -n "$GREENCOLOR" ]]; then
+        warn "Green frames detected"
+    fi
 else
     info "No solid colour frames detected"
 fi
@@ -345,7 +349,7 @@ fi
 # ============================================================
 echo "" | tee -a "$REPORT"
 echo "============================================" | tee -a "$REPORT"
-echo "SUMMARY: $ERRORS error(s), $WARNINGS warning(s)" | tee -a "$REPORT"
+echo "SUMMARY: $ERRORS error(s), $WARNINGS warning(s), $CURIOSITIES curiosities" | tee -a "$REPORT"
 echo "============================================" | tee -a "$REPORT"
 if [[ "$ERRORS" -gt 0 ]]
 then
