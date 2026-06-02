@@ -575,8 +575,23 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     int vid;
     double bitrate;
     double speed;
+    double speed_onair = -1;
+    double dt;
+    uint64_t cur_frames = 0;
+    float fps_inst = 0;
     static int64_t last_time = -1;
     static int first_report = 1;
+    /* Option A: windowed (instantaneous) throughput, smoothed across reports
+     * so a stall reads ~0 while parked and recovers immediately on resume,
+     * instead of being buried in a since-process-start average. */
+    static int64_t prev_time = -1;
+    static int64_t prev_pts = AV_NOPTS_VALUE;
+    static uint64_t prev_frames = 0;
+    static double fps_inst_ema = -1, speed_inst_ema = -1;
+    /* Option C: epoch snapshotted when the output first goes on-air, so speed
+     * can be measured relative to playout start rather than process start. */
+    static int64_t onair_time = -1;
+    static int64_t onair_pts = AV_NOPTS_VALUE;
     uint64_t nb_frames_dup = 0, nb_frames_drop = 0;
     int mins, secs, ms, us;
     int64_t hours;
@@ -598,6 +613,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     }
 
     t = (cur_time-timer_start) / 1000000.0;
+    dt = (prev_time >= 0) ? (cur_time - prev_time) / 1000000.0 : 0.0;
 
     vid = 0;
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
@@ -625,10 +641,18 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
             uint64_t frame_number = atomic_load(&ost->packets_written);
 
             fps = t > 1 ? frame_number / t : 0;
-            av_bprintf(&buf, "frame=%5"PRId64" fps=%3.*f q=%3.1f ",
-                     frame_number, fps < 9.95, fps, q);
+            cur_frames = frame_number;
+            if (dt > 0.0) {
+                float inst = (frame_number - prev_frames) / dt;
+                fps_inst_ema = fps_inst_ema < 0 ? inst
+                                                : 0.5f * inst + 0.5f * fps_inst_ema;
+            }
+            fps_inst = fps_inst_ema < 0 ? fps : fps_inst_ema;
+            av_bprintf(&buf, "frame=%5"PRId64" fps=%3.*f fps_inst=%3.*f q=%3.1f ",
+                     frame_number, fps < 9.95, fps, fps_inst < 9.95, fps_inst, q);
             av_bprintf(&buf_script, "frame=%"PRId64"\n", frame_number);
             av_bprintf(&buf_script, "fps=%.2f\n", fps);
+            av_bprintf(&buf_script, "fps_inst=%.2f\n", fps_inst);
             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
                        ost->file->index, ost->index, q);
             if (is_last_report)
@@ -658,6 +682,24 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
 
     bitrate = pts != AV_NOPTS_VALUE && pts && total_size >= 0 ? total_size * 8 / (pts / 1000.0) : -1;
     speed   = pts != AV_NOPTS_VALUE && t != 0.0 ? (double)pts / AV_TIME_BASE / t : -1;
+
+    /* Option A: instantaneous speed over the report window. */
+    if (dt > 0.0 && pts != AV_NOPTS_VALUE && prev_pts != AV_NOPTS_VALUE) {
+        double inst = (double)(pts - prev_pts) / AV_TIME_BASE / dt;
+        speed_inst_ema = speed_inst_ema < 0 ? inst : 0.5 * inst + 0.5 * speed_inst_ema;
+    }
+
+    /* Option C: latch the on-air epoch the first time the output starts
+     * real-time playout, then measure speed from that point on. */
+    if (onair_time < 0 && output_files[0] && of_is_on_air(output_files[0])) {
+        onair_time = cur_time;
+        onair_pts  = pts;
+    }
+    if (onair_time >= 0 && pts != AV_NOPTS_VALUE && onair_pts != AV_NOPTS_VALUE) {
+        double dtr = (cur_time - onair_time) / 1000000.0;
+        if (dtr > 0.0)
+            speed_onair = (double)(pts - onair_pts) / AV_TIME_BASE / dtr;
+    }
 
     if (total_size < 0) av_bprintf(&buf, "size=N/A time=");
     else                av_bprintf(&buf, "size=%8.0fKiB time=", total_size / 1024.0);
@@ -702,6 +744,25 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         av_bprintf(&buf_script, "speed=%4.3gx\n", speed);
     }
 
+    /* Option A: windowed speed - tracks current throughput, not the lifetime
+     * average, so a pre_render park or output-buffer wait no longer poisons it. */
+    if (speed_inst_ema < 0) {
+        av_bprintf(&buf, " speed_inst=N/A");
+        av_bprintf(&buf_script, "speed_inst=N/A\n");
+    } else {
+        av_bprintf(&buf, " speed_inst=%4.3gx", speed_inst_ema);
+        av_bprintf(&buf_script, "speed_inst=%4.3gx\n", speed_inst_ema);
+    }
+
+    /* Option C: speed since going on-air (N/A while still pre-buffering). */
+    if (speed_onair < 0) {
+        av_bprintf(&buf, " speed_onair=N/A");
+        av_bprintf(&buf_script, "speed_onair=N/A\n");
+    } else {
+        av_bprintf(&buf, " speed_onair=%4.3gx", speed_onair);
+        av_bprintf(&buf_script, "speed_onair=%4.3gx\n", speed_onair);
+    }
+
     secs = (int)t;
     ms = (int)((t - secs) * 1000);
     mins = secs / 60;
@@ -735,6 +796,11 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
                        "Error closing progress log, loss of information possible: %s\n", av_err2str(ret));
         }
     }
+
+    /* Snapshot this report's position so the next report can window against it. */
+    prev_time   = cur_time;
+    prev_pts    = pts;
+    prev_frames = cur_frames;
 
     first_report = 0;
 }

@@ -2752,6 +2752,9 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
             return AVERROR(EIO);
         }
         ctx->playback_started = 1;
+        /* Mark the output as on-air so fftools can report speed relative to
+         * playout start, excluding the pre_render buffering phase. Set once. */
+        av_dict_set(&avctx->metadata, "ffmpeg.onair", "1", 0);
     }
 
     return 0;

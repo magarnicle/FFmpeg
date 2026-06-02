@@ -931,6 +931,9 @@ void of_free(OutputFile **pof);
 void of_enc_stats_close(void);
 
 int64_t of_filesize(OutputFile *of);
+/* Returns non-zero once the output has begun real-time playout (used by the
+ * progress reporter to compute playout-relative speed; see of_is_on_air). */
+int of_is_on_air(OutputFile *of);
 
 int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
 void ifile_close(InputFile **f);

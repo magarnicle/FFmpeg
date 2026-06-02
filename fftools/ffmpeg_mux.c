@@ -890,3 +890,15 @@ int64_t of_filesize(OutputFile *of)
     Muxer *mux = mux_from_of(of);
     return atomic_load(&mux->last_filesize);
 }
+
+int of_is_on_air(OutputFile *of)
+{
+    Muxer *mux = mux_from_of(of);
+    /* Output devices (e.g. decklink in pre_render mode) publish an
+     * "ffmpeg.onair" metadata key the moment real-time playout actually
+     * begins, so the progress reporter can measure speed relative to going
+     * on air rather than to process start. The key is set exactly once by
+     * the muxer thread; a torn read here merely defers detection by one
+     * report interval, which is harmless for an averaged statistic. */
+    return av_dict_get(mux->fc->metadata, "ffmpeg.onair", NULL, 0) != NULL;
+}
