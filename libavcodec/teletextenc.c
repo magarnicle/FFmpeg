@@ -85,7 +85,7 @@ typedef struct TeletextEncContext {
     int page;             /* Page number (100-899) */
     int magazine;         /* Magazine number (1-8) */
     int region;           /* Character set region (0-15) */
-    int double_height;    /* Use double height text (OP-42 4d) */
+    int double_height;    /* WST double-height display attribute (control code 0x0D) */
     int erase_page;       /* C4: Erase page flag (OP-42 4h) */
     int update_indicator; /* C8: Update indicator flag (OP-42 4g) */
     int subtitle_flag;    /* C6: Subtitle indicator flag (OP-42 4f) */
@@ -279,7 +279,7 @@ static void clear_page_buffer(TeletextEncContext *ctx)
 
 /**
  * Write text to page buffer at specified row
- * Optionally applies double height formatting per OP-42 4d
+ * Optionally applies the WST double-height display attribute
  */
 static void write_to_page(TeletextEncContext *ctx, int row, int col,
                           const uint8_t *text, int len, int color)
@@ -289,7 +289,7 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
     if (col < 0)
         col = 0;
 
-    /* Insert double height code if enabled (OP-42 4d) */
+    /* Insert double-height attribute (WST control code 0x0D) if enabled */
     if (ctx->double_height && col < TELETEXT_COLS) {
         ctx->page_buffer[row][col++] = TELETEXT_DOUBLE_HEIGHT;
     }
@@ -427,23 +427,6 @@ int ff_teletext_build_data_unit(uint8_t *out, int data_unit_id,
 
     /* Copy 42 bytes of teletext data */
     memcpy(out + 4, data, TELETEXT_LINE_SIZE);
-
-    /* Log the full output data unit for debugging */
-    av_log(NULL, AV_LOG_INFO,
-           "Teletext encoder output (mag=%d row=%d):\n", magazine, packet_number);
-    av_log(NULL, AV_LOG_INFO,
-           "  header: %02x %02x %02x %02x\n",
-           out[0], out[1], out[2], out[3]);
-    av_log(NULL, AV_LOG_INFO,
-           "  MRAG + data bytes 0-19: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-           out[4], out[5], out[6], out[7], out[8], out[9], out[10], out[11],
-           out[12], out[13], out[14], out[15], out[16], out[17], out[18], out[19],
-           out[20], out[21], out[22], out[23]);
-    av_log(NULL, AV_LOG_INFO,
-           "  data bytes 20-41:       %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-           out[24], out[25], out[26], out[27], out[28], out[29], out[30], out[31],
-           out[32], out[33], out[34], out[35], out[36], out[37], out[38], out[39],
-           out[40], out[41], out[42], out[43], out[44], out[45]);
 
     return TELETEXT_DATA_UNIT_SIZE;
 }
@@ -586,7 +569,10 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
                                 0, 7, ctx->mag_encoded, 0, line_data);
     total_size += TELETEXT_DATA_UNIT_SIZE;
 
-    /* Content rows (rows 1-23) - only emit non-empty rows near the subtitle area */
+    /* Content rows: emit only rows that actually carry caption text, so the page
+     * stays compact (fewer data units -> faster full-page transmission). Stale
+     * lower rows from a previous caption are cleared by the header's C4 erase bit
+     * (enable -erase_page for closed captions). */
     for (int row = 19; row < TELETEXT_ROWS && row <= 23; row++) {
         /* Check if row has content */
         int has_content = 0;
@@ -597,7 +583,7 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
             }
         }
 
-        if (has_content || row >= 20) {
+        if (has_content) {
             build_content_row(ctx, line_data, row);
             if (total_size + TELETEXT_DATA_UNIT_SIZE > buf_size)
                 return AVERROR_BUFFER_TOO_SMALL;
@@ -621,11 +607,11 @@ static av_cold int teletext_encode_close(AVCodecContext *avctx)
 #define VE AV_OPT_FLAG_SUBTITLE_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 
 static const AVOption teletext_options[] = {
-    { "teletext_page", "Teletext page number (100-899)", OFFSET(page), AV_OPT_TYPE_INT, { .i64 = 888 }, 100, 899, VE },
-    { "page", "Teletext page number (100-899)", OFFSET(page), AV_OPT_TYPE_INT, { .i64 = 888 }, 100, 899, VE },
+    { "teletext_page", "Teletext page number (100-899; OP-42 uses 801)", OFFSET(page), AV_OPT_TYPE_INT, { .i64 = 801 }, 100, 899, VE },
+    { "page", "Teletext page number (100-899; OP-42 uses 801)", OFFSET(page), AV_OPT_TYPE_INT, { .i64 = 801 }, 100, 899, VE },
     { "magazine", "Magazine number (1-8)", OFFSET(magazine), AV_OPT_TYPE_INT, { .i64 = 8 }, 1, 8, VE },
     { "region", "Character set region (0-15)", OFFSET(region), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 15, VE },
-    { "double_height", "Use double height text (OP-42 4d)", OFFSET(double_height), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "double_height", "Use the WST double-height display attribute (0x0D)", OFFSET(double_height), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "erase_page", "C4: Erase page between transmissions (OP-42 4h)", OFFSET(erase_page), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "update_indicator", "C8: Update indicator flag (OP-42 4g)", OFFSET(update_indicator), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "subtitle_flag", "C6: Subtitle indicator flag (OP-42 4f)", OFFSET(subtitle_flag), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },

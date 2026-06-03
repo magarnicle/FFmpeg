@@ -74,7 +74,7 @@ static const AVOption options[] = {
     { "both"        , "insert on both fields (default, per OP-47)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "odd"         , "insert on odd field (field 1) only",         0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "even"        , "insert on even field (field 2) only",        0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, ENC, .unit = "teletext_fields"},
-    { "teletext_vbi_offset", "teletext VBI waveform start sample offset", OFFSET(teletext_vbi_offset), AV_OPT_TYPE_INT, { .i64 = 18 }, 0, 20, ENC },
+    { "teletext_vbi_offset", "teletext VBI waveform start sample offset (tune so the clock run-in meets OP-42 12us timing)", OFFSET(teletext_vbi_offset), AV_OPT_TYPE_INT, { .i64 = 18 }, 0, 64, ENC },
     { "socket_path" , "Unix socket path for external frame input", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "socket_listen", "Listen on socket for external frame input", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "shm_name", "Shared memory name for cross-process frame buffer", OFFSET(shm_name), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },

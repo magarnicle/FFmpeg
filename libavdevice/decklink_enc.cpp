@@ -1409,7 +1409,7 @@ static int decklink_setup_subtitle(AVFormatContext *avctx, AVStream *st)
         /* Teletext for VANC output */
         ctx->teletext_st = st;
         ff_decklink_packet_queue_init(avctx, &ctx->teletext_queue, 1024 * 1024);
-        av_log(avctx, AV_LOG_INFO, "Teletext stream configured for VANC output\n");
+        av_log(avctx, AV_LOG_INFO, "Teletext stream configured (HD: OP-47 VANC; SD PAL: VBI lines 21/334)\n");
         ret = 0;
         break;
 #endif
@@ -1827,7 +1827,7 @@ static void log_teletext_packet(AVFormatContext *avctx, AVPacket *pkt)
             text_buf[--len] = '\0';
 
         /* Log all rows, even empty ones, for debugging */
-        av_log(avctx, AV_LOG_INFO, "  Row %2d: \"%s\"%s\n",
+        av_log(avctx, AV_LOG_DEBUG, "  Row %2d: \"%s\"%s\n",
                row, len > 0 ? text_buf : "(empty)",
                row == 0 ? " [header]" : "");
     }
@@ -2303,7 +2303,7 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
                                         teletext_data, 42, ctx->teletext_vbi_offset);
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_DEBUG,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
                teletext_data[2], teletext_data[3], teletext_data[4], teletext_data[5],
@@ -2314,30 +2314,38 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     }
 }
 
-/* Insert teletext VBI waveforms directly into SD PAL VBI lines
- * This is called for SD PAL mode where we write raw teletext waveforms
- * to VBI lines 21 (field 1) and 334 (field 2) per Australian OP-47.
+/* Insert teletext VBI waveforms directly into SD PAL VBI lines 21/334.
  *
- * Each encoder packet contains multiple data units (rows). We store all rows
- * and cycle through them, sending one row per frame. This allows the full
- * teletext page to be transmitted over multiple frames.
+ * Transmission model per Free TV Australia OP-42:
+ *   - A subtitle from the teletext encoder is one "page" (data unit 0 = header,
+ *     followed by content rows).
+ *   - When a new page arrives we burst it once: two distinct packets per frame,
+ *     one on line 21 (field 1) and one on line 334 (field 2), header first, so a
+ *     5-row page is fully transmitted in 3 frames (~120 ms at 25 fps).
+ *   - Between updates we emit dummy headers (page 8FF, sec 8) on both lines
+ *     every frame to keep the signal continuous (sec 6) rather than "bursty".
+ *   - After 10 s with no update we send a cleardown blank page (the last header
+ *     with the C4 erase bit set, sec 7) and repeat every 10 s.
+ *
+ * Because the header carries C4 (erase) baked in by the encoder, a new page now
+ * erases-then-rebuilds exactly once per caption instead of every frame.
  */
 static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                        IDeckLinkVideoFrameAncillary *vanc)
 {
     AVPacket teletext_pkt;
     int ret;
+    uint8_t clear_pkt[42];
 
     /* Only process if we're in SD PAL mode */
     if (ctx->bmd_mode != bmdModePAL)
         return;
 
-    /* Check for new teletext packets and extract all data units */
+    /* Drain the queue: a new encoder packet is a new page to transmit. */
     while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
         int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
-        if (pts > ctx->last_pts) {
+        if (pts > ctx->last_pts)
             break;
-        }
 
         ret = ff_decklink_packet_queue_get(&ctx->teletext_queue, &teletext_pkt, 0);
         if (ret <= 0)
@@ -2349,63 +2357,79 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             continue;
         }
 
-        log_teletext_packet(avctx, &teletext_pkt);
+        if (av_log_get_level() >= AV_LOG_DEBUG)
+            log_teletext_packet(avctx, &teletext_pkt);
 
         /* Parse all data units from the packet (each is 46 bytes) */
         int num_units = teletext_pkt.size / 46;
         if (num_units > 5)
-            num_units = 5;  /* Limit to 5 rows max */
+            num_units = 5;  /* teletext_rows[] holds at most 5 */
 
         if (num_units > 0) {
-            ctx->teletext_row_count = num_units;
-            ctx->teletext_row_index = 0;  /* Reset to start of new content */
-            ctx->has_teletext_data = 1;
-
-            av_log(avctx, AV_LOG_DEBUG, "Teletext: storing %d data units from packet\n", num_units);
-
             for (int i = 0; i < num_units; i++) {
                 uint8_t *du = teletext_pkt.data + (i * 46);
                 /* Copy 42-byte payload (bytes 4-45 of each data unit) */
                 memcpy(ctx->teletext_rows[i], du + 4, 42);
             }
+            ctx->teletext_row_count = num_units;
+            ctx->teletext_row_index = 0;   /* transmit cursor */
+            ctx->teletext_tx_active = 1;    /* start bursting this page */
+            ctx->teletext_idle_frames = 0;
+            ctx->has_teletext_data = 1;
+            av_log(avctx, AV_LOG_DEBUG, "Teletext: new page, %d rows\n", num_units);
         }
 
         av_packet_unref(&teletext_pkt);
     }
 
-    /* Determine which data to transmit */
-    const uint8_t *data_to_send;
-    if (ctx->has_teletext_data && ctx->teletext_row_count > 0) {
-        /* Send current row and advance index for next frame */
-        data_to_send = ctx->teletext_rows[ctx->teletext_row_index];
+    int do_f1 = (ctx->teletext_fields != TELETEXT_FIELDS_EVEN);
+    int do_f2 = (ctx->teletext_fields != TELETEXT_FIELDS_ODD);
+    int both  = do_f1 && do_f2;
 
-        av_log(avctx, AV_LOG_DEBUG, "Teletext: sending row %d of %d\n",
-               ctx->teletext_row_index, ctx->teletext_row_count);
-        av_log(avctx, AV_LOG_INFO,
-               "  MRAG + data bytes 0-19: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-               data_to_send[0], data_to_send[1], data_to_send[2], data_to_send[3],
-               data_to_send[4], data_to_send[5], data_to_send[6], data_to_send[7],
-               data_to_send[8], data_to_send[9], data_to_send[10], data_to_send[11],
-               data_to_send[12], data_to_send[13], data_to_send[14], data_to_send[15],
-               data_to_send[16], data_to_send[17], data_to_send[18], data_to_send[19]);
+    const uint8_t *f1_data = teletext_filler_packet;
+    const uint8_t *f2_data = teletext_filler_packet;
 
-        /* Advance to next row for next frame, wrapping around */
-        ctx->teletext_row_index = (ctx->teletext_row_index + 1) % ctx->teletext_row_count;
+    if (ctx->teletext_tx_active && ctx->teletext_row_count > 0) {
+        /* Bursting the current page; header (index 0) goes out first. */
+        int c = ctx->teletext_row_index;
+        f1_data = ctx->teletext_rows[c];
+        f2_data = ctx->teletext_rows[c];
+        if (both) {
+            /* Two distinct rows per frame across both fields. */
+            f2_data = (c + 1 < ctx->teletext_row_count) ? ctx->teletext_rows[c + 1]
+                                                        : teletext_filler_packet;
+            ctx->teletext_row_index += 2;
+        } else {
+            /* Single field enabled: one row per frame. */
+            ctx->teletext_row_index += 1;
+        }
+        if (ctx->teletext_row_index >= ctx->teletext_row_count) {
+            ctx->teletext_tx_active = 0;     /* page fully sent -> idle */
+            ctx->teletext_idle_frames = 0;
+        }
     } else {
-        /* No data yet - send filler */
-        data_to_send = teletext_filler_packet;
-        av_log(avctx, AV_LOG_DEBUG, "Teletext: sending filler (no data)\n");
+        /* Idle: continuous dummy headers (sec 6), with a 10 s cleardown (sec 7). */
+        ctx->teletext_idle_frames++;
+        int64_t ten_sec = ctx->bmd_tb_num ?
+            (int64_t)10 * ctx->bmd_tb_den / ctx->bmd_tb_num : 250;
+        if (ctx->has_teletext_data && ten_sec > 0 &&
+            ctx->teletext_idle_frames >= ten_sec) {
+            /* Blank page = last header with the C4 erase bit set. The encoder
+             * always uses subcode 0, so byte 5 = ham84(0x08) = 0xD0 forces C4=1. */
+            memcpy(clear_pkt, ctx->teletext_rows[0], sizeof(clear_pkt));
+            clear_pkt[5] = 0xD0;
+            f1_data = clear_pkt;
+            f2_data = clear_pkt;
+            ctx->teletext_idle_frames = 0;   /* re-arm: repeat every 10 s */
+            av_log(avctx, AV_LOG_DEBUG, "Teletext: OP-42 cleardown (blank page, C4=1)\n");
+        }
+        /* otherwise both fields carry the dummy header (page 8FF) */
     }
 
-    /* Insert on VBI line 21 (field 1 / odd field) */
-    if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
-    }
-
-    /* Insert on VBI line 334 (field 2 / even field) */
-    if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
-    }
+    if (do_f1)
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, f1_data);
+    if (do_f2)
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, f2_data);
 }
 
 /* Parse any EIA-608 subtitles sitting on the queue, and write packet side data
@@ -2503,28 +2527,41 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
         goto done;
     }
 
-    /* For SD PAL mode, insert teletext as raw VBI waveforms on lines 21/334
-     * This must be done after ancillary data creation so we can access VBI line buffers */
+    /* For SD PAL mode, insert teletext as raw VBI waveforms on lines 21/334.
+     * This must be done after ancillary data creation so we can access VBI line
+     * buffers. The waveform is written as V210, so output must be 10-bit; 8-bit
+     * packs the VBI line differently and would corrupt the signal. We check here
+     * rather than at write_header because pre_render defers bmd_mode until the
+     * device is initialised. */
     if (ctx->teletext_st && ctx->bmd_mode == bmdModePAL) {
-        /* Diagnostic: test which VBI lines the SDK accepts */
-        static int diag_done = 0;
-        if (!diag_done) {
-            diag_done = 1;
-            av_log(avctx, AV_LOG_INFO, "Testing available VBI lines for SD PAL:\n");
-            for (int test_line = 1; test_line <= 30; test_line++) {
-                void *test_buf;
-                HRESULT hr = vanc->GetBufferForVerticalBlankingLine(test_line, &test_buf);
-                av_log(avctx, AV_LOG_INFO, "  Line %d: %s (0x%08x)\n",
-                       test_line, (hr == S_OK) ? "OK" : "FAIL", (unsigned int)hr);
+        if (ctx->raw_format != bmdFormat10BitYUV) {
+            if (!ctx->teletext_format_warned) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "SD PAL teletext requires 10-bit v210 output; got 8-bit. "
+                       "VBI teletext not inserted - use -c:v v210.\n");
+                ctx->teletext_format_warned = 1;
             }
-            for (int test_line = 310; test_line <= 345; test_line++) {
-                void *test_buf;
-                HRESULT hr = vanc->GetBufferForVerticalBlankingLine(test_line, &test_buf);
-                av_log(avctx, AV_LOG_INFO, "  Line %d: %s (0x%08x)\n",
-                       test_line, (hr == S_OK) ? "OK" : "FAIL", (unsigned int)hr);
+        } else {
+            /* One-time diagnostic (debug only): which VBI lines does the SDK accept? */
+            static int diag_done = 0;
+            if (!diag_done && av_log_get_level() >= AV_LOG_DEBUG) {
+                diag_done = 1;
+                av_log(avctx, AV_LOG_DEBUG, "Testing available VBI lines for SD PAL:\n");
+                for (int test_line = 1; test_line <= 30; test_line++) {
+                    void *test_buf;
+                    HRESULT hr = vanc->GetBufferForVerticalBlankingLine(test_line, &test_buf);
+                    av_log(avctx, AV_LOG_DEBUG, "  Line %d: %s (0x%08x)\n",
+                           test_line, (hr == S_OK) ? "OK" : "FAIL", (unsigned int)hr);
+                }
+                for (int test_line = 310; test_line <= 345; test_line++) {
+                    void *test_buf;
+                    HRESULT hr = vanc->GetBufferForVerticalBlankingLine(test_line, &test_buf);
+                    av_log(avctx, AV_LOG_DEBUG, "  Line %d: %s (0x%08x)\n",
+                           test_line, (hr == S_OK) ? "OK" : "FAIL", (unsigned int)hr);
+                }
             }
+            construct_teletext_vbi_sd(avctx, ctx, vanc);
         }
-        construct_teletext_vbi_sd(avctx, ctx, vanc);
     }
 
     /* Now that we've got all the VANC lines in a nice orderly manner, generate the

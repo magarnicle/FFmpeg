@@ -149,11 +149,14 @@ struct decklink_ctx {
     /* Teletext output queue and state */
     DecklinkPacketQueue teletext_queue;
     DecklinkTeletextFields teletext_fields;
-    int teletext_vbi_offset;         /* VBI waveform start sample offset (0-20) */
-    uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
-    int teletext_row_count;          /* Number of stored rows */
-    int teletext_row_index;          /* Current row index for cycling */
-    int has_teletext_data;           /* Whether we have valid teletext data */
+    int teletext_vbi_offset;         /* VBI waveform start sample offset */
+    uint8_t teletext_rows[5][42];    /* Current page rows (data unit 0 = header) */
+    int teletext_row_count;          /* Number of rows in the current page */
+    int teletext_row_index;          /* Transmit cursor: next row to send */
+    int has_teletext_data;           /* Whether a page has ever been received */
+    int teletext_tx_active;          /* 1 = bursting the current page across lines 21/334 */
+    int64_t teletext_idle_frames;    /* Frames since the current page finished transmitting */
+    int teletext_format_warned;      /* SD-PAL non-V210 guard: error logged once */
 
     /* Streams present */
     int audio;

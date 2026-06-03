@@ -303,6 +303,19 @@ and playback begins.
 Set to @option{0} to use time-based triggering via @option{pre_render_until}.
 Defaults to @option{0}.
 
+@item teletext_fields
+Selects which fields carry the WST teletext VBI signal for closed-caption
+output on SD PAL (lines 21 and 334). Must be @samp{both}, @samp{odd} (line 21
+only) or @samp{even} (line 334 only). With @samp{both}, two distinct teletext
+packets are transmitted per frame (one per field) so a full page is sent in
+fewer frames. Defaults to @samp{both} (per Free TV Australia OP-42/OP-47).
+
+@item teletext_vbi_offset
+Start sample offset of the teletext VBI waveform within the 720-sample active
+line for SD PAL output. Tune this so the clock run-in meets the OP-42 timing
+(the penultimate "1" at 12 microseconds +/- 0.288 from the line timing
+reference), as checked on a waveform monitor. Defaults to @option{18}.
+
 @end table
 
 @subsection Examples
@@ -354,6 +367,22 @@ Pre-render 250 frames (~10 seconds at 25fps) before starting playback:
 ffmpeg -i test.avi -f decklink -pix_fmt uyvy422 \
     -output_buffer_size 2000000000 -pre_render 1 -pre_render_frames 250 \
     'DeckLink Mini Monitor'
+@end example
+
+@item
+Closed captions as WST teletext on SD PAL, per Free TV Australia Operational
+Practice OP-42 (VBI lines 21/334, magazine 8, page 801). The teletext waveform
+is written into the VBI as V210, so the video output must be 10-bit
+(@code{-c:v v210}); 8-bit output is rejected for teletext. The @code{teletext}
+subtitle encoder carries the OP-42 header control bits: @option{subtitle_flag}
+(C6=1, default), @option{update_indicator} (C8=1) and @option{erase_page} (C4,
+erase-then-rebuild on each new caption). Between captions the device emits OP-42
+dummy headers (page 8FF) to keep the signal continuous:
+@example
+ffmpeg -i program.mov -i captions.srt \
+    -map 0:v -c:v v210 -map 0:a -c:a pcm_s16le \
+    -map 1:s -c:s teletext -page 801 -subtitle_flag 1 -update_indicator 1 -erase_page 1 \
+    -f decklink -teletext_fields both 'DeckLink SDI'
 @end example
 
 @end itemize
