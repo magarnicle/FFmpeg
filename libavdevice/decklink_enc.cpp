@@ -27,6 +27,9 @@
 #include <poll.h>
 #include <errno.h>
 #include <time.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
 #define DECKLINK_CAN_GET_TOTAL_RAM 1
 #endif
@@ -305,6 +308,72 @@ public:
 static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt);
 static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt);
 
+/* Promote the calling output thread to SCHED_FIFO so the realtime DeckLink
+ * playout cannot be starved by the (SCHED_OTHER) decode/filter worker threads.
+ * A CPU spike in the filtergraph at a concat segment boundary previously starved
+ * the audio output thread long enough that it fell behind the card's playout
+ * clock and tripped the late_threshold abort, even though the async buffer was
+ * full. Any SCHED_FIFO priority preempts every SCHED_OTHER worker, so a modest
+ * priority is sufficient; the audio thread is given a slightly higher priority
+ * than video because it is the timing-critical one (no buffer-slot backpressure
+ * to pace it, and the late check aborts the whole output).
+ *
+ * SCHED_FIFO requires CAP_SYS_NICE or a non-zero RLIMIT_RTPRIO. When that is
+ * unavailable pthread_setschedparam() returns EPERM; we fall back to a
+ * best-effort negative nice and warn loudly so the operator can grant the
+ * privilege. Priority setup never fails the output itself. */
+static void decklink_set_output_thread_priority(AVFormatContext *avctx,
+                                                const char *name,
+                                                int fifo_offset, int nice_fallback)
+{
+    int min_prio = sched_get_priority_min(SCHED_FIFO);
+    int max_prio = sched_get_priority_max(SCHED_FIFO);
+    struct sched_param param = {};
+    int ret;
+
+    if (min_prio < 0 || max_prio < 0) {
+        av_log(avctx, AV_LOG_WARNING,
+               "%s thread: SCHED_FIFO unavailable on this platform; running at "
+               "default priority.\n", name);
+        return;
+    }
+
+    param.sched_priority = FFMIN(min_prio + fifo_offset, max_prio);
+
+    /* pthread_setschedparam() returns an errno value directly (0 on success);
+     * it does not set the global errno. */
+    ret = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+    if (ret == 0) {
+        av_log(avctx, AV_LOG_INFO,
+               "%s thread: SCHED_FIFO priority %d set for realtime output.\n",
+               name, param.sched_priority);
+        return;
+    }
+
+    if (ret == EPERM) {
+        /* On Linux the nice value is per-thread, addressed by the kernel tid. */
+        errno = 0;
+        if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), nice_fallback) == 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "%s thread: no permission for SCHED_FIFO (need CAP_SYS_NICE "
+                   "or a non-zero RLIMIT_RTPRIO); fell back to nice %d. Grant "
+                   "realtime scheduling to prevent audio-late playout aborts "
+                   "under CPU load.\n", name, nice_fallback);
+        } else {
+            av_log(avctx, AV_LOG_WARNING,
+                   "%s thread: no permission for SCHED_FIFO (need CAP_SYS_NICE "
+                   "or a non-zero RLIMIT_RTPRIO) and nice fallback failed (%s); "
+                   "running at default priority. Audio-late playout aborts are "
+                   "likely under CPU load.\n", name, strerror(errno));
+        }
+        return;
+    }
+
+    av_log(avctx, AV_LOG_WARNING,
+           "%s thread: could not set SCHED_FIFO priority (%s); running at "
+           "default priority.\n", name, strerror(ret));
+}
+
 /* Video consumer thread - pulls from video queue and schedules to DeckLink.
  * This thread may block waiting for DeckLink buffer slots, which is why we need
  * a separate audio thread.
@@ -322,6 +391,7 @@ static void *decklink_video_output_thread(void *arg)
     int pre_render_logged = 0;
 
     av_log(avctx, AV_LOG_INFO, "Video output thread started\n");
+    decklink_set_output_thread_priority(avctx, "Video output", 1, -10);
 
     while (!ctx->output_thread_stop) {
         /* In pre-render mode, wait for device to be ready */
@@ -393,6 +463,7 @@ static void *decklink_audio_output_thread(void *arg)
     int pre_render_logged = 0;
 
     av_log(avctx, AV_LOG_INFO, "Audio output thread started\n");
+    decklink_set_output_thread_priority(avctx, "Audio output", 2, -19);
 
     while (!ctx->output_thread_stop) {
         /* In pre-render mode, wait for device to be ready */
