@@ -289,6 +289,45 @@ if [[ -n "$TRUE_PEAK" ]]; then
     TP_OVER=$(python3 -c "print(1 if $TRUE_PEAK > -2 else 0)")
     if [[ "$TP_OVER" == "1" ]]; then
         error "True peak is ${TRUE_PEAK} dBTP, exceeds -2 dBTP limit"
+        TP_VIOLATIONS=$(echo "$QC_OUTPUT" | grep "FTPK:" | python3 -c "
+import sys, re
+THRESHOLD = -2.0
+violations = []
+for line in sys.stdin:
+    t_m = re.search(r't:\s*([\d.]+)', line)
+    fp_m = re.search(r'FTPK:\s*([-\d.]+)\s+([-\d.]+)', line)
+    if t_m and fp_m:
+        t = float(t_m.group(1))
+        for i, v in enumerate([float(fp_m.group(1)), float(fp_m.group(2))]):
+            if v > THRESHOLD:
+                violations.append((t, i + 1))
+from collections import defaultdict
+ch_times = defaultdict(list)
+for t, ch in violations:
+    ch_times[ch].append(t)
+def to_tc(s, fps=25):
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    fr = int((s % 1) * fps)
+    return f'{h:02d}:{m:02d}:{sec:02d}:{fr:02d}'
+def merge(times, gap=1.05):
+    if not times: return []
+    times = sorted(times)
+    runs, start, prev = [], times[0], times[0]
+    for t in times[1:]:
+        if t - prev > gap: runs.append((start, prev)); start = t
+        prev = t
+    runs.append((start, prev))
+    return runs
+for ch in sorted(ch_times):
+    for start, end in merge(ch_times[ch]):
+        dur = round(end - start + 0.1, 2)
+        print(f'  {to_tc(start)}  Audio true-peak violation beginning at {to_tc(start)} for {dur:.2f} seconds for channel {ch}.')
+" 2>/dev/null || true)
+        if [[ -n "$TP_VIOLATIONS" ]]; then
+            echo "$TP_VIOLATIONS" | tee -a "$REPORT"
+        fi
     else
         info "True peak: ${TRUE_PEAK} dBTP (OK, below -2 dBTP)"
     fi
