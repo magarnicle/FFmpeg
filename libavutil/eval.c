@@ -818,11 +818,14 @@ int av_expr_parse_and_eval(double *d, const char *s,
     *d = av_expr_eval(e, const_values, opaque);
     av_expr_free(e);
     if (isnan(*d)) {
-        int i;
-        av_log(log_ctx, AV_LOG_ERROR, "Expression '%s' evaluated to NAN, likely because these variables are NAN:", s);
-        for (i = 0; const_names && const_names[i]; i++) {
-            if (isnan(const_values[i]))
-                av_log(log_ctx, AV_LOG_ERROR, " %s", const_names[i]);
+        av_log(log_ctx, AV_LOG_ERROR, "Expression '%s' evaluated to NAN", s);
+        if (const_names && const_values) {
+            int i;
+            av_log(log_ctx, AV_LOG_ERROR, ", likely because these variables are NAN:");
+            for (i = 0; const_names[i]; i++) {
+                if (isnan(const_values[i]))
+                    av_log(log_ctx, AV_LOG_ERROR, " %s", const_names[i]);
+            }
         }
         av_log(log_ctx, AV_LOG_ERROR, "\n");
         return AVERROR(EINVAL);
