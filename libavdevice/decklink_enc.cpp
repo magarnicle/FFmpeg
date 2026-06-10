@@ -1525,6 +1525,35 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
         return 0;
     }
 
+    /* Pre-render: if ffmpeg reached input EOF before the scheduled start time,
+     * the entire program fit inside the async output buffer.  Stopping the
+     * trigger thread now (below) would tear it down before it ever fires, so
+     * the DeckLink is never started and the SDI output stays black across the
+     * whole slot.  Hold here until the trigger fires and the device becomes
+     * ready, so playout actually begins; the real-time drain below then plays
+     * the buffered program out.  Only wait when a future time trigger is
+     * pending and we have buffered content to play. */
+    if (ctx->pre_render_trigger_started && !ctx->pre_render_device_ready &&
+        ctx->pre_render_start_time > 0 && !ctx->output_thread_error &&
+        ff_decklink_packet_queue_size(&ctx->output_video_queue) > 0) {
+        int64_t now = av_gettime();
+        if (now < ctx->pre_render_start_time)
+            av_log(avctx, AV_LOG_INFO,
+                   "Pre-render: input ended %.1f s before scheduled start; "
+                   "holding buffered program until playout trigger fires\n",
+                   (ctx->pre_render_start_time - now) / 1000000.0);
+        while (!ctx->pre_render_device_ready && !ctx->output_thread_error) {
+            if (avctx->interrupt_callback.callback &&
+                avctx->interrupt_callback.callback(avctx->interrupt_callback.opaque)) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "Pre-render: interrupted while waiting for trigger; "
+                       "aborting before playout started\n");
+                break;
+            }
+            usleep(10000);  /* 10ms */
+        }
+    }
+
     /* Stop pre-render trigger thread first */
     if (ctx->pre_render_trigger_started) {
         ctx->pre_render_trigger_stop = 1;
