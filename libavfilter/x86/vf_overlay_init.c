@@ -32,11 +32,17 @@ int ff_overlay_row_20_sse4(uint8_t *d, uint8_t *da, uint8_t *s, uint8_t *a,
 int ff_overlay_row_22_sse4(uint8_t *d, uint8_t *da, uint8_t *s, uint8_t *a,
                            int w, ptrdiff_t alinesize);
 
+int ff_overlay_row_44_10_sse4(uint16_t *d, uint16_t *da, uint16_t *s, uint16_t *a,
+                              int w, ptrdiff_t alinesize);
+
+int ff_overlay_row_44_10_avx2(uint16_t *d, uint16_t *da, uint16_t *s, uint16_t *a,
+                              int w, ptrdiff_t alinesize);
+
 av_cold void ff_overlay_init_x86(AVFilterContext *ctx)
 {
     OverlayContext *s = ctx->priv;
     const AVFilterLink *main = ctx->inputs[0];
-    const AVFilterLink *overlay = ctx->inputs[0];
+    const AVFilterLink *overlay = ctx->inputs[1];
     int cpu_flags = av_get_cpu_flags();
     int main_has_alpha = s->main_has_alpha;
 
@@ -64,5 +70,24 @@ av_cold void ff_overlay_init_x86(AVFilterContext *ctx)
         s->blend_row[0] = ff_overlay_row_44_sse4;
         s->blend_row[1] = ff_overlay_row_22_sse4;
         s->blend_row[2] = ff_overlay_row_22_sse4;
+    }
+
+    /* 10-bit formats */
+    if (EXTERNAL_SSE4(cpu_flags) &&
+        s->format == OVERLAY_FORMAT_YUV444P10 &&
+        overlay->alpha_mode != AVALPHA_MODE_PREMULTIPLIED && !main_has_alpha) {
+        s->blend_row_16[0] = ff_overlay_row_44_10_sse4;
+        s->blend_row_16[1] = ff_overlay_row_44_10_sse4;
+        s->blend_row_16[2] = ff_overlay_row_44_10_sse4;
+        av_log(ctx, AV_LOG_VERBOSE, "using SSE4 for 10-bit 4:4:4 blend\n");
+    }
+
+    if (EXTERNAL_AVX2_FAST(cpu_flags) &&
+        s->format == OVERLAY_FORMAT_YUV444P10 &&
+        overlay->alpha_mode != AVALPHA_MODE_PREMULTIPLIED && !main_has_alpha) {
+        s->blend_row_16[0] = ff_overlay_row_44_10_avx2;
+        s->blend_row_16[1] = ff_overlay_row_44_10_avx2;
+        s->blend_row_16[2] = ff_overlay_row_44_10_avx2;
+        av_log(ctx, AV_LOG_VERBOSE, "using AVX2 for 10-bit 4:4:4 blend\n");
     }
 }

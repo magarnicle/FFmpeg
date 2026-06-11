@@ -29,6 +29,8 @@ pb_1:     times 16 db 1
 pw_128:   times  8 dw 128
 pw_255:   times  8 dw 255
 pw_257:   times  8 dw 257
+pd_512:   times  4 dd 512
+pd_1023:  times  4 dd 1023
 
 SECTION .text
 
@@ -95,6 +97,107 @@ cglobal overlay_row_22, 5, 7, 6, 0, dst, da, s, a, w, r, x
         packuswb    m0, m0
         movq [dstq+xq], m0
         add         xq, mmsize/2
+        cmp         xq, wq
+        jl .loop
+
+    .end:
+    mov    eax, xd
+    RET
+
+; 10-bit 4:4:4 overlay blend (straight alpha, no main alpha)
+; Computes: dst = (dst * (1023 - alpha) + src * alpha + 512) >> 10
+; Processes 4 pixels per iteration using 32-bit intermediates
+INIT_XMM sse4
+cglobal overlay_row_44_10, 5, 7, 8, 0, dst, da, s, a, w, r, x
+    xor          xq, xq
+    movsxdifnidn wq, wd
+    mov          rq, wq
+    and          rq, 3                  ; remainder
+    cmp          wq, 4
+    jl .end
+    sub          wq, rq
+    mova         m6, [pd_1023]
+    mova         m7, [pd_512]
+    .loop:
+        ; Load 4 pixels (16-bit each) and zero-extend to 32-bit
+        movq        m0, [sq + xq*2]      ; src (4 x 16-bit)
+        movq        m1, [dstq + xq*2]    ; dst
+        movq        m2, [aq + xq*2]      ; alpha
+
+        pmovzxwd    m0, m0               ; src -> 4 x 32-bit
+        pmovzxwd    m1, m1               ; dst -> 4 x 32-bit
+        pmovzxwd    m2, m2               ; alpha -> 4 x 32-bit
+
+        ; m3 = 1023 - alpha
+        mova        m3, m6
+        psubd       m3, m2
+
+        ; m1 = dst * (1023 - alpha)
+        pmulld      m1, m3
+
+        ; m0 = src * alpha
+        pmulld      m0, m2
+
+        ; m0 = dst*(1023-alpha) + src*alpha + 512
+        paddd       m0, m1
+        paddd       m0, m7
+
+        ; m0 = result >> 10
+        psrld       m0, 10
+
+        ; Pack back to 16-bit and store
+        packusdw    m0, m0
+        movq  [dstq + xq*2], m0
+
+        add         xq, 4
+        cmp         xq, wq
+        jl .loop
+
+    .end:
+    mov    eax, xd
+    RET
+
+; AVX2 version - processes 8 pixels per iteration
+INIT_YMM avx2
+cglobal overlay_row_44_10, 5, 7, 8, 0, dst, da, s, a, w, r, x
+    xor          xq, xq
+    movsxdifnidn wq, wd
+    mov          rq, wq
+    and          rq, 7                  ; remainder
+    cmp          wq, 8
+    jl .end
+    sub          wq, rq
+    vpbroadcastd m6, [pd_1023]
+    vpbroadcastd m7, [pd_512]
+    .loop:
+        ; Load 8 pixels (16-bit each) and zero-extend to 32-bit
+        vpmovzxwd   m0, [sq + xq*2]      ; src -> 8 x 32-bit
+        vpmovzxwd   m1, [dstq + xq*2]    ; dst -> 8 x 32-bit
+        vpmovzxwd   m2, [aq + xq*2]      ; alpha -> 8 x 32-bit
+
+        ; m3 = 1023 - alpha
+        vpsubd      m3, m6, m2
+
+        ; m1 = dst * (1023 - alpha)
+        vpmulld     m1, m1, m3
+
+        ; m0 = src * alpha
+        vpmulld     m0, m0, m2
+
+        ; m0 = dst*(1023-alpha) + src*alpha + 512
+        vpaddd      m0, m0, m1
+        vpaddd      m0, m0, m7
+
+        ; m0 = result >> 10
+        vpsrld      m0, m0, 10
+
+        ; Pack back to 16-bit: need to pack 8x32 -> 8x16
+        ; packusdw in AVX2 works within 128-bit lanes, so we need to permute
+        vextracti128 xm1, m0, 1          ; high 4 dwords
+        packusdw    xm0, xm1             ; pack to 8 x 16-bit
+        movu  [dstq + xq*2], xm0
+
+        add         xq, 8
         cmp         xq, wq
         jl .loop
 

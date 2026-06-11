@@ -79,6 +79,8 @@ typedef struct OverlayContext {
 
     int (*blend_row[4])(uint8_t *d, uint8_t *da, uint8_t *s, uint8_t *a, int w,
                         ptrdiff_t alinesize);
+    int (*blend_row_16[4])(uint16_t *d, uint16_t *da, uint16_t *s, uint16_t *a, int w,
+                           ptrdiff_t alinesize);
     int (*blend_slice)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
 } OverlayContext;
 

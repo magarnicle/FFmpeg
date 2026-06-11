@@ -512,6 +512,17 @@ static av_always_inline void blend_plane_##depth##_##nbits##bits(AVFilterContext
             a += (1 << hsub) * c;                                                                          \
             k += c;                                                                                        \
         }                                                                                                  \
+        if (nbits == 10 && !hsub && !vsub && octx->blend_row_16[i]) {                                      \
+            int c = octx->blend_row_16[i]((uint16_t*)d, (uint16_t*)da, (uint16_t*)s,                       \
+                    (uint16_t*)a, kmax - k, src->linesize[3]);                                             \
+                                                                                                           \
+            s += c;                                                                                        \
+            d  = PTR_ADD(T, d, dst_step * c);                                                              \
+            if (main_straight)                                                                             \
+                da += c;                                                                                   \
+            a += c;                                                                                        \
+            k += c;                                                                                        \
+        }                                                                                                  \
         for (; k < kmax; k++) {                                                                            \
             int alpha_v, alpha_h, alpha;                                                                   \
                                                                                                            \
