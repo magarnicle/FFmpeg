@@ -1,6 +1,7 @@
 TOOLS = enc_recon_frame_test enum_options qt-faststart scale_slice_test trasher uncoded_frame
 TOOLS-$(CONFIG_LIBMYSOFA) += sofa2wavs
 TOOLS-$(CONFIG_ZLIB) += cws2fws
+TOOLS-$(CONFIG_LIBKLVANC) += op47_extract
 
 tools/target_dec_%_fuzzer.o: tools/target_dec_fuzzer.c
 	$(COMPILE_C) -DFFMPEG_DECODER=$*
@@ -29,6 +30,7 @@ tools/target_swr_fuzzer.o: tools/target_swr_fuzzer.c
 tools/enc_recon_frame_test$(EXESUF): tools/decode_simple.o
 tools/venc_data_dump$(EXESUF): tools/decode_simple.o
 tools/scale_slice_test$(EXESUF): tools/decode_simple.o
+tools/op47_extract$(EXESUF): $(FF_DEP_LIBS)
 
 tools/decode_simple.o: | tools
 

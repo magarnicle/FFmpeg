@@ -90,6 +90,8 @@ tools/scale_slice_test$(EXESUF): ELIBS = $(FF_EXTRALIBS)
 tools/sofa2wavs$(EXESUF): ELIBS = $(FF_EXTRALIBS)
 tools/uncoded_frame$(EXESUF): $(FF_DEP_LIBS)
 tools/uncoded_frame$(EXESUF): ELIBS = $(FF_EXTRALIBS)
+tools/op47_extract$(EXESUF): $(FF_DEP_LIBS)
+tools/op47_extract$(EXESUF): ELIBS = $(FF_EXTRALIBS) -lklvanc
 tools/target_dec_%_fuzzer$(EXESUF): $(FF_DEP_LIBS)
 tools/target_dem_%_fuzzer$(EXESUF): $(FF_DEP_LIBS)
 
