@@ -242,6 +242,7 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
         return AVERROR(ENOMEM);
     fci = ff_fc_internal(s);
     si = &fci->fc;
+    fci->requested_seek_ts = AV_NOPTS_VALUE;
     if (!s->av_class) {
         av_log(NULL, AV_LOG_ERROR, "Input context has not been properly allocated by avformat_alloc_context() and is not NULL either\n");
         return AVERROR(EINVAL);
@@ -641,6 +642,12 @@ static int add_source_filename_metadata(AVFormatContext *s, AVPacket *pkt)
     av_dict_set(&d, "lavf.source_basename", av_basename(s->url), 0);
     av_log(NULL, AV_LOG_DEBUG, "source filename: %s\n", s->url);
 
+    /* If this input was seeked as a whole (e.g. -ss), carry the offset so the
+     * playout muxer can report it. Stored in AV_TIME_BASE (microsecond) units. */
+    if (ff_fc_internal(s)->requested_seek_ts != AV_NOPTS_VALUE)
+        av_dict_set_int(&d, "lavf.source_seek_us",
+                        ff_fc_internal(s)->requested_seek_ts, 0);
+
     packed_metadata = av_packet_pack_dictionary(d, &metadata_len);
     av_dict_free(&d);
     if (!packed_metadata)
@@ -714,12 +721,10 @@ FF_ENABLE_DEPRECATION_WARNINGS
         }
 
         /* Add source filename metadata to packet */
-        if (0){
         err = add_source_filename_metadata(s, pkt);
         if (err < 0)
             av_log(s, AV_LOG_WARNING, "Failed to add source filename metadata: %s\n",
                    av_err2str(err));
-        }
 
         err = handle_new_packet(s, pkt, 1);
         if (err <= 0) /* Error or passthrough */

@@ -672,6 +672,13 @@ int avformat_seek_file(AVFormatContext *s, int stream_index, int64_t min_ts,
     if (stream_index < -1 || stream_index >= (int)s->nb_streams)
         return AVERROR(EINVAL);
 
+    /* Record whole-file seeks (stream_index < 0, ts in AV_TIME_BASE units) so
+     * per-packet source metadata can report that the input was seeked, e.g. by
+     * an fftools -ss input option. Stream-relative seeks are skipped since ts
+     * would be in stream time_base, not a meaningful wall-clock offset here. */
+    if (stream_index < 0)
+        ff_fc_internal(s)->requested_seek_ts = ts;
+
     if (s->seek2any > 0)
         flags |= AVSEEK_FLAG_ANY;
     flags &= ~AVSEEK_FLAG_BACKWARD;

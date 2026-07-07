@@ -125,14 +125,17 @@ extern bool operator==(const REFIID& me, const REFIID& other){
 	   me.byte14 == other.byte14 &&
 	   me.byte15 == other.byte15;
 }
+/* Format a " -ss=N.NNNs" suffix for playout logs; defined below. */
+static void format_seek_suffix(char *buf, size_t buf_size, int64_t seek_us);
+
 /* DeckLink callback class declaration */
 class decklink_frame : public IDeckLinkVideoFrame_v14_2_1
 {
 public:
     decklink_frame(struct decklink_ctx *ctx, AVFrame *avframe, AVCodecID codec_id, int height, int width) :
-        _ctx(ctx), _avframe(avframe), _avpacket(NULL), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width),  _refs(1) { }
+        _ctx(ctx), _avframe(avframe), _avpacket(NULL), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width), _source_filename(NULL), _pts(AV_NOPTS_VALUE), _source_seek_us(AV_NOPTS_VALUE), _refs(1) { }
     decklink_frame(struct decklink_ctx *ctx, AVPacket *avpacket, AVCodecID codec_id, int height, int width) :
-        _ctx(ctx), _avframe(NULL), _avpacket(avpacket), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width), _refs(1) { }
+        _ctx(ctx), _avframe(NULL), _avpacket(avpacket), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width), _source_filename(NULL), _pts(AV_NOPTS_VALUE), _source_seek_us(AV_NOPTS_VALUE), _refs(1) { }
     virtual long           STDMETHODCALLTYPE GetWidth      (void)          { return _width; }
     virtual long           STDMETHODCALLTYPE GetHeight     (void)          { return _height; }
     virtual long           STDMETHODCALLTYPE GetRowBytes   (void)
@@ -210,6 +213,7 @@ public:
         if (!ret) {
             av_frame_free(&_avframe);
             av_packet_free(&_avpacket);
+            av_freep(&_source_filename);
             if (_ancillary)
                 _ancillary->Release();
             delete this;
@@ -224,6 +228,9 @@ public:
     IDeckLinkVideoFrameAncillary *_ancillary;
     int _height;
     int _width;
+    char *_source_filename;
+    int64_t _pts;
+    int64_t _source_seek_us;
 
 private:
     std::atomic<int>  _refs;
@@ -245,6 +252,24 @@ public:
             case bmdOutputFrameDropped: result_str = "dropped"; break;
             case bmdOutputFrameFlushed: result_str = "flushed"; break;
             default: result_str = "unknown"; break;
+        }
+
+        /* Log the segment the card actually puts on-air. This callback fires in
+         * display order as each frame completes, so the first frame of a new
+         * source filename marks the real on-air segment boundary (as opposed to
+         * the earlier SCHEDULED log emitted when the frame was enqueued). Only
+         * frames that were genuinely displayed count. */
+        if (frame->_source_filename &&
+            (result == bmdOutputFrameCompleted || result == bmdOutputFrameDisplayedLate) &&
+            (!ctx->last_onair_source_filename ||
+             strcmp(frame->_source_filename, ctx->last_onair_source_filename) != 0)) {
+            char seek_suffix[64];
+            format_seek_suffix(seek_suffix, sizeof(seek_suffix), frame->_source_seek_us);
+            av_log(NULL, AV_LOG_INFO,
+                   "decklink: ON-AIR new segment: %s (pts=%"PRId64")%s\n",
+                   frame->_source_filename, frame->_pts, seek_suffix);
+            av_free(ctx->last_onair_source_filename);
+            ctx->last_onair_source_filename = av_strdup(frame->_source_filename);
         }
 
         if (frame->_avframe) {
@@ -1665,7 +1690,8 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     }
 
     /* Free source filename tracking */
-    av_freep(&ctx->last_logged_source_filename);
+    av_freep(&ctx->last_scheduled_source_filename);
+    av_freep(&ctx->last_onair_source_filename);
 
     ff_ccfifo_uninit(&ctx->cc_fifo);
     av_freep(&cctx->ctx);
@@ -2671,14 +2697,19 @@ done:
 }
 #endif
 
-/* Extract source filename from packet metadata */
-static char *get_packet_source_filename(AVPacket *pkt)
+/* Extract source filename from packet metadata. If seek_us is non-NULL it is
+ * set to the input's whole-file seek offset (e.g. -ss) in AV_TIME_BASE units,
+ * or AV_NOPTS_VALUE if the input was not seeked. */
+static char *get_packet_source_filename(AVPacket *pkt, int64_t *seek_us)
 {
     size_t size;
     const uint8_t *side_metadata;
     AVDictionary *metadata = NULL;
     AVDictionaryEntry *entry = NULL;
     char *filename = NULL;
+
+    if (seek_us)
+        *seek_us = AV_NOPTS_VALUE;
 
     side_metadata = av_packet_get_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA, &size);
     if (!side_metadata || size == 0)
@@ -2695,8 +2726,24 @@ static char *get_packet_source_filename(AVPacket *pkt)
     if (entry)
         filename = av_strdup(entry->value);
 
+    if (seek_us) {
+        entry = av_dict_get(metadata, "lavf.source_seek_us", NULL, 0);
+        if (entry)
+            *seek_us = strtoll(entry->value, NULL, 10);
+    }
+
     av_dict_free(&metadata);
     return filename;
+}
+
+/* Format a seek suffix for playout logs, e.g. " -ss=630.000s", or an empty
+ * string if the input was not seeked. */
+static void format_seek_suffix(char *buf, size_t buf_size, int64_t seek_us)
+{
+    if (seek_us == AV_NOPTS_VALUE || seek_us == 0)
+        buf[0] = '\0';
+    else
+        snprintf(buf, buf_size, " (-ss=%.3fs)", (double)seek_us / AV_TIME_BASE);
 }
 
 /* Schedule a video packet to decklink - called directly or from consumer thread */
@@ -2710,21 +2757,6 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     decklink_frame *frame;
     uint32_t buffered;
     HRESULT hr;
-
-    /* Log source filename when it changes */
-    char *source_filename = get_packet_source_filename(pkt);
-    if (source_filename) {
-        /* Only log if filename changed to avoid log spam */
-        if (!ctx->last_logged_source_filename ||
-            strcmp(source_filename, ctx->last_logged_source_filename) != 0) {
-            av_log(avctx, AV_LOG_INFO,
-                   "Now playing from source: %s (pts=%"PRId64")\n",
-                   source_filename, pkt->pts);
-            av_free(ctx->last_logged_source_filename);
-            ctx->last_logged_source_filename = av_strdup(source_filename);
-        }
-        av_free(source_filename);
-    }
 
     /* Check if frame is late and should be dropped or errored */
     if (ctx->playback_started) {
@@ -2793,6 +2825,29 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
         av_frame_free(&avframe);
         av_packet_free(&avpacket);
         return AVERROR(EIO);
+    }
+
+    /* Attach the source filename to the frame so the completion callback can
+     * log when the card actually puts a new segment on-air. Also emit a
+     * debug-level SCHEDULED boundary here (fires when the frame is enqueued,
+     * ahead of playout) for lead-time diagnostics. Ownership of the string
+     * transfers to the frame and is freed in decklink_frame::Release(). */
+    int64_t source_seek_us = AV_NOPTS_VALUE;
+    char *source_filename = get_packet_source_filename(pkt, &source_seek_us);
+    if (source_filename) {
+        if (!ctx->last_scheduled_source_filename ||
+            strcmp(source_filename, ctx->last_scheduled_source_filename) != 0) {
+            char seek_suffix[64];
+            format_seek_suffix(seek_suffix, sizeof(seek_suffix), source_seek_us);
+            av_log(avctx, AV_LOG_DEBUG,
+                   "decklink: SCHEDULED new segment: %s (pts=%"PRId64")%s\n",
+                   source_filename, pkt->pts, seek_suffix);
+            av_free(ctx->last_scheduled_source_filename);
+            ctx->last_scheduled_source_filename = av_strdup(source_filename);
+        }
+        frame->_source_filename = source_filename;
+        frame->_pts = pkt->pts;
+        frame->_source_seek_us = source_seek_us;
     }
 
     /* Wait for decklink buffer slot */

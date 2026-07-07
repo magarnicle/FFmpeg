@@ -21,6 +21,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/dict.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bytestream.h"
 #include "codec_internal.h"
@@ -101,6 +103,35 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         if (!buf)
             return AVERROR(ENOMEM);
         memcpy(buf, side_data->data, side_data->size);
+    }
+
+    /* Carry source-file identification (lavf.source_filename / _basename) from
+     * frame metadata onto the packet as STRINGS_METADATA side data. The decoder
+     * stashes it in frame->metadata and filters like concat preserve it, but the
+     * encode boundary would otherwise drop it - propagating it lets downstream
+     * muxers (e.g. decklink) log which concat segment is playing. */
+    {
+        const AVDictionaryEntry *e;
+        AVDictionary *src_md = NULL;
+        if ((e = av_dict_get(pic->metadata, "lavf.source_filename", NULL, 0)))
+            av_dict_set(&src_md, e->key, e->value, 0);
+        if ((e = av_dict_get(pic->metadata, "lavf.source_basename", NULL, 0)))
+            av_dict_set(&src_md, e->key, e->value, 0);
+        if ((e = av_dict_get(pic->metadata, "lavf.source_seek_us", NULL, 0)))
+            av_dict_set(&src_md, e->key, e->value, 0);
+        if (src_md) {
+            size_t md_size;
+            uint8_t *packed = av_packet_pack_dictionary(src_md, &md_size);
+            av_dict_free(&src_md);
+            if (packed) {
+                ret = av_packet_add_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA,
+                                              packed, md_size);
+                if (ret < 0) {
+                    av_freep(&packed);
+                    return ret;
+                }
+            }
+        }
     }
 
     *got_packet = 1;

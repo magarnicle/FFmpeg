@@ -93,6 +93,14 @@ typedef struct FormatContextInternal {
              * Set if chapter ids are strictly monotonic.
              */
             int chapter_ids_monotonic;
+
+            /**
+             * Timestamp (AV_TIME_BASE units) of the most recent whole-file seek
+             * requested via avformat_seek_file() with stream_index < 0 (e.g. an
+             * fftools -ss input seek), or AV_NOPTS_VALUE if never seeked. Used to
+             * annotate per-packet source metadata for playout logging.
+             */
+            int64_t requested_seek_ts;
         };
     };
 } FormatContextInternal;

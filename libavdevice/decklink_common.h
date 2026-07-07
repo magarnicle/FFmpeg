@@ -165,7 +165,8 @@ struct decklink_ctx {
     int64_t last_pts;
     unsigned long frameCount;
     unsigned int dropped;
-    char *last_logged_source_filename;
+    char *last_scheduled_source_filename;
+    char *last_onair_source_filename;
     AVStream *audio_st;
     AVStream *video_st;
     AVStream *klv_st;
