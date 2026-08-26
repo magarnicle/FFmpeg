@@ -3139,12 +3139,32 @@ static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
     case AV_CODEC_ID_EIA_608:
         ff_ccfifo_extractbytes(&ctx->cc_fifo, pkt->data, pkt->size);
         break;
-    case AV_CODEC_ID_DVB_TELETEXT:
-        /* Queue teletext packets for VANC insertion */
+    case AV_CODEC_ID_DVB_TELETEXT: {
+        /* Queue teletext packets for VANC insertion.
+         *
+         * The drain side (construct_teletext / construct_teletext_vbi_sd) gates
+         * each queued packet against ctx->last_pts, which tracks the DeckLink
+         * video frame clock in the mode timebase (ctx->bmd_tb_num/bmd_tb_den,
+         * e.g. 1/25). Subtitle packets, however, reach us in the subtitle stream
+         * timebase (typically 1/1000000). Without rescaling, a microsecond-scale
+         * PTS always compares as far in the future ("pts > last_pts"), so the
+         * gate never releases a packet: no teletext is ever inserted and the
+         * queue simply fills until it overruns. Rescale the PTS into the video
+         * frame timebase so the comparison is meaningful.
+         *
+         * pkt->time_base is set by the muxing layer (fftools/ffmpeg_mux.c) to the
+         * stream timebase the PTS is expressed in; fall back to st->time_base if
+         * it is not populated. */
+        AVRational frame_tb = av_make_q(ctx->bmd_tb_num, ctx->bmd_tb_den);
+        AVRational src_tb   = (pkt->time_base.num && pkt->time_base.den)
+                                  ? pkt->time_base : st->time_base;
+        if (frame_tb.num && frame_tb.den && src_tb.num && src_tb.den)
+            av_packet_rescale_ts(pkt, src_tb, frame_tb);
         if (ff_decklink_packet_queue_put(&ctx->teletext_queue, pkt) < 0) {
             av_log(avctx, AV_LOG_WARNING, "Failed to queue teletext packet\n");
         }
         break;
+    }
     default:
         av_log(avctx, AV_LOG_WARNING, "Unsupported subtitle codec in packet\n");
         break;
