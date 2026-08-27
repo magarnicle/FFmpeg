@@ -2163,9 +2163,27 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     const uint16_t LUMA_BLACK = 64;   /* Black level */
     const uint16_t CHROMA_NEUTRAL = 512;  /* Neutral chroma */
 
+    /* Width of the VBI line buffer. This used to be hardcoded to 720; use the
+     * caller-supplied line_width instead so we match whatever the DeckLink VBI
+     * line buffer actually is on this device (V210 rows are padded to 48-pixel /
+     * 128-byte blocks, so the real width can exceed 720). Clamp to the scratch
+     * buffer below. Logged once so we can see the real value. */
+    static int width_logged = 0;
+    if (!width_logged) {
+        width_logged = 1;
+        av_log(NULL, AV_LOG_INFO,
+               "Teletext VBI waveform: line_width=%d (previously hardcoded 720)\n",
+               line_width);
+    }
+
     /* Create array of 10-bit luma values for the line */
-    uint16_t luma[720];
-    for (int i = 0; i < 720; i++)
+    uint16_t luma[2048];
+    int width = line_width;
+    if (width < 0)
+        width = 0;
+    if (width > (int)(sizeof(luma) / sizeof(luma[0])))
+        width = (int)(sizeof(luma) / sizeof(luma[0]));
+    for (int i = 0; i < width; i++)
         luma[i] = LUMA_BLACK;
 
     /* Start position for teletext data in the VBI buffer
@@ -2189,7 +2207,7 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         uint16_t value = (bit & 1) ? LUMA_LOW : LUMA_HIGH;
         int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
         int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
-        for (int p = start_pixel; p < end_pixel && p < 720; p++)
+        for (int p = start_pixel; p < end_pixel && p < width; p++)
             luma[p] = value;
         bit_pos_fp += SAMPLES_PER_BIT_FP;
     }
@@ -2200,7 +2218,7 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         uint16_t value = (framing & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
         int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
         int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
-        for (int p = start_pixel; p < end_pixel && p < 720; p++)
+        for (int p = start_pixel; p < end_pixel && p < width; p++)
             luma[p] = value;
         bit_pos_fp += SAMPLES_PER_BIT_FP;
     }
@@ -2212,7 +2230,7 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
             uint16_t value = (byte & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
             int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
             int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
-            for (int p = start_pixel; p < end_pixel && p < 720; p++)
+            for (int p = start_pixel; p < end_pixel && p < width; p++)
                 luma[p] = value;
             bit_pos_fp += SAMPLES_PER_BIT_FP;
         }
@@ -2220,7 +2238,7 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
 
     /* Convert to V210 format: 6 pixels per 16 bytes */
     uint32_t *v210 = (uint32_t *)line_buf;
-    for (int i = 0; i < 720; i += 6) {
+    for (int i = 0; i + 6 <= width; i += 6) {
         uint16_t y0 = luma[i];
         uint16_t y1 = luma[i + 1];
         uint16_t y2 = luma[i + 2];
