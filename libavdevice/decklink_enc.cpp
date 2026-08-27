@@ -3338,6 +3338,29 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
             }
         }
 
+        /* Set up subtitle/data streams. Unlike video and audio (handled above via
+         * deferred extraction and opened when the trigger fires), these need no
+         * open device: decklink_setup_subtitle() just records ctx->teletext_st /
+         * ctx->cc_fifo and initializes the teletext queue. Without this the normal
+         * setup loop below is never reached in pre_render mode, so teletext_st
+         * stays NULL and construct_teletext_vbi_sd() is skipped even though the
+         * write path keeps queuing (and overrunning) teletext packets. */
+        for (n = 0; n < avctx->nb_streams; n++) {
+            AVStream *st = avctx->streams[n];
+            AVCodecParameters *c = st->codecpar;
+            if (c->codec_type == AVMEDIA_TYPE_DATA) {
+                if (decklink_setup_data(avctx, st)) {
+                    av_freep(&cctx->ctx);
+                    return AVERROR(EIO);
+                }
+            } else if (c->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+                if (decklink_setup_subtitle(avctx, st)) {
+                    av_freep(&cctx->ctx);
+                    return AVERROR(EIO);
+                }
+            }
+        }
+
         if (!ctx->video) {
             av_log(avctx, AV_LOG_ERROR, "Pre-render: no video stream found\n");
             av_freep(&cctx->ctx);
