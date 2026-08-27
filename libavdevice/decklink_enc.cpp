@@ -3154,8 +3154,18 @@ static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
          *
          * pkt->time_base is set by the muxing layer (fftools/ffmpeg_mux.c) to the
          * stream timebase the PTS is expressed in; fall back to st->time_base if
-         * it is not populated. */
-        AVRational frame_tb = av_make_q(ctx->bmd_tb_num, ctx->bmd_tb_den);
+         * it is not populated.
+         *
+         * The target is the video frame clock that ctx->last_pts is tracked in.
+         * Once the DeckLink device is open that is bmd_tb_num/bmd_tb_den, but in
+         * pre_render mode teletext packets are queued during the fill, before the
+         * device is initialized (bmd_tb_num/den are still 0). Fall back to the
+         * deferred video timebase captured at write_header, which is the same
+         * video stream timebase last_pts is measured in. Without this the rescale
+         * is skipped during pre_render and the microsecond PTS never drains. */
+        AVRational frame_tb = (ctx->bmd_tb_num && ctx->bmd_tb_den)
+                                  ? av_make_q(ctx->bmd_tb_num, ctx->bmd_tb_den)
+                                  : ctx->deferred_video_tb;
         AVRational src_tb   = (pkt->time_base.num && pkt->time_base.den)
                                   ? pkt->time_base : st->time_base;
         if (frame_tb.num && frame_tb.den && src_tb.num && src_tb.den)
