@@ -2556,6 +2556,18 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
     struct klvanc_line_set_s vanc_lines = { 0 };
     int ret = 0, i;
 
+    /* One-time diagnostic: report the state of the two gates that decide whether
+     * teletext is ever inserted — supports_vanc (VANC/VBI output enabled on the
+     * device) and whether we selected the SD PAL mode used by the SD VBI path. */
+    static int vanc_state_logged = 0;
+    if (!vanc_state_logged) {
+        vanc_state_logged = 1;
+        av_log(avctx, AV_LOG_INFO,
+               "VANC path state: supports_vanc=%d bmd_mode=0x%08x is_PAL=%d teletext_st=%d\n",
+               ctx->supports_vanc, (unsigned)ctx->bmd_mode,
+               ctx->bmd_mode == bmdModePAL, ctx->teletext_st != NULL);
+    }
+
     if (!ctx->supports_vanc)
         return 0;
 
