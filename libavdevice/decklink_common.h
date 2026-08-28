@@ -154,6 +154,7 @@ struct decklink_ctx {
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */
     int has_teletext_data;           /* Whether we have valid teletext data */
+    int teletext_erase_pending;      /* Header still carries C4=1; clear it after first transmission */
 
     /* Streams present */
     int audio;

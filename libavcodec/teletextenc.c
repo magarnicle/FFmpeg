@@ -94,6 +94,8 @@ typedef struct TeletextEncContext {
     uint16_t page_bcd;  /* Page number in BCD */
     int mag_encoded;    /* Magazine encoded (0-7) */
     uint8_t page_buffer[TELETEXT_ROWS][TELETEXT_COLS];  /* Current page content */
+    uint8_t prev_page_buffer[TELETEXT_ROWS][TELETEXT_COLS];  /* Last transmitted content */
+    int erase_this_frame;  /* C4 asserted this frame due to a content change */
     int sequence_num;   /* Packet sequence counter */
 } TeletextEncContext;
 
@@ -308,39 +310,48 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
 }
 
 /**
- * Encode MRAG (Magazine and Row Address Group) per ITU-R BT.653-3
- * Bits are interleaved: Byte1 = M1,R0,M2,R1  Byte2 = R2,R3,R4,M3
+ * Encode MRAG (Magazine and Row Address Group) per ETS 300 706 s7.1.2
+ *
+ * The address is two Hamming 8/4 code words carrying 8 message bits:
+ * magazine (3 bits) and packet/row address (5 bits). The first word holds
+ * the magazine in its low three data bits and row bit 0 as its top data bit;
+ * the second word holds row bits 1-4:
+ *   Byte1 nibble = M0 M1 M2 R0        Byte2 nibble = R1 R2 R3 R4
+ *
+ * This matches the decoder in decklink_enc.cpp (log_teletext_packet), which
+ * reads magazine from byte4 bits 0-2, row bit 0 from byte4 bit 3, and row
+ * bits 1-4 from byte5.
  */
 static void encode_mrag(int mag, int row, uint8_t *byte1, uint8_t *byte2)
 {
-    int m1 = (mag >> 0) & 1;
-    int m2 = (mag >> 1) & 1;
-    int m3 = (mag >> 2) & 1;
+    int m0 = (mag >> 0) & 1;
+    int m1 = (mag >> 1) & 1;
+    int m2 = (mag >> 2) & 1;
     int r0 = (row >> 0) & 1;
     int r1 = (row >> 1) & 1;
     int r2 = (row >> 2) & 1;
     int r3 = (row >> 3) & 1;
     int r4 = (row >> 4) & 1;
 
-    *byte1 = ff_teletext_ham84(m1 | (r0 << 1) | (m2 << 2) | (r1 << 3));
-    *byte2 = ff_teletext_ham84(r2 | (r3 << 1) | (r4 << 2) | (m3 << 3));
+    *byte1 = ff_teletext_ham84(m0 | (m1 << 1) | (m2 << 2) | (r0 << 3));
+    *byte2 = ff_teletext_ham84(r1 | (r2 << 1) | (r3 << 2) | (r4 << 3));
 }
 
 /**
  * Build a teletext header row (row 0) per ETS 300 706
  *
- * Page header structure (42 bytes total):
+ * Page header structure (42 bytes total) per ETS 300 706 Table 3. The
+ * subcode is 13 bits split S1(4) S2(3) S3(4) S4(2), with the control bits
+ * C4-C14 packed alongside S2/S4 and in the two following code words:
  *   Bytes 0-1:   MRAG (Hamming 8/4)
  *   Bytes 2-3:   Page units, page tens (Hamming 8/4)
- *   Byte 4:      S1 bits 0-3 (Hamming 8/4)
- *   Byte 5:      S1 bits 4-6 (bits 0-2) + C4 (bit 3) (Hamming 8/4)
- *   Byte 6:      S2 bits 0-3 (Hamming 8/4)
- *   Byte 7:      S2 bits 4-6 (bits 0-2) + C5 (bit 3) (Hamming 8/4)
- *   Byte 8:      S3 bits 0-3 (Hamming 8/4)
- *   Byte 9:      S4 bits 0-1 (bits 0-1) + C6 (bit 2) + C7 (bit 3) (Hamming 8/4)
- *   Byte 10:     C8 (bit 0) + C9 (bit 1) + C10 (bit 2) + C11 (bit 3) (Hamming 8/4)
- *   Byte 11:     C12-C14 national charset (bits 0-2) + spare (bit 3) (Hamming 8/4)
- *   Bytes 12-41: 30 characters page header display (odd parity)
+ *   Byte 4:      S1 (bits 0-3) (Hamming 8/4)
+ *   Byte 5:      S2 (bits 0-2) + C4 erase page (bit 3) (Hamming 8/4)
+ *   Byte 6:      S3 (bits 0-3) (Hamming 8/4)
+ *   Byte 7:      S4 (bits 0-1) + C5 newsflash (bit 2) + C6 subtitle (bit 3)
+ *   Byte 8:      C7 suppress header (bit 0) + C8 update (bit 1) + C9 (bit 2) + C10 (bit 3)
+ *   Byte 9:      C11 magazine serial (bit 0) + C12-C14 national charset (bits 1-3)
+ *   Bytes 10-41: 32 characters page header display (odd parity)
  *
  * Control bits per OP-42:
  *   C4 = Erase Page (set to 1 between caption transmissions)
@@ -362,33 +373,32 @@ static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
     line[2] = ff_teletext_ham84(ctx->page_bcd & 0x0F);
     line[3] = ff_teletext_ham84((ctx->page_bcd >> 4) & 0x0F);
 
-    /* Byte 4: S1 bits 0-3 (subcode low nibble) */
+    /* Byte 4: S1 (subcode bits 0-3) */
     line[4] = ff_teletext_ham84(0);
 
-    /* Byte 5: S1 bits 4-6 (bits 0-2) + C4 erase page (bit 3) */
-    line[5] = ff_teletext_ham84(ctx->erase_page ? 0x08 : 0);
+    /* Byte 5: S2 (bits 0-2) + C4 erase page (bit 3).
+     * C4 is asserted either by the erase_page option or automatically on the
+     * header of a frame where the caption content changed (OP-42 4h) so the
+     * decoder clears the previous page before painting the new rows. */
+    line[5] = ff_teletext_ham84((ctx->erase_page || ctx->erase_this_frame) ? 0x08 : 0);
 
-    /* Byte 6: S2 bits 0-3 (subcode low nibble) */
+    /* Byte 6: S3 (subcode bits 0-3) */
     line[6] = ff_teletext_ham84(0);
 
-    /* Byte 7: S2 bits 4-6 (bits 0-2) + C5 newsflash (bit 3) */
-    line[7] = ff_teletext_ham84(0);  /* C5 = 0 */
+    /* Byte 7: S4 (bits 0-1) + C5 newsflash (bit 2) + C6 subtitle (bit 3) per
+     * EN 300 706 s9.3.1. S4 is a 2-bit subcode field, so C6 is the top data bit. */
+    line[7] = ff_teletext_ham84(ctx->subtitle_flag ? 0x08 : 0);  /* C6 at bit 3 */
 
-    /* Byte 8: S3 bits 0-3 */
-    line[8] = ff_teletext_ham84(0);
+    /* Byte 8: C7 suppress header (bit 0) + C8 update (bit 1) + C9 interrupted (bit 2) + C10 inhibit (bit 3) */
+    line[8] = ff_teletext_ham84(ctx->update_indicator ? 0x02 : 0);  /* C8 at bit 1 */
 
-    /* Byte 9: S4 bits 0-1 (bits 0-1) + C6 subtitle (bit 2) + C7 suppress header (bit 3) */
-    line[9] = ff_teletext_ham84(ctx->subtitle_flag ? 0x04 : 0);  /* C6 at bit 2 */
+    /* Byte 9: C11 magazine serial (bit 0) + C12-C14 national option charset (bits 1-3)
+     * C11 = 0 for parallel mode per OP-42 4e */
+    line[9] = ff_teletext_ham84((ctx->region & 0x07) << 1);
 
-    /* Byte 10: C8 update (bit 0) + C9 interrupted (bit 1) + C10 inhibit (bit 2) + C11 serial (bit 3) */
-    line[10] = ff_teletext_ham84(ctx->update_indicator ? 0x01 : 0);  /* C8 at bit 0, C11=0 for parallel */
-
-    /* Byte 11: C12-C14 national option charset = region (bits 0-2) + spare (bit 3) */
-    line[11] = ff_teletext_ham84(ctx->region & 0x07);
-
-    /* Bytes 12-41: 30 characters page header display (odd parity) */
-    for (int i = 0; i < 30; i++) {
-        line[12 + i] = ff_teletext_odd_parity(' ');
+    /* Bytes 10-41: 32 characters page header display (odd parity) */
+    for (int i = 0; i < 32; i++) {
+        line[10 + i] = ff_teletext_odd_parity(' ');
     }
 }
 
@@ -474,6 +484,10 @@ static av_cold int teletext_encode_init(AVCodecContext *avctx)
 
     ctx->sequence_num = 0;
     clear_page_buffer(ctx);
+    /* Seed the "previously transmitted" page as blank so a content change is
+     * detected the first time a real caption is encoded. */
+    memset(ctx->prev_page_buffer, ' ', sizeof(ctx->prev_page_buffer));
+    ctx->erase_this_frame = 0;
 
     av_log(avctx, AV_LOG_INFO, "Teletext encoder initialized: page %d, magazine %d, region %d\n",
            ctx->page, ctx->magazine, ctx->region);
@@ -492,7 +506,12 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
     clear_page_buffer(ctx);
 
     if (!sub || sub->num_rects == 0) {
-        /* Empty subtitle - generate clear page */
+        /* Empty subtitle - generate clear page. Assert C4 if this clears
+         * content that was previously on screen. */
+        ctx->erase_this_frame = memcmp(ctx->page_buffer, ctx->prev_page_buffer,
+                                       sizeof(ctx->page_buffer)) != 0;
+        memcpy(ctx->prev_page_buffer, ctx->page_buffer, sizeof(ctx->page_buffer));
+
         /* Build header row */
         build_header_row(ctx, line_data);
 
@@ -576,6 +595,13 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
         av_log(avctx, AV_LOG_DEBUG, "Teletext: wrote %d lines total\n", line_count);
     }
 
+    /* Assert C4 (erase page) on this header if the visible content differs
+     * from what we last transmitted, so the decoder clears the old caption
+     * before painting the new rows (OP-42 4h). */
+    ctx->erase_this_frame = memcmp(ctx->page_buffer, ctx->prev_page_buffer,
+                                   sizeof(ctx->page_buffer)) != 0;
+    memcpy(ctx->prev_page_buffer, ctx->page_buffer, sizeof(ctx->page_buffer));
+
     /* Generate teletext packets */
     /* Header row (row 0) */
     build_header_row(ctx, line_data);
@@ -586,7 +612,9 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
                                 0, 7, ctx->mag_encoded, 0, line_data);
     total_size += TELETEXT_DATA_UNIT_SIZE;
 
-    /* Content rows (rows 1-23) - only emit non-empty rows near the subtitle area */
+    /* Content rows - only emit rows that actually carry text. Blank rows are
+     * not transmitted: the C4 erase-page bit clears stale content, so sending
+     * empty R22/R23 every cycle would only waste VBI bandwidth. */
     for (int row = 19; row < TELETEXT_ROWS && row <= 23; row++) {
         /* Check if row has content */
         int has_content = 0;
@@ -597,7 +625,7 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
             }
         }
 
-        if (has_content || row >= 20) {
+        if (has_content) {
             build_content_row(ctx, line_data, row);
             if (total_size + TELETEXT_DATA_UNIT_SIZE > buf_size)
                 return AVERROR_BUFFER_TOO_SMALL;
@@ -627,7 +655,7 @@ static const AVOption teletext_options[] = {
     { "region", "Character set region (0-15)", OFFSET(region), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 15, VE },
     { "double_height", "Use double height text (OP-42 4d)", OFFSET(double_height), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "erase_page", "C4: Erase page between transmissions (OP-42 4h)", OFFSET(erase_page), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
-    { "update_indicator", "C8: Update indicator flag (OP-42 4g)", OFFSET(update_indicator), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
+    { "update_indicator", "C8: Update indicator flag (OP-42 4g)", OFFSET(update_indicator), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { "subtitle_flag", "C6: Subtitle indicator flag (OP-42 4f)", OFFSET(subtitle_flag), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { NULL }
 };

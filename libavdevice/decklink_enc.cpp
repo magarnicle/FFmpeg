@@ -1860,6 +1860,13 @@ static inline uint16_t vanc_parity(uint8_t byte)
     return (b9 << 9) | (b8 << 8) | byte;
 }
 
+/* Hamming 8/4 encode table: maps 4-bit value to protected byte (mirrors
+ * ff_teletext_ham84_encode in libavcodec/teletextenc.c) */
+static const uint8_t ham84_encode[16] = {
+    0x15, 0x02, 0x49, 0x5E, 0x64, 0x73, 0x38, 0x2F,
+    0xD0, 0xC7, 0x8C, 0x9B, 0xA1, 0xB6, 0xFD, 0xEA
+};
+
 /* Hamming 8/4 decode table: maps encoded byte to 4-bit value (0xFF = invalid) */
 static const uint8_t ham84_decode[256] = {
     0x01, 0xFF, 0x01, 0x01, 0xFF, 0x00, 0x01, 0xFF,
@@ -1895,6 +1902,17 @@ static const uint8_t ham84_decode[256] = {
     0x08, 0xFF, 0xFF, 0x05, 0xFF, 0x0E, 0x0D, 0xFF,
     0xFF, 0x0E, 0x0F, 0xFF, 0x0E, 0x0E, 0xFF, 0x0E,
 };
+
+/* Clear the C4 (erase page) bit in a stored page-header row (byte 5, bit 3 of
+ * the decoded nibble). Used to age out the erase flag after the header has been
+ * transmitted once, so a decoder only clears the page on a genuine content
+ * change rather than on every retransmission cycle. */
+static void teletext_clear_erase_bit(uint8_t *header_row)
+{
+    uint8_t nibble = ham84_decode[header_row[5]];
+    if (nibble != 0xFF && (nibble & 0x08))
+        header_row[5] = ham84_encode[nibble & 0x07];
+}
 
 /* Extract and log text content from teletext data units for debugging.
  * Teletext data unit structure (46 bytes):
@@ -2265,26 +2283,34 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
  * Per OP-42: "time filling headers... are by convention 0,FF (Magazine 0
  * known as 8, page FF) with a subcode of 0x3F7E"
  *
- * Page header structure per ETS 300 706:
+ * Page header structure per ETS 300 706 Table 3:
  *   Bytes 0-1:   MRAG (magazine 8 encoded as 0, row 0)
- *   Bytes 2-3:   Page FF
- *   Bytes 4-9:   Subcode + C4-C7 (all 0 for dummy header)
- *   Bytes 10-11: C8-C14 (all 0)
- *   Bytes 12-41: 30 display characters (spaces)
+ *   Bytes 2-3:   Page FF (units=F, tens=F)
+ *   Byte 4:      S1 (subcode nibble)
+ *   Byte 5:      S2 + C4 (erase page)
+ *   Byte 6:      S3 (subcode nibble)
+ *   Byte 7:      S4 + C5 (newsflash) + C6 (subtitle)
+ *   Byte 8:      C7-C10 (all 0)
+ *   Byte 9:      C11-C14 (all 0)
+ *   Bytes 10-41: 32 display characters (spaces)
  *
- * Hamming 8/4 values: ham84(0)=0x15, ham84(0xF)=0xEA
+ * Subcode 0x3F7E decomposes to S1=0xE, S2=0x7, S3=0xF, S4=0x3 with all
+ * control bits 0. Hamming 8/4 values: ham84(0)=0x15, ham84(0x3)=0x5E,
+ * ham84(0x7)=0x2F, ham84(0xE)=0xFD, ham84(0xF)=0xEA
  */
 static const uint8_t teletext_filler_packet[42] = {
     0x15, 0x15,  /* MRAG: magazine 8 (encoded 0), row 0 */
     0xEA, 0xEA,  /* Page FF (units=F, tens=F) */
-    0x15, 0x15,  /* S1 low, S1 high + C4=0 */
-    0x15, 0x15,  /* S2 low, S2 high + C5=0 */
-    0x15, 0x15,  /* S3, S4 + C6=0 + C7=0 */
-    0x15, 0x15,  /* C8-C11=0, C12-C14=0 */
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 30 spaces */
+    0xFD,        /* S1 = 0xE */
+    0x2F,        /* S2 = 0x7 + C4=0 */
+    0xEA,        /* S3 = 0xF */
+    0x5E,        /* S4 = 0x3 + C5=0 + C6=0 */
+    0x15,        /* C7-C10 = 0 */
+    0x15,        /* C11-C14 = 0 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 32 spaces */
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
 /* Filler teletext data unit for HD VANC (OP-47 SDP format)
@@ -2300,14 +2326,16 @@ static const uint8_t teletext_filler_data_unit[46] = {
     0xE4,        /* framing_code */
     0x15, 0x15,  /* MRAG: magazine 8 (encoded 0), row 0 */
     0xEA, 0xEA,  /* Page FF (units=F, tens=F) */
-    0x15, 0x15,  /* S1 low, S1 high + C4=0 */
-    0x15, 0x15,  /* S2 low, S2 high + C5=0 */
-    0x15, 0x15,  /* S3, S4 + C6=0 + C7=0 */
-    0x15, 0x15,  /* C8-C11=0, C12-C14=0 */
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 30 spaces */
+    0xFD,        /* S1 = 0xE */
+    0x2F,        /* S2 = 0x7 + C4=0 */
+    0xEA,        /* S3 = 0xF */
+    0x5E,        /* S4 = 0x3 + C5=0 + C6=0 */
+    0x15,        /* C7-C10 = 0 */
+    0x15,        /* C11-C14 = 0 */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,  /* 32 spaces */
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
 /* Insert OP-47 VANC packet on specified line */
@@ -2378,6 +2406,7 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
             ctx->teletext_row_count = num_units;
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
             ctx->has_teletext_data = 1;
+            ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
 
             for (int i = 0; i < num_units; i++) {
                 uint8_t *du = teletext_pkt.data + (i * 46);
@@ -2394,9 +2423,21 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
     const uint8_t *teletext_data;
 
     if (ctx->has_teletext_data && ctx->teletext_row_count > 0) {
-        teletext_data = ctx->teletext_rows[ctx->teletext_row_index];
+        int idx = ctx->teletext_row_index;
+        if (idx == 0) {
+            if (ctx->teletext_erase_pending) {
+                /* First header transmission after a content change: it goes out
+                 * with C4=1, then we stop asserting erase on later cycles. */
+                ctx->teletext_erase_pending = 0;
+            } else {
+                /* Later cycles: ensure the header no longer erases the page so
+                 * the decoder doesn't clear and re-render every ~100ms. */
+                teletext_clear_erase_bit(ctx->teletext_rows[0]);
+            }
+        }
+        teletext_data = ctx->teletext_rows[idx];
         /* Advance to next row for next frame */
-        ctx->teletext_row_index = (ctx->teletext_row_index + 1) % ctx->teletext_row_count;
+        ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
     } else {
         teletext_data = teletext_filler_packet;
     }
@@ -2504,6 +2545,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             ctx->teletext_row_count = num_units;
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
             ctx->has_teletext_data = 1;
+            ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
 
             av_log(avctx, AV_LOG_DEBUG, "Teletext: storing %d data units from packet\n", num_units);
 
@@ -2520,6 +2562,16 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     /* Determine which data to transmit */
     const uint8_t *data_to_send;
     if (ctx->has_teletext_data && ctx->teletext_row_count > 0) {
+        /* Age out the header's C4 erase bit: keep it set for the first header
+         * transmission after a content change, then clear it so the decoder
+         * doesn't clear and re-render the page every retransmission cycle. */
+        if (ctx->teletext_row_index == 0) {
+            if (ctx->teletext_erase_pending)
+                ctx->teletext_erase_pending = 0;
+            else
+                teletext_clear_erase_bit(ctx->teletext_rows[0]);
+        }
+
         /* Send current row and advance index for next frame */
         data_to_send = ctx->teletext_rows[ctx->teletext_row_index];
 
