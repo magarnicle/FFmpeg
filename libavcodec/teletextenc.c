@@ -523,10 +523,16 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
         return TELETEXT_DATA_UNIT_SIZE;
     }
 
-    /* Process subtitle rectangles */
-    int current_row = 20;  /* Start near bottom of teletext page */
+    /* Collect all display lines across rectangles first, then bottom-anchor
+     * them: the last line sits on R23 and further lines grow upward. This
+     * matches the OP-42 subtitle placement used by broadcast inserters
+     * (e.g. Polistream), which anchor captions to the bottom of the page. */
+    uint8_t lines[TELETEXT_ROWS][TELETEXT_COLS];
+    int line_lens[TELETEXT_ROWS];
+    int line_colors[TELETEXT_ROWS];
+    int num_lines = 0;
 
-    for (unsigned i = 0; i < sub->num_rects && current_row < TELETEXT_ROWS; i++) {
+    for (unsigned i = 0; i < sub->num_rects && num_lines < TELETEXT_ROWS; i++) {
         AVSubtitleRect *rect = sub->rects[i];
         const char *text = NULL;
 
@@ -562,37 +568,43 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
 
         av_log(avctx, AV_LOG_DEBUG, "Teletext: cleaned text (%d chars): \"%s\"\n", len, clean_text);
 
-        /* Split text by newlines and write each line */
+        /* Split text by newlines and stash each non-empty display line */
         const uint8_t *line_start = clean_text;
         const uint8_t *p = clean_text;
-        int line_count = 0;
 
-        while (*p && current_row < TELETEXT_ROWS) {
+        while (*p && num_lines < TELETEXT_ROWS) {
             if (*p == '\n' || *(p + 1) == '\0') {
                 int line_len = (*p == '\n') ? (p - line_start) : (p - line_start + 1);
                 if (line_len > 0) {
-                    /* Center the text */
-                    int col = (TELETEXT_COLS - line_len) / 2;
-                    if (col < 1) col = 1;
-
-                    /* Log the line being written */
-                    char debug_line[41];
-                    int copy_len = line_len < 40 ? line_len : 40;
-                    memcpy(debug_line, line_start, copy_len);
-                    debug_line[copy_len] = '\0';
-                    av_log(avctx, AV_LOG_DEBUG, "Teletext: writing line %d to row %d col %d: \"%s\"\n",
-                           line_count, current_row, col, debug_line);
-
-                    write_to_page(ctx, current_row, col, line_start, line_len, color);
-                    current_row++;
-                    line_count++;
+                    if (line_len > TELETEXT_COLS)
+                        line_len = TELETEXT_COLS;
+                    memcpy(lines[num_lines], line_start, line_len);
+                    line_lens[num_lines] = line_len;
+                    line_colors[num_lines] = color;
+                    num_lines++;
                 }
                 line_start = p + 1;
             }
             p++;
         }
+    }
 
-        av_log(avctx, AV_LOG_DEBUG, "Teletext: wrote %d lines total\n", line_count);
+    /* Bottom-anchor: place the last collected line on R23 and grow upward. */
+    int start_row = 23 - (num_lines - 1);
+    if (start_row < 1)
+        start_row = 1;
+
+    for (int l = 0; l < num_lines; l++) {
+        int row = start_row + l;
+        if (row >= TELETEXT_ROWS)
+            break;
+        /* Center the text */
+        int col = (TELETEXT_COLS - line_lens[l]) / 2;
+        if (col < 1)
+            col = 1;
+        av_log(avctx, AV_LOG_DEBUG, "Teletext: writing line %d to row %d col %d\n",
+               l, row, col);
+        write_to_page(ctx, row, col, lines[l], line_lens[l], line_colors[l]);
     }
 
     /* Assert C4 (erase page) on this header if the visible content differs
@@ -614,8 +626,9 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
 
     /* Content rows - only emit rows that actually carry text. Blank rows are
      * not transmitted: the C4 erase-page bit clears stale content, so sending
-     * empty R22/R23 every cycle would only waste VBI bandwidth. */
-    for (int row = 19; row < TELETEXT_ROWS && row <= 23; row++) {
+     * empty rows every cycle would only waste VBI bandwidth. Scan from the
+     * anchored start row down to the bottom display row (R23). */
+    for (int row = start_row; row < TELETEXT_ROWS && row <= 23; row++) {
         /* Check if row has content */
         int has_content = 0;
         for (int col = 0; col < TELETEXT_COLS; col++) {
