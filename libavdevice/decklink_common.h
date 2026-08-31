@@ -150,6 +150,9 @@ struct decklink_ctx {
     DecklinkPacketQueue teletext_queue;
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;         /* VBI waveform start sample offset (0-20) */
+    int teletext_shape;              /* Band-limit the SD teletext VBI waveform (0=raw square wave) */
+    int teletext_shape_cutoff;       /* Shaping FIR -6dB cutoff in kHz */
+    int teletext_shape_taps;         /* Shaping FIR length in taps */
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */

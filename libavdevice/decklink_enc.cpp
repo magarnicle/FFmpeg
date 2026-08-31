@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <math.h>
 #if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
 #define DECKLINK_CAN_GET_TOTAL_RAM 1
 #endif
@@ -2161,7 +2162,8 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  */
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
                                             const uint8_t *teletext_data, int data_len,
-                                            int vbi_offset)
+                                            int vbi_offset, int shape_enable,
+                                            int shape_cutoff_khz, int shape_taps)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -2254,15 +2256,85 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         }
     }
 
+    /* Optional band-limiting of the waveform.
+     *
+     * The ideal luma[] above is a hard two-level square wave. Broadcast VBI-
+     * insertion hardware (e.g. the Deltacast card driving Polistream) instead
+     * emits an analog-shaped, band-limited pulse. When enabled, convolve luma[]
+     * with a windowed-sinc (Hann-windowed) low-pass FIR to approximate that
+     * eye. This is a source-side nicety, not an OP-42 requirement (OP-42 §7
+     * leaves eye restoration to a downstream re-timer), so it is off unless
+     * the caller sets teletext_shape. Cutoff and tap count are tunable so the
+     * eye can be matched to a reference capture without recompiling.
+     *
+     * Overshoot from the sinc side-lobes is expected and legal (OP-42 Fig 1);
+     * we only clamp to the 10-bit range so V210 packing stays valid. */
+    const uint16_t *out_luma = luma;
+    uint16_t shaped[2048];
+    if (shape_enable && shape_taps >= 3 && shape_cutoff_khz > 0) {
+        int taps = shape_taps;
+        if (taps > 63)
+            taps = 63;
+        if ((taps & 1) == 0)
+            taps++;                 /* force odd so the FIR is symmetric */
+        int M = taps / 2;
+        const double fs_khz = 13500.0;  /* PAL VBI sample rate */
+        double fc = shape_cutoff_khz;
+        if (fc > fs_khz / 2.0)
+            fc = fs_khz / 2.0;
+
+        double kern[64];
+        double ksum = 0.0;
+        for (int n = 0; n < taps; n++) {
+            int m = n - M;
+            double sinc = (m == 0) ? (2.0 * fc / fs_khz)
+                                   : sin(2.0 * M_PI * fc / fs_khz * m) / (M_PI * m);
+            double win = 0.5 - 0.5 * cos(2.0 * M_PI * n / (taps - 1));  /* Hann */
+            kern[n] = sinc * win;
+            ksum += kern[n];
+        }
+        if (ksum != 0.0) {
+            for (int n = 0; n < taps; n++)
+                kern[n] /= ksum;    /* unity DC gain */
+        }
+
+        for (int i = 0; i < width; i++) {
+            double acc = 0.0;
+            for (int n = 0; n < taps; n++) {
+                int idx = i + n - M;
+                if (idx < 0)
+                    idx = 0;
+                else if (idx >= width)
+                    idx = width - 1;
+                acc += kern[n] * luma[idx];
+            }
+            int v = (int)lrint(acc);
+            if (v < 0)
+                v = 0;
+            else if (v > 1023)
+                v = 1023;
+            shaped[i] = (uint16_t)v;
+        }
+        out_luma = shaped;
+
+        static int shape_logged = 0;
+        if (!shape_logged) {
+            shape_logged = 1;
+            av_log(NULL, AV_LOG_INFO,
+                   "Teletext VBI waveform shaping: cutoff=%d kHz taps=%d\n",
+                   shape_cutoff_khz, taps);
+        }
+    }
+
     /* Convert to V210 format: 6 pixels per 16 bytes */
     uint32_t *v210 = (uint32_t *)line_buf;
     for (int i = 0; i + 6 <= width; i += 6) {
-        uint16_t y0 = luma[i];
-        uint16_t y1 = luma[i + 1];
-        uint16_t y2 = luma[i + 2];
-        uint16_t y3 = luma[i + 3];
-        uint16_t y4 = luma[i + 4];
-        uint16_t y5 = luma[i + 5];
+        uint16_t y0 = out_luma[i];
+        uint16_t y1 = out_luma[i + 1];
+        uint16_t y2 = out_luma[i + 2];
+        uint16_t y3 = out_luma[i + 3];
+        uint16_t y4 = out_luma[i + 4];
+        uint16_t y5 = out_luma[i + 5];
 
         /* V210 packing (little-endian 32-bit words):
          * Word 0: Cb0 | Y0 | Cr0
@@ -2487,7 +2559,9 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                        teletext_data, 42, ctx->teletext_vbi_offset);
+                                        teletext_data, 42, ctx->teletext_vbi_offset,
+                                        ctx->teletext_shape, ctx->teletext_shape_cutoff,
+                                        ctx->teletext_shape_taps);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -3296,6 +3370,9 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
     ctx->teletext_vbi_offset = cctx->teletext_vbi_offset;
+    ctx->teletext_shape = cctx->teletext_shape;
+    ctx->teletext_shape_cutoff = cctx->teletext_shape_cutoff;
+    ctx->teletext_shape_taps = cctx->teletext_shape_taps;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
