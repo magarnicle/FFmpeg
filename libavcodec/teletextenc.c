@@ -371,9 +371,9 @@ static void encode_mrag(int mag, int row, uint8_t *byte1, uint8_t *byte2)
  *   C4 = Erase Page (set to 1 between caption transmissions)
  *   C5 = Newsflash (0)
  *   C6 = Subtitle indicator (1 for closed captions)
- *   C7 = Suppress Header (0)
+ *   C7 = Suppress Header (1 for subtitles: hide the page header row)
  *   C8 = Update Indicator (1 for closed captions)
- *   C9 = Interrupted Sequence (0)
+ *   C9 = Interrupted Sequence (1 for subtitles: overlay as a live subtitle)
  *   C10 = Inhibit Display (0)
  *   C11 = Magazine Serial (0 for parallel mode per OP-42 4e)
  *   C12-C14 = National Option Character Subset (region)
@@ -403,8 +403,18 @@ static void build_header_row(TeletextEncContext *ctx, uint8_t *line)
      * EN 300 706 s9.3.1. S4 is a 2-bit subcode field, so C6 is the top data bit. */
     line[7] = ff_teletext_ham84(ctx->subtitle_flag ? 0x08 : 0);  /* C6 at bit 3 */
 
-    /* Byte 8: C7 suppress header (bit 0) + C8 update (bit 1) + C9 interrupted (bit 2) + C10 inhibit (bit 3) */
-    line[8] = ff_teletext_ham84(ctx->update_indicator ? 0x02 : 0);  /* C8 at bit 1 */
+    /* Byte 8: C7 suppress header (bit 0) + C8 update (bit 1) + C9 interrupted (bit 2) + C10 inhibit (bit 3).
+     * For subtitles the receiver must be told to overlay the page as a live
+     * subtitle rather than treat it as a normal navigable page: that needs
+     * C9 (interrupted sequence) and C7 (suppress header). Setting only C8
+     * (byte8=0x49) left an STB in caption mode ignoring the page entirely.
+     * A Polistream reference capture sets C7=C8=C9=1 (byte8=0x2f); match it. */
+    {
+        int c8bits = ctx->update_indicator ? 0x02 : 0;   /* C8 update */
+        if (ctx->subtitle_flag)
+            c8bits |= 0x01 | 0x04;                        /* C7 suppress header + C9 interrupted sequence */
+        line[8] = ff_teletext_ham84(c8bits);
+    }
 
     /* Byte 9: C11 magazine serial (bit 0) + C12-C14 national option charset (bits 1-3)
      * C11 = 0 for parallel mode per OP-42 4e */
