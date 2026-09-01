@@ -2177,12 +2177,14 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
     const int FP_SHIFT = 8;
 
-    /* 10-bit luma levels for teletext signal per OP-42 Section 3
-     * Binary "1": 70% +/- 3% of peak white = 64 + 0.70*(940-64) = 677
+    /* 10-bit luma levels for teletext signal
+     * Binary "1": 66% of peak white = 64 + 0.66*(940-64) = 642 (~640)
      * Binary "0": 0% +/- 2% (black level) = 64
-     * Note: ETS 300 706 specifies 66%, but OP-42 requires 70% for Australian broadcast
+     * OP-42 quotes 70% (677) for Australian broadcast, but Polistream — the
+     * reference that decodes on our STB — drives 66% (~640, matching ETS 300
+     * 706). We follow Polistream's level to match what the receiver expects.
      */
-    const uint16_t LUMA_HIGH = 677;   /* 70% per OP-42 */
+    const uint16_t LUMA_HIGH = 640;   /* 66% per ETS 300 706 / Polistream */
     const uint16_t LUMA_LOW  = 64;    /* Black level (0 IRE) */
     const uint16_t LUMA_BLACK = 64;   /* Black level */
     const uint16_t CHROMA_NEUTRAL = 512;  /* Neutral chroma */
@@ -2276,8 +2278,9 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * the caller sets teletext_shape. Cutoff and tap count are tunable so the
      * eye can be matched to a reference capture without recompiling.
      *
-     * Overshoot from the sinc side-lobes is expected and legal (OP-42 Fig 1);
-     * we only clamp to the 10-bit range so V210 packing stays valid. */
+     * The convolution output is clipped to the teletext rails [LUMA_LOW,
+     * LUMA_HIGH] (see below), which flattens the windowed-sinc's ring to
+     * Polistream's clean flat-topped eye and keeps luma in gamut. */
     const uint16_t *out_luma = luma;
     uint16_t shaped[2048];
     if (shape_enable && shape_taps >= 3 && shape_cutoff_khz > 0) {
@@ -2332,11 +2335,21 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
                     idx = width - 1;
                 acc += kern[n] * luma[idx];
             }
+            /* Clip to the teletext signal rails, not the full 10-bit range.
+             * A sharp (windowed-sinc) low-pass rings past the rails; clamping
+             * the ring to [LUMA_LOW, LUMA_HIGH] reproduces Polistream's flat-
+             * topped eye (peak == the "1" level, floor == black, no sub-black)
+             * and keeps luma in gamut. This is what makes the sharp kernel
+             * usable: it removes the sub-black excursion that motivated the
+             * Gaussian fallback, so we get sinc's flat passband (full-amplitude
+             * clock run-in) without the gamut risk. Validated against a
+             * Polistream capture: sinc @4700 kHz clipped to rails matches poli's
+             * spectrum (>5.5 MHz energy 0.16% vs 0.15%) with CRI at full 160. */
             int v = (int)lrint(acc);
-            if (v < 0)
-                v = 0;
-            else if (v > 1023)
-                v = 1023;
+            if (v < LUMA_LOW)
+                v = LUMA_LOW;
+            else if (v > LUMA_HIGH)
+                v = LUMA_HIGH;
             shaped[i] = (uint16_t)v;
         }
         out_luma = shaped;
