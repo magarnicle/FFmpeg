@@ -2236,8 +2236,13 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         bit_pos_fp += SAMPLES_PER_BIT_FP;
     }
 
-    /* Generate framing code: 0xE4 per ETS 300 706, transmitted LSB-first */
-    uint8_t framing = 0xE4;
+    /* Framing code: on-air bit pattern 11100100 (first bit transmitted first,
+     * per ETS 300 706 / ITU-R BT.653). The loop below emits LSB-first, so the
+     * byte constant must be 0x27 (0x27 = 0b00100111 -> LSB-first on air =
+     * 11100100). The previous 0xE4 is the MSB-first spelling; emitted LSB-first
+     * it put 00100111 on air (reversed), which no teletext slicer frame-locks
+     * on. Verified against a Polistream reference capture. */
+    uint8_t framing = 0x27;
     for (int bit = 0; bit < 8; bit++) {
         uint16_t value = (framing & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
         int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
