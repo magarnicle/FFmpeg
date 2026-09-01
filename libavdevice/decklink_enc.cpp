@@ -2160,10 +2160,14 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  *   Word 2: Cr1[9:0], Y3[9:0], Cb2[9:0], xx
  *   Word 3: Y4[9:0], Cr2[9:0], Y5[9:0], xx
  */
+#define TELETEXT_SHAPE_GAUSS 0
+#define TELETEXT_SHAPE_SINC  1
+
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
                                             const uint8_t *teletext_data, int data_len,
                                             int vbi_offset, int shape_enable,
-                                            int shape_cutoff_khz, int shape_taps)
+                                            int shape_cutoff_khz, int shape_taps,
+                                            int shape_kernel)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -2285,13 +2289,28 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
 
         double kern[64];
         double ksum = 0.0;
-        for (int n = 0; n < taps; n++) {
-            int m = n - M;
-            double sinc = (m == 0) ? (2.0 * fc / fs_khz)
-                                   : sin(2.0 * M_PI * fc / fs_khz * m) / (M_PI * m);
-            double win = 0.5 - 0.5 * cos(2.0 * M_PI * n / (taps - 1));  /* Hann */
-            kern[n] = sinc * win;
-            ksum += kern[n];
+        if (shape_kernel == TELETEXT_SHAPE_GAUSS) {
+            /* Gaussian low-pass: monotonic step response, so it band-limits the
+             * waveform without ringing past the rails (no overshoot / sub-black,
+             * unlike the windowed-sinc). sigma set so the -6dB point is at fc. */
+            double sigma = fs_khz * sqrt(2.0 * log(2.0)) / (2.0 * M_PI * fc);
+            if (sigma < 0.3)
+                sigma = 0.3;
+            for (int n = 0; n < taps; n++) {
+                double m = n - M;
+                kern[n] = exp(-0.5 * (m / sigma) * (m / sigma));
+                ksum += kern[n];
+            }
+        } else {
+            /* Windowed-sinc (Hann): sharper cutoff but rings (overshoots). */
+            for (int n = 0; n < taps; n++) {
+                int m = n - M;
+                double sinc = (m == 0) ? (2.0 * fc / fs_khz)
+                                       : sin(2.0 * M_PI * fc / fs_khz * m) / (M_PI * m);
+                double win = 0.5 - 0.5 * cos(2.0 * M_PI * n / (taps - 1));  /* Hann */
+                kern[n] = sinc * win;
+                ksum += kern[n];
+            }
         }
         if (ksum != 0.0) {
             for (int n = 0; n < taps; n++)
@@ -2321,7 +2340,8 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         if (!shape_logged) {
             shape_logged = 1;
             av_log(NULL, AV_LOG_INFO,
-                   "Teletext VBI waveform shaping: cutoff=%d kHz taps=%d\n",
+                   "Teletext VBI waveform shaping: kernel=%s cutoff=%d kHz taps=%d\n",
+                   shape_kernel == TELETEXT_SHAPE_GAUSS ? "gauss" : "sinc",
                    shape_cutoff_khz, taps);
         }
     }
@@ -2561,7 +2581,7 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
                                         teletext_data, 42, ctx->teletext_vbi_offset,
                                         ctx->teletext_shape, ctx->teletext_shape_cutoff,
-                                        ctx->teletext_shape_taps);
+                                        ctx->teletext_shape_taps, ctx->teletext_shape_kernel);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -3373,6 +3393,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_shape = cctx->teletext_shape;
     ctx->teletext_shape_cutoff = cctx->teletext_shape_cutoff;
     ctx->teletext_shape_taps = cctx->teletext_shape_taps;
+    ctx->teletext_shape_kernel = cctx->teletext_shape_kernel;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
