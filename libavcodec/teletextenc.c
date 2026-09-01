@@ -291,11 +291,6 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
     if (col < 0)
         col = 0;
 
-    /* Insert double height code if enabled (OP-42 4d) */
-    if (ctx->double_height && col < TELETEXT_COLS) {
-        ctx->page_buffer[row][col++] = TELETEXT_DOUBLE_HEIGHT;
-    }
-
     /* Start Box, transmitted twice.
      *
      * Per ETS 300 706 s12.2, when the Subtitle (C6) or Newsflash bit is set a
@@ -608,23 +603,41 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
         }
     }
 
-    /* Bottom-anchor: place the last collected line on R23 and grow upward. */
-    int start_row = 23 - (num_lines - 1);
+    /* Bottom-anchor the subtitle rows.
+     *
+     * A double-height row is drawn two display lines tall, so with double
+     * height the lines are spaced two rows apart with the last (bottom) line
+     * on R22 (its lower half covers R23) — matching Polistream's OP-42
+     * placement: one line on R22, two lines on R20 and R22, etc. The
+     * intervening rows (R21/R23) are left blank and not transmitted. In
+     * single-height mode the lines are adjacent with the last on R23. */
+    int step = ctx->double_height ? 2 : 1;
+    int last_row = ctx->double_height ? 22 : 23;
+    int start_row = last_row - step * (num_lines - 1);
     if (start_row < 1)
         start_row = 1;
 
     for (int l = 0; l < num_lines; l++) {
-        int row = start_row + l;
+        int row = start_row + step * l;
         if (row >= TELETEXT_ROWS)
             break;
-        /* Centre the boxed block. write_to_page prepends double-height (opt),
-         * two Start Box codes and a colour code (opt), and appends two End Box
-         * codes, so account for that overhead when centring. */
-        int overhead = 4 + (ctx->double_height ? 1 : 0) +
-                       (line_colors[l] != TELETEXT_ALPHA_WHITE ? 1 : 0);
-        int col = (TELETEXT_COLS - (line_lens[l] + overhead)) / 2;
-        if (col < 0)
-            col = 0;
+
+        /* Double height governs the whole row, so emit it at column 0 (it is a
+         * set-after attribute, taking effect on every following cell), matching
+         * Polistream. The boxed text is then centred in the remaining cells. */
+        int box_start = 0;
+        if (ctx->double_height) {
+            ctx->page_buffer[row][0] = TELETEXT_DOUBLE_HEIGHT;
+            box_start = 1;
+        }
+
+        /* Centre the boxed block. write_to_page prepends two Start Box codes and
+         * a colour code (opt) and appends two End Box codes, so account for that
+         * overhead when centring. */
+        int overhead = 4 + (line_colors[l] != TELETEXT_ALPHA_WHITE ? 1 : 0);
+        int col = box_start + (TELETEXT_COLS - box_start - (line_lens[l] + overhead)) / 2;
+        if (col < box_start)
+            col = box_start;
         av_log(avctx, AV_LOG_DEBUG, "Teletext: writing line %d to row %d col %d\n",
                l, row, col);
         write_to_page(ctx, row, col, lines[l], line_lens[l], line_colors[l]);
