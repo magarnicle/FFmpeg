@@ -2695,6 +2695,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
             stored_new = 1;                   /* Reset the idle timer */
+            ctx->teletext_drip_counter = ctx->teletext_drip_gap;  /* drip first row now */
 
             av_log(avctx, AV_LOG_DEBUG, "Teletext: storing %d data units from packet\n", num_units);
 
@@ -2756,13 +2757,33 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle filler\n");
         }
     } else if (ctx->teletext_row_count > 0) {
-        /* Active or recently-updated caption: retransmit the stored page,
-         * aging out the header's C4 erase bit after the first transmission so
-         * the decoder doesn't clear and re-render every cycle. */
-        data_f1 = teletext_next_row(ctx);
-        data_f2 = ctx->teletext_dual_field ? teletext_next_row(ctx) : data_f1;
-        av_log(avctx, AV_LOG_DEBUG, "Teletext: sending rows (dual_field=%d) of %d\n",
-               ctx->teletext_dual_field, ctx->teletext_row_count);
+        /* Active or recently-updated caption. */
+        if (ctx->teletext_drip) {
+            /* Polistream-style drip: transmit one page row (or one per field in
+             * dual_field mode) every teletext_drip_gap frames, and send filler
+             * (8/31 when teletext_p31_filler is set) in between, rather than
+             * cycling the whole page every frame. A Polistream capture drips
+             * content on ~5% of frames (one isolated frame every ~17), letting
+             * the receiver accumulate and hold the page. The row's C4-erase
+             * aging is handled in teletext_next_row(). */
+            if (++ctx->teletext_drip_counter >= ctx->teletext_drip_gap) {
+                ctx->teletext_drip_counter = 0;
+                data_f1 = teletext_next_row(ctx);
+                data_f2 = ctx->teletext_dual_field ? teletext_next_row(ctx) : data_f1;
+                av_log(avctx, AV_LOG_DEBUG, "Teletext: drip row (gap=%d dual=%d)\n",
+                       ctx->teletext_drip_gap, ctx->teletext_dual_field);
+            } else {
+                data_f1 = data_f2 = filler;
+            }
+        } else {
+            /* Continuous carousel: retransmit the stored page every frame,
+             * aging out the header's C4 erase bit after the first transmission
+             * so the decoder doesn't clear and re-render every cycle. */
+            data_f1 = teletext_next_row(ctx);
+            data_f2 = ctx->teletext_dual_field ? teletext_next_row(ctx) : data_f1;
+            av_log(avctx, AV_LOG_DEBUG, "Teletext: sending rows (dual_field=%d) of %d\n",
+                   ctx->teletext_dual_field, ctx->teletext_row_count);
+        }
     } else {
         data_f1 = data_f2 = filler;
     }
@@ -3476,6 +3497,9 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_shape_kernel = cctx->teletext_shape_kernel;
     ctx->teletext_p31_filler = cctx->teletext_p31_filler;
     ctx->teletext_dual_field = cctx->teletext_dual_field;
+    ctx->teletext_drip = cctx->teletext_drip;
+    ctx->teletext_drip_gap = cctx->teletext_drip_gap;
+    ctx->teletext_drip_counter = 0;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))

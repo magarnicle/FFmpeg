@@ -156,6 +156,9 @@ struct decklink_ctx {
     int teletext_shape_kernel;       /* Shaping FIR kernel: 0=gauss, 1=sinc */
     int teletext_p31_filler;         /* Idle filler: 0=dummy header, 1=packet 8/31 (Polistream) */
     int teletext_dual_field;         /* 1=different consecutive row per field (Polistream) */
+    int teletext_drip;               /* 1=drip one row every drip_gap frames, filler between (Polistream) */
+    int teletext_drip_gap;           /* frames of filler between dripped rows */
+    int teletext_drip_counter;       /* runtime: frames since last dripped row */
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */
