@@ -2612,6 +2612,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         return;
 
     /* Check for new teletext packets and extract all data units */
+    int stored_new = 0;
     while (ff_decklink_packet_queue_size(&ctx->teletext_queue) > 0) {
         int64_t pts = ff_decklink_packet_queue_peekpts(&ctx->teletext_queue);
         if (pts > ctx->last_pts) {
@@ -2640,6 +2641,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
+            stored_new = 1;                   /* Reset the idle timer */
 
             av_log(avctx, AV_LOG_DEBUG, "Teletext: storing %d data units from packet\n", num_units);
 
@@ -2653,12 +2655,52 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         av_packet_unref(&teletext_pkt);
     }
 
+    /* Track how long we've gone without a caption update, for the OP-42 s7
+     * cleardown. Reset on a new packet; otherwise age once per frame. */
+    if (stored_new)
+        ctx->teletext_idle_frames = 0;
+    else if (ctx->has_teletext_data)
+        ctx->teletext_idle_frames++;
+
+    /* 10 seconds expressed in frames from the video timebase (fallback = 10s
+     * at 25fps). */
+    int frames_10s = 250;
+    if (ctx->bmd_tb_num > 0)
+        frames_10s = (int)(10LL * ctx->bmd_tb_den / ctx->bmd_tb_num);
+    if (frames_10s < 50)
+        frames_10s = 50;
+    if (frames_10s > 2000)
+        frames_10s = 2000;
+
     /* Determine which data to transmit */
     const uint8_t *data_to_send;
-    if (ctx->has_teletext_data && ctx->teletext_row_count > 0) {
-        /* Age out the header's C4 erase bit: keep it set for the first header
-         * transmission after a content change, then clear it so the decoder
-         * doesn't clear and re-render the page every retransmission cycle. */
+    uint8_t cleardown[42];
+    if (!ctx->has_teletext_data) {
+        /* Lead-in, before any caption has arrived: dummy (time-filling) headers
+         * so the line is never dead and the decoder clock stays locked. */
+        data_to_send = teletext_filler_packet;
+        av_log(avctx, AV_LOG_DEBUG, "Teletext: filler (no caption yet)\n");
+    } else if (ctx->teletext_idle_frames >= frames_10s) {
+        /* OP-42 s7: after 10s with no caption update, clear the page (blank
+         * P801 with C4=1, no StartBox) and drop to continuous dummy headers,
+         * repeating the cleardown every 10s. Send the cleardown as a short
+         * burst at each 10s boundary for reliability, filler the rest of the
+         * time, rather than holding the last caption on screen indefinitely. */
+        if (ctx->teletext_idle_frames % frames_10s < 5) {
+            memcpy(cleardown, ctx->teletext_rows[0], 42);
+            uint8_t nib = ham84_decode[cleardown[5]];
+            if (nib != 0xFF)
+                cleardown[5] = ham84_encode[(nib & 0x07) | 0x08];  /* set C4=1 */
+            data_to_send = cleardown;
+            av_log(avctx, AV_LOG_DEBUG, "Teletext: idle cleardown (P801 C4=1)\n");
+        } else {
+            data_to_send = teletext_filler_packet;
+            av_log(avctx, AV_LOG_DEBUG, "Teletext: idle filler (dummy header)\n");
+        }
+    } else if (ctx->teletext_row_count > 0) {
+        /* Active or recently-updated caption: retransmit the stored page,
+         * aging out the header's C4 erase bit after the first transmission so
+         * the decoder doesn't clear and re-render every cycle. */
         if (ctx->teletext_row_index == 0) {
             if (ctx->teletext_erase_pending)
                 ctx->teletext_erase_pending = 0;
@@ -2666,25 +2708,12 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
                 teletext_clear_erase_bit(ctx->teletext_rows[0]);
         }
 
-        /* Send current row and advance index for next frame */
         data_to_send = ctx->teletext_rows[ctx->teletext_row_index];
-
         av_log(avctx, AV_LOG_DEBUG, "Teletext: sending row %d of %d\n",
                ctx->teletext_row_index, ctx->teletext_row_count);
-        av_log(avctx, AV_LOG_INFO,
-               "  MRAG + data bytes 0-19: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-               data_to_send[0], data_to_send[1], data_to_send[2], data_to_send[3],
-               data_to_send[4], data_to_send[5], data_to_send[6], data_to_send[7],
-               data_to_send[8], data_to_send[9], data_to_send[10], data_to_send[11],
-               data_to_send[12], data_to_send[13], data_to_send[14], data_to_send[15],
-               data_to_send[16], data_to_send[17], data_to_send[18], data_to_send[19]);
-
-        /* Advance to next row for next frame, wrapping around */
         ctx->teletext_row_index = (ctx->teletext_row_index + 1) % ctx->teletext_row_count;
     } else {
-        /* No data yet - send filler */
         data_to_send = teletext_filler_packet;
-        av_log(avctx, AV_LOG_DEBUG, "Teletext: sending filler (no data)\n");
     }
 
     /* Insert on VBI line 21 (field 1 / odd field) */

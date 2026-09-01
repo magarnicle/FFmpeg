@@ -159,6 +159,7 @@ struct decklink_ctx {
     int teletext_row_index;          /* Current row index for cycling */
     int has_teletext_data;           /* Whether we have valid teletext data */
     int teletext_erase_pending;      /* Header still carries C4=1; clear it after first transmission */
+    int teletext_idle_frames;        /* Frames since the last caption update (for the OP-42 s7 cleardown) */
 
     /* Streams present */
     int audio;
