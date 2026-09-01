@@ -2423,6 +2423,22 @@ static const uint8_t teletext_filler_packet[42] = {
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
+/* Alternate filler: a packet 8/31 (magazine 8, row 31 = Independent Data Line),
+ * captured verbatim from a Polistream reference. Polistream keeps the teletext
+ * line continuously active by transmitting this on ~90% of fields, injecting
+ * the subtitle page rows only when they change. Selectable via the
+ * teletext_p31_filler option so we can match that idle behaviour on air. The
+ * IDL payload is a static snapshot (Polistream increments a counter in it);
+ * receivers that don't consume IDL ignore the content and just see a valid
+ * magazine-8 packet keeping the data channel alive. */
+static const uint8_t teletext_filler_p31[42] = {
+    0xD0, 0xEA, 0x64, 0x38, 0xC7, 0xC7, 0xC7, 0xC7, 0xC7, 0xC7,
+    0x96, 0x4F, 0x4F, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50,
+    0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x51,
+    0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51,
+    0x9A, 0xFE
+};
+
 /* Filler teletext data unit for HD VANC (OP-47 SDP format)
  * Contains dummy header per OP-42 Section 8 (page 8FF)
  * Structure: data_unit_id (0x02=non-subtitle), length (0x2C=44),
@@ -2611,13 +2627,32 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     }
 }
 
+/* Return the next stored teletext row to transmit and advance the carousel.
+ * Applies the header C4-erase aging (assert erase once on the first header
+ * after a content change, then clear it) so the decoder doesn't re-erase every
+ * cycle. Called once per field in dual_field mode, once per frame otherwise. */
+static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
+{
+    int idx = ctx->teletext_row_index;
+    if (idx == 0) {
+        if (ctx->teletext_erase_pending)
+            ctx->teletext_erase_pending = 0;   /* first header keeps C4=1 */
+        else
+            teletext_clear_erase_bit(ctx->teletext_rows[0]);
+    }
+    const uint8_t *d = ctx->teletext_rows[idx];
+    ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
+    return d;
+}
+
 /* Insert teletext VBI waveforms directly into SD PAL VBI lines
  * This is called for SD PAL mode where we write raw teletext waveforms
  * to VBI lines 21 (field 1) and 334 (field 2) per Australian OP-47.
  *
  * Each encoder packet contains multiple data units (rows). We store all rows
- * and cycle through them, sending one row per frame. This allows the full
- * teletext page to be transmitted over multiple frames.
+ * and cycle through them, sending one row per frame (or two rows per frame,
+ * one per field, when teletext_dual_field is set). This transmits the full
+ * teletext page over multiple frames.
  */
 static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                        IDeckLinkVideoFrameAncillary *vanc)
@@ -2690,58 +2725,56 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     if (frames_10s > 2000)
         frames_10s = 2000;
 
-    /* Determine which data to transmit */
-    const uint8_t *data_to_send;
+    /* Idle/lead-in filler. Optionally a packet 8/31 (Polistream style) instead
+     * of a dummy page header, to keep the data channel continuously active. */
+    const uint8_t *filler = ctx->teletext_p31_filler ? teletext_filler_p31
+                                                     : teletext_filler_packet;
+
+    /* Determine which data to transmit. In dual_field mode the two fields carry
+     * consecutive different rows (like Polistream); otherwise both fields carry
+     * the same packet. */
+    const uint8_t *data_f1, *data_f2;
     uint8_t cleardown[42];
     if (!ctx->has_teletext_data) {
-        /* Lead-in, before any caption has arrived: dummy (time-filling) headers
-         * so the line is never dead and the decoder clock stays locked. */
-        data_to_send = teletext_filler_packet;
+        /* Lead-in, before any caption has arrived: filler so the line is never
+         * dead and the decoder clock stays locked. */
+        data_f1 = data_f2 = filler;
         av_log(avctx, AV_LOG_DEBUG, "Teletext: filler (no caption yet)\n");
     } else if (ctx->teletext_idle_frames >= frames_10s) {
         /* OP-42 s7: after 10s with no caption update, clear the page (blank
-         * P801 with C4=1, no StartBox) and drop to continuous dummy headers,
-         * repeating the cleardown every 10s. Send the cleardown as a short
-         * burst at each 10s boundary for reliability, filler the rest of the
-         * time, rather than holding the last caption on screen indefinitely. */
+         * P801 with C4=1, no StartBox) and drop to continuous filler,
+         * repeating the cleardown every 10s. */
         if (ctx->teletext_idle_frames % frames_10s < 5) {
             memcpy(cleardown, ctx->teletext_rows[0], 42);
             uint8_t nib = ham84_decode[cleardown[5]];
             if (nib != 0xFF)
                 cleardown[5] = ham84_encode[(nib & 0x07) | 0x08];  /* set C4=1 */
-            data_to_send = cleardown;
+            data_f1 = data_f2 = cleardown;
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle cleardown (P801 C4=1)\n");
         } else {
-            data_to_send = teletext_filler_packet;
-            av_log(avctx, AV_LOG_DEBUG, "Teletext: idle filler (dummy header)\n");
+            data_f1 = data_f2 = filler;
+            av_log(avctx, AV_LOG_DEBUG, "Teletext: idle filler\n");
         }
     } else if (ctx->teletext_row_count > 0) {
         /* Active or recently-updated caption: retransmit the stored page,
          * aging out the header's C4 erase bit after the first transmission so
          * the decoder doesn't clear and re-render every cycle. */
-        if (ctx->teletext_row_index == 0) {
-            if (ctx->teletext_erase_pending)
-                ctx->teletext_erase_pending = 0;
-            else
-                teletext_clear_erase_bit(ctx->teletext_rows[0]);
-        }
-
-        data_to_send = ctx->teletext_rows[ctx->teletext_row_index];
-        av_log(avctx, AV_LOG_DEBUG, "Teletext: sending row %d of %d\n",
-               ctx->teletext_row_index, ctx->teletext_row_count);
-        ctx->teletext_row_index = (ctx->teletext_row_index + 1) % ctx->teletext_row_count;
+        data_f1 = teletext_next_row(ctx);
+        data_f2 = ctx->teletext_dual_field ? teletext_next_row(ctx) : data_f1;
+        av_log(avctx, AV_LOG_DEBUG, "Teletext: sending rows (dual_field=%d) of %d\n",
+               ctx->teletext_dual_field, ctx->teletext_row_count);
     } else {
-        data_to_send = teletext_filler_packet;
+        data_f1 = data_f2 = filler;
     }
 
     /* Insert on VBI line 21 (field 1 / odd field) */
     if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_f1);
     }
 
     /* Insert on VBI line 334 (field 2 / even field) */
     if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_f2);
     }
 }
 
@@ -3441,6 +3474,8 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_shape_cutoff = cctx->teletext_shape_cutoff;
     ctx->teletext_shape_taps = cctx->teletext_shape_taps;
     ctx->teletext_shape_kernel = cctx->teletext_shape_kernel;
+    ctx->teletext_p31_filler = cctx->teletext_p31_filler;
+    ctx->teletext_dual_field = cctx->teletext_dual_field;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))

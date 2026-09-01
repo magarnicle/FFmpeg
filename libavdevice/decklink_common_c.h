@@ -92,6 +92,8 @@ struct decklink_cctx {
     int teletext_shape_cutoff;
     int teletext_shape_taps;
     int teletext_shape_kernel;
+    int teletext_p31_filler;
+    int teletext_dual_field;
 
     /* Socket server options */
     char *socket_path;

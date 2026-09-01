@@ -81,6 +81,8 @@ static const AVOption options[] = {
     { "teletext_shape_kernel", "teletext waveform shaping FIR kernel", OFFSET(teletext_shape_kernel), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, ENC, .unit = "ttxshape" },
     { "gauss", "Gaussian: no ring, but too gentle to band-limit without killing the clock run-in", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, ENC, .unit = "ttxshape" },
     { "sinc",  "windowed-sinc (default): flat passband keeps the CRI, ring clipped to rails to match Polistream", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, ENC, .unit = "ttxshape" },
+    { "teletext_p31_filler", "idle teletext filler: send packet 8/31 (Polistream style) instead of a dummy page header", OFFSET(teletext_p31_filler), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "teletext_dual_field", "transmit different consecutive rows on field 1 and field 2 (Polistream style) instead of duplicating one row per frame", OFFSET(teletext_dual_field), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "socket_path" , "Unix socket path for external frame input", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "socket_listen", "Listen on socket for external frame input", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "shm_name", "Shared memory name for cross-process frame buffer", OFFSET(shm_name), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
