@@ -76,7 +76,7 @@ static const AVOption options[] = {
     { "even"        , "insert on even field (field 2) only",        0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "teletext_vbi_offset", "teletext VBI waveform start sample offset", OFFSET(teletext_vbi_offset), AV_OPT_TYPE_INT, { .i64 = 18 }, 0, 200, ENC },
     { "teletext_shape", "band-limit the SD teletext VBI waveform with a windowed-sinc FIR (off = raw square wave)", OFFSET(teletext_shape), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
-    { "teletext_shape_cutoff", "teletext waveform shaping FIR -6dB cutoff (kHz)", OFFSET(teletext_shape_cutoff), AV_OPT_TYPE_INT, { .i64 = 4000 }, 500, 6750, ENC },
+    { "teletext_shape_cutoff", "teletext waveform shaping FIR -6dB cutoff (kHz)", OFFSET(teletext_shape_cutoff), AV_OPT_TYPE_INT, { .i64 = 5500 }, 500, 6750, ENC },
     { "teletext_shape_taps", "teletext waveform shaping FIR length in taps (forced odd)", OFFSET(teletext_shape_taps), AV_OPT_TYPE_INT, { .i64 = 15 }, 3, 63, ENC },
     { "teletext_shape_kernel", "teletext waveform shaping FIR kernel", OFFSET(teletext_shape_kernel), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, ENC, .unit = "ttxshape" },
     { "gauss", "Gaussian: band-limits without overshoot (default)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, ENC, .unit = "ttxshape" },
