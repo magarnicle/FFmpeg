@@ -296,6 +296,19 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
         ctx->page_buffer[row][col++] = TELETEXT_DOUBLE_HEIGHT;
     }
 
+    /* Start Box, transmitted twice.
+     *
+     * Per ETS 300 706 s12.2, when the Subtitle (C6) or Newsflash bit is set a
+     * decoder displays ONLY the characters between a Start Box and an End Box,
+     * overlaid on the video. Without these codes the page is received but no
+     * text is rendered (the symptom we saw: "WST Page 801" detected, nothing
+     * shown). The codes are set-after spacing attributes and are sent in pairs
+     * for error resilience (OP-42 "StartBox Characters"). */
+    if (col < TELETEXT_COLS)
+        ctx->page_buffer[row][col++] = TELETEXT_START_BOX;
+    if (col < TELETEXT_COLS)
+        ctx->page_buffer[row][col++] = TELETEXT_START_BOX;
+
     /* Insert color code at start if not white */
     if (color != TELETEXT_ALPHA_WHITE && col < TELETEXT_COLS) {
         ctx->page_buffer[row][col++] = color;
@@ -307,6 +320,12 @@ static void write_to_page(TeletextEncContext *ctx, int row, int col,
             break;
         ctx->page_buffer[row][col++] = text[i];
     }
+
+    /* End Box, transmitted twice, to close the subtitle box after the text. */
+    if (col < TELETEXT_COLS)
+        ctx->page_buffer[row][col++] = TELETEXT_END_BOX;
+    if (col < TELETEXT_COLS)
+        ctx->page_buffer[row][col++] = TELETEXT_END_BOX;
 }
 
 /**
@@ -598,10 +617,14 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
         int row = start_row + l;
         if (row >= TELETEXT_ROWS)
             break;
-        /* Center the text */
-        int col = (TELETEXT_COLS - line_lens[l]) / 2;
-        if (col < 1)
-            col = 1;
+        /* Centre the boxed block. write_to_page prepends double-height (opt),
+         * two Start Box codes and a colour code (opt), and appends two End Box
+         * codes, so account for that overhead when centring. */
+        int overhead = 4 + (ctx->double_height ? 1 : 0) +
+                       (line_colors[l] != TELETEXT_ALPHA_WHITE ? 1 : 0);
+        int col = (TELETEXT_COLS - (line_lens[l] + overhead)) / 2;
+        if (col < 0)
+            col = 0;
         av_log(avctx, AV_LOG_DEBUG, "Teletext: writing line %d to row %d col %d\n",
                l, row, col);
         write_to_page(ctx, row, col, lines[l], line_lens[l], line_colors[l]);
