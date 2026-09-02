@@ -89,6 +89,7 @@ typedef struct TeletextEncContext {
     int erase_page;       /* C4: Erase page flag (OP-42 4h) */
     int update_indicator; /* C8: Update indicator flag (OP-42 4g) */
     int subtitle_flag;    /* C6: Subtitle indicator flag (OP-42 4f) */
+    int wrap_text;        /* Word-wrap lines wider than the row instead of truncating */
 
     /* Internal state */
     uint16_t page_bcd;  /* Page number in BCD */
@@ -592,6 +593,14 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
 
         av_log(avctx, AV_LOG_DEBUG, "Teletext: cleaned text (%d chars): \"%s\"\n", len, clean_text);
 
+        /* Usable text width once box/colour/double-height overhead is removed
+         * (write_to_page prepends 2 Start Box + optional colour and appends 2
+         * End Box; double height consumes col 0). */
+        int overhead = 4 + (color != TELETEXT_ALPHA_WHITE ? 1 : 0);
+        int max_w = TELETEXT_COLS - (ctx->double_height ? 1 : 0) - overhead;
+        if (max_w < 1)
+            max_w = 1;
+
         /* Split text by newlines and stash each non-empty display line */
         const uint8_t *line_start = clean_text;
         const uint8_t *p = clean_text;
@@ -600,12 +609,40 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
             if (*p == '\n' || *(p + 1) == '\0') {
                 int line_len = (*p == '\n') ? (p - line_start) : (p - line_start + 1);
                 if (line_len > 0) {
-                    if (line_len > TELETEXT_COLS)
-                        line_len = TELETEXT_COLS;
-                    memcpy(lines[num_lines], line_start, line_len);
-                    line_lens[num_lines] = line_len;
-                    line_colors[num_lines] = color;
-                    num_lines++;
+                    if (ctx->wrap_text) {
+                        /* Word-wrap: break at spaces so text wider than the row
+                         * isn't lost (Polistream "Wrap text if >ttxt width"). */
+                        int s = 0;
+                        while (s < line_len && num_lines < TELETEXT_ROWS) {
+                            int remaining = line_len - s;
+                            int take, skip;
+                            if (remaining <= max_w) {
+                                take = remaining;
+                                skip = 0;
+                            } else {
+                                int brk = -1;
+                                for (int i = max_w; i > 0; i--) {
+                                    if (line_start[s + i] == ' ') { brk = i; break; }
+                                }
+                                take = (brk > 0) ? brk : max_w;   /* space, else hard break */
+                                skip = (brk > 0) ? 1 : 0;         /* drop the break space */
+                            }
+                            memcpy(lines[num_lines], line_start + s, take);
+                            line_lens[num_lines] = take;
+                            line_colors[num_lines] = color;
+                            num_lines++;
+                            s += take + skip;
+                            while (s < line_len && line_start[s] == ' ')
+                                s++;                              /* trim leading spaces */
+                        }
+                    } else {
+                        if (line_len > TELETEXT_COLS)
+                            line_len = TELETEXT_COLS;
+                        memcpy(lines[num_lines], line_start, line_len);
+                        line_lens[num_lines] = line_len;
+                        line_colors[num_lines] = color;
+                        num_lines++;
+                    }
                 }
                 line_start = p + 1;
             }
@@ -716,6 +753,7 @@ static const AVOption teletext_options[] = {
     { "erase_page", "C4: Erase page between transmissions (OP-42 4h)", OFFSET(erase_page), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "update_indicator", "C8: Update indicator flag (OP-42 4g)", OFFSET(update_indicator), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { "subtitle_flag", "C6: Subtitle indicator flag (OP-42 4f)", OFFSET(subtitle_flag), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
+    { "wrap_text", "Word-wrap subtitle lines wider than the teletext row instead of truncating (Polistream 'Wrap text if >ttxt width')", OFFSET(wrap_text), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { NULL }
 };
 
