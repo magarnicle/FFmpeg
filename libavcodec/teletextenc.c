@@ -147,6 +147,47 @@ static int hex_to_teletext_color(uint32_t rgb)
 }
 
 /**
+ * Transliterate a Unicode code point to teletext-safe ASCII.
+ *
+ * The teletext G0 (primary) set has no accented letters or "smart" punctuation,
+ * so the common Unicode characters that appear in real subtitle files are
+ * mapped to their nearest ASCII equivalent instead of being dropped: smart
+ * quotes -> ' / ", en/em dashes -> -, ellipsis -> ..., accented Latin letters
+ * -> their base letter. Proper accented glyphs (e.g. e-acute rendered as such)
+ * would require Packet X/26 G2 diacritic composition, which is not implemented.
+ * Returns a short ASCII string; unknown code points return a single space.
+ */
+static const char *teletext_translit(unsigned cp)
+{
+    switch (cp) {
+    /* Punctuation */
+    case 0x2018: case 0x2019: case 0x201A: case 0x201B: case 0x2032: return "'";
+    case 0x201C: case 0x201D: case 0x201E: case 0x201F: case 0x2033: return "\"";
+    case 0x2013: case 0x2014: case 0x2015: case 0x2212: return "-";
+    case 0x2026: return "...";
+    case 0x00A0: case 0x2007: case 0x2009: case 0x200A: case 0x202F: return " ";
+    /* Accented Latin -> base letter */
+    case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5: return "A";
+    case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5: return "a";
+    case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB: return "E";
+    case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB: return "e";
+    case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF: return "I";
+    case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF: return "i";
+    case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6: case 0x00D8: return "O";
+    case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6: case 0x00F8: return "o";
+    case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC: return "U";
+    case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC: return "u";
+    case 0x00D1: return "N"; case 0x00F1: return "n";
+    case 0x00C7: return "C"; case 0x00E7: return "c";
+    case 0x00DD: return "Y"; case 0x00FD: case 0x00FF: return "y";
+    case 0x00DF: return "ss";
+    case 0x00C6: return "AE"; case 0x00E6: return "ae";
+    case 0x0152: return "OE"; case 0x0153: return "oe";
+    default: return " ";
+    }
+}
+
+/**
  * Strip HTML/SRT tags from text and extract formatting
  */
 static int strip_tags_and_format(TeletextEncContext *ctx, const char *input,
@@ -249,19 +290,23 @@ static int strip_tags_and_format(TeletextEncContext *ctx, const char *input,
         } else if (c == '\n' || c == '\r') {
             output[pos++] = '\n';
         } else if (c >= 0x80) {
-            /* Skip multi-byte UTF-8 sequences, replace with space */
-            if ((c & 0xE0) == 0xC0) {
-                p++;  /* 2-byte sequence */
-                output[pos++] = ' ';
-            } else if ((c & 0xF0) == 0xE0) {
-                p += 2;  /* 3-byte sequence */
-                output[pos++] = ' ';
-            } else if ((c & 0xF8) == 0xF0) {
-                p += 3;  /* 4-byte sequence */
-                output[pos++] = ' ';
-            } else {
-                output[pos++] = ' ';
+            /* Decode the UTF-8 code point and transliterate it to teletext-safe
+             * ASCII (smart quotes, dashes, ellipsis, accented Latin), rather
+             * than dropping every non-ASCII character to a space. */
+            unsigned cp;
+            int nb;
+            if ((c & 0xE0) == 0xC0)      { cp = c & 0x1F; nb = 2; }
+            else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; nb = 3; }
+            else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; nb = 4; }
+            else                         { cp = 0;        nb = 1; }
+            for (int k = 1; k < nb; k++) {
+                if ((p[k] & 0xC0) != 0x80) { nb = k; break; }  /* truncated */
+                cp = (cp << 6) | (p[k] & 0x3F);
             }
+            const char *rep = teletext_translit(cp);
+            while (*rep && pos < max_len - 1)
+                output[pos++] = *rep++;
+            p += (nb - 1);  /* the trailing p++ consumes the final byte */
         } else {
             output[pos++] = ' ';
         }
