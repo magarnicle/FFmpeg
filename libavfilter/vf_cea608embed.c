@@ -72,6 +72,9 @@ typedef struct CEA608EmbedContext {
     int data_field;         /* 0=field1, 1=field2 */
     int start_row;          /* Starting row (0=auto) */
     int continuous;         /* Output padding when no caption data */
+    int keepalive;          /* Display an invisible (transparent-bg space) caption
+                             * whenever no real caption is on screen, so the WebVTT
+                             * cue never gaps (keeps a player's CC track/button alive). */
 
     /* Subtitle events */
     SubtitleEvent *events;
@@ -85,6 +88,14 @@ typedef struct CEA608EmbedContext {
     int erase_pos;          /* Byte offset in erase_data (0 or 3) */
     uint8_t erase_data[6];  /* Pre-encoded EDM command */
     int erase_data_size;    /* Size of erase_data (6) */
+
+    /* Keep-alive (invisible) caption state */
+    uint8_t keepalive_data[64]; /* Pre-encoded transparent-bg space pop-on caption */
+    int keepalive_size;
+    int keepalive_event;    /* 0 = draining the keep-alive caption, -1 = not */
+    int keepalive_pos;      /* Byte offset while draining keepalive_data */
+    int keepalive_shown;    /* 1 = keep-alive caption currently displayed */
+    int caption_displayed;  /* 1 = a real caption currently displayed */
 
     /* Scheduling cursors */
     int next_load;          /* Next event index to consider for loading */
@@ -774,9 +785,28 @@ static av_cold int init(AVFilterContext *avctx)
     /* Pre-encode erase (EDM) command */
     ctx->erase_data_size = encode_erase_cc(ctx, ctx->erase_data, sizeof(ctx->erase_data));
 
+    /* Pre-encode the keep-alive caption: a pop-on caption of a single space with
+     * a transparent background, so it renders to nothing but still produces a
+     * WebVTT cue. Displayed whenever no real caption is on screen. */
+    if (ctx->keepalive) {
+        int p = 0;
+        uint8_t hi, lo;
+        emit_control(ctx->keepalive_data, &p, 0x14, CC_RCL, ctx->data_field);
+        emit_control(ctx->keepalive_data, &p, 0x14, CC_ENM, ctx->data_field);
+        generate_pac(15, 0, &hi, &lo);
+        emit_control(ctx->keepalive_data, &p, hi, lo, ctx->data_field);
+        emit_control(ctx->keepalive_data, &p, 0x17, 0x2D, ctx->data_field); /* background transparent */
+        emit_cc_data(ctx->keepalive_data, &p, 0x20, 0x00, ctx->data_field); /* a space */
+        emit_control(ctx->keepalive_data, &p, 0x14, CC_EOC, ctx->data_field);
+        ctx->keepalive_size = p;
+    }
+
     /* Initialize drain state */
     ctx->drain_event = -1;
     ctx->erase_event = -1;
+    ctx->keepalive_event = -1;
+    ctx->keepalive_shown = 0;
+    ctx->caption_displayed = 0;
     ctx->next_load = 0;
     ctx->next_erase = 0;
     ctx->sub_eof = 0;
@@ -912,7 +942,7 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVF
     }
 
     /* If not currently draining anything, check for new work */
-    if (ctx->drain_event < 0 && ctx->erase_event < 0) {
+    if (ctx->drain_event < 0 && ctx->erase_event < 0 && ctx->keepalive_event < 0) {
         /* Check for pending erases (events already sent but not yet cleared) */
         while (ctx->next_erase < ctx->next_load && ctx->next_erase < ctx->nb_events) {
             SubtitleEvent *ev = &ctx->events[ctx->next_erase];
@@ -937,10 +967,19 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVF
                     }
                 }
                 if (!skip) {
-                    ctx->erase_event = ctx->next_erase;
-                    ctx->erase_pos = 0;
-                    ctx->next_erase++;
-                    log_cc_data(avctx, ctx->erase_data, ctx->erase_data_size, NULL, 1);
+                    if (ctx->keepalive) {
+                        /* Don't EDM: the keep-alive caption (drained below) swaps
+                         * this caption for the invisible space, so the WebVTT cue
+                         * never gaps. */
+                        ev->cleared = 1;
+                        ctx->caption_displayed = 0;
+                        ctx->next_erase++;
+                    } else {
+                        ctx->erase_event = ctx->next_erase;
+                        ctx->erase_pos = 0;
+                        ctx->next_erase++;
+                        log_cc_data(avctx, ctx->erase_data, ctx->erase_data_size, NULL, 1);
+                    }
                     break;
                 }
             }
@@ -958,6 +997,7 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVF
                     ctx->drain_event = ctx->next_load;
                     ctx->drain_pos = 0;
                     ctx->next_load++;
+                    ctx->keepalive_shown = 0;  /* a real caption replaces the keep-alive */
                     log_cc_data(avctx, ev->cc_data, ev->cc_data_size, ev->text, 0);
                 }
             } else {
@@ -965,6 +1005,16 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVF
                 ctx->events[ctx->next_load].cleared = 1;
                 ctx->next_load++;
             }
+        }
+
+        /* Screen is idle with no real caption: (re)show the invisible keep-alive
+         * caption so the WebVTT cue stays present (keeps a player's CC track
+         * and button alive across caption-free gaps). */
+        if (ctx->keepalive && ctx->drain_event < 0 && ctx->erase_event < 0
+            && !ctx->caption_displayed && !ctx->keepalive_shown
+            && ctx->keepalive_size > 0) {
+            ctx->keepalive_event = 0;
+            ctx->keepalive_pos = 0;
         }
     }
 
@@ -984,6 +1034,15 @@ static int process_video_frame(AVFilterContext *avctx, AVFilterLink *inlink, AVF
         if (ctx->drain_pos >= ev->cc_data_size) {
             ev->sent = 1;
             ctx->drain_event = -1;
+            ctx->caption_displayed = 1;  /* real caption now on screen */
+        }
+        have_output = 1;
+    } else if (ctx->keepalive_event >= 0) {
+        memcpy(out_triplet, ctx->keepalive_data + ctx->keepalive_pos, 3);
+        ctx->keepalive_pos += 3;
+        if (ctx->keepalive_pos >= ctx->keepalive_size) {
+            ctx->keepalive_event = -1;
+            ctx->keepalive_shown = 1;    /* invisible keep-alive now on screen */
         }
         have_output = 1;
     }
@@ -1092,6 +1151,7 @@ static const AVOption cea608embed_options[] = {
     { "data_field", "select data field (0=first, 1=second)", OFFSET(data_field), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, FLAGS },
     { "start_row", "starting row (0=auto, 1-15=fixed)", OFFSET(start_row), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 15, FLAGS },
     { "continuous", "output padding when no caption data", OFFSET(continuous), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
+    { "keepalive", "show an invisible (transparent-background space) caption whenever idle, so the WebVTT cue never gaps (keeps a player's CC track/button alive)", OFFSET(keepalive), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
     { NULL }
 };
 
