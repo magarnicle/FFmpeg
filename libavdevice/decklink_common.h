@@ -156,6 +156,7 @@ struct decklink_ctx {
     int has_teletext_data;           /* Whether we have valid teletext data */
     int teletext_erase_pending;      /* Header still carries C4=1; clear it after first transmission */
     int teletext_idle_frames;        /* Frames since the last caption update (for the OP-42 s7 cleardown) */
+    int64_t teletext_caption_end_pts;/* End PTS (pts+duration) of the current caption; AV_NOPTS_VALUE if unknown */
 
     /* Streams present */
     int audio;

@@ -2580,8 +2580,18 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
             stored_new = 1;                   /* Reset the idle timer */
+            /* Remember when this caption should stop being displayed, so we can
+             * erase it promptly at its end instead of waiting for the OP-42 s7
+             * idle cleardown (which lingers the caption up to ~10s). Falls back
+             * to the idle timer when the packet carries no duration. */
+            ctx->teletext_caption_end_pts = (teletext_pkt.duration > 0)
+                ? teletext_pkt.pts + teletext_pkt.duration
+                : AV_NOPTS_VALUE;
 
-            av_log(avctx, AV_LOG_DEBUG, "Teletext: storing %d data units from packet\n", num_units);
+            av_log(avctx, AV_LOG_DEBUG,
+                   "Teletext: storing %d data units (pts=%"PRId64" dur=%"PRId64" end=%"PRId64")\n",
+                   num_units, teletext_pkt.pts, teletext_pkt.duration,
+                   ctx->teletext_caption_end_pts);
 
             for (int i = 0; i < num_units; i++) {
                 uint8_t *du = teletext_pkt.data + (i * 46);
@@ -2609,6 +2619,17 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         frames_10s = 50;
     if (frames_10s > 2000)
         frames_10s = 2000;
+
+    /* Prompt clear at the caption's own end time: when the current caption's
+     * display duration has elapsed and no newer caption has arrived, jump the
+     * idle timer to the cleardown point so the OP-42 s7 erase fires now instead
+     * of ~10s later (which left the caption lingering past program end). */
+    if (ctx->has_teletext_data && !stored_new
+        && ctx->teletext_caption_end_pts != AV_NOPTS_VALUE
+        && ctx->last_pts >= ctx->teletext_caption_end_pts
+        && ctx->teletext_idle_frames < frames_10s) {
+        ctx->teletext_idle_frames = frames_10s;
+    }
 
     /* Determine which data to transmit. The stored page is retransmitted one
      * row per frame (continuous carousel), the same packet on both fields. */
@@ -3346,6 +3367,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
     ctx->teletext_vbi_offset = cctx->teletext_vbi_offset;
+    ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
