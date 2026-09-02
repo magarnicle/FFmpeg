@@ -1155,22 +1155,38 @@ static int decklink_pre_render_init_device(AVFormatContext *avctx)
         return AVERROR(EIO);
     }
 
-    /* Enable video output with retry loop */
-    if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
-        av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
-        ctx->supports_vanc = 0;
-    }
-    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
-        if (!ctx->block_until_available) {
-            av_log(avctx, AV_LOG_ERROR, "Pre-render: could not enable video output\n");
-            ff_decklink_cleanup(avctx);
-            return AVERROR(EIO);
+    /* Enable video output, waiting for the card if it is still held by the
+     * outgoing process. EnableVideoOutput returns E_ACCESSDENIED while the
+     * device is in use; in block_until_available (pre-render/hand-off) mode we
+     * keep retrying the SAME mode until we actually get the card. Only once the
+     * card is accessible (a non-E_ACCESSDENIED result) and VANC genuinely fails
+     * do we fall back to plain output. Previously any VANC failure during the
+     * hand-off wait silently dropped VANC -> no teletext, decided before we ever
+     * held the card. */
+    already_logged = 0;
+    for (;;) {
+        BMDVideoOutputFlags out_flags = ctx->supports_vanc ? bmdVideoOutputVANC
+                                                           : bmdVideoOutputFlagDefault;
+        HRESULT hr = ctx->dlo->EnableVideoOutput(ctx->bmd_mode, out_flags);
+        if (hr == S_OK)
+            break;
+        if (hr == E_ACCESSDENIED && ctx->block_until_available) {
+            if (!already_logged) {
+                av_log(avctx, AV_LOG_DEBUG, "Pre-render: waiting for device (vanc=%d)...\n",
+                       ctx->supports_vanc);
+                already_logged = 1;
+            }
+            usleep(1000);
+            continue;
         }
-        if (!already_logged) {
-            av_log(avctx, AV_LOG_DEBUG, "Pre-render: waiting for device...\n");
-            already_logged = 1;
+        if (ctx->supports_vanc) {
+            av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
+            ctx->supports_vanc = 0;
+            continue;
         }
-        usleep(1000);
+        av_log(avctx, AV_LOG_ERROR, "Pre-render: could not enable video output\n");
+        ff_decklink_cleanup(avctx);
+        return AVERROR(EIO);
     }
 
     /* Set callback */
@@ -1341,21 +1357,33 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
                 " Check available formats with -list_formats 1.\n");
         return -1;
     }
-    if (ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputVANC) != S_OK) {
-        av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
-        ctx->supports_vanc = 0;
-    }
+    /* Same hand-off-aware enable as the pre-render path: wait out E_ACCESSDENIED
+     * (card still held by the outgoing process) retrying the desired mode, and
+     * only fall back from VANC to plain output once the card is actually
+     * accessible and VANC genuinely fails. */
     already_logged = 0;
-    while (!ctx->supports_vanc && ctx->dlo->EnableVideoOutput(ctx->bmd_mode, bmdVideoOutputFlagDefault) != S_OK) {
-        if (!ctx->block_until_available) {
-            av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
-            return -1;
-        };
-        if (!already_logged){
-            av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device...\n");
-            already_logged = 1;
+    for (;;) {
+        BMDVideoOutputFlags out_flags = ctx->supports_vanc ? bmdVideoOutputVANC
+                                                           : bmdVideoOutputFlagDefault;
+        HRESULT hr = ctx->dlo->EnableVideoOutput(ctx->bmd_mode, out_flags);
+        if (hr == S_OK)
+            break;
+        if (hr == E_ACCESSDENIED && ctx->block_until_available) {
+            if (!already_logged) {
+                av_log(avctx, AV_LOG_DEBUG, "Could not enable video output, waiting for device (vanc=%d)...\n",
+                       ctx->supports_vanc);
+                already_logged = 1;
+            }
+            usleep(1000);
+            continue;
         }
-        usleep(1000);
+        if (ctx->supports_vanc) {
+            av_log(avctx, AV_LOG_WARNING, "Could not enable video output with VANC! Trying without...\n");
+            ctx->supports_vanc = 0;
+            continue;
+        }
+        av_log(avctx, AV_LOG_ERROR, "Could not enable video output!\n");
+        return -1;
     }
 
 
