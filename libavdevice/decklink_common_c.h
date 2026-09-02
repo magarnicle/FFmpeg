@@ -96,6 +96,7 @@ struct decklink_cctx {
     int teletext_dual_field;
     int teletext_drip;
     int teletext_drip_gap;
+    int teletext_send_twice;
 
     /* Socket server options */
     char *socket_path;

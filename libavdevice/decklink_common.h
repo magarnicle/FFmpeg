@@ -159,6 +159,8 @@ struct decklink_ctx {
     int teletext_drip;               /* 1=drip one row every drip_gap frames, filler between (Polistream) */
     int teletext_drip_gap;           /* frames of filler between dripped rows */
     int teletext_drip_counter;       /* runtime: frames since last dripped row */
+    int teletext_send_twice;         /* 1=emit each row twice, "Send Subtitles Twice (aus)" */
+    int teletext_row_repeat;         /* runtime: pending second emit of current row */
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */

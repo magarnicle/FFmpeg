@@ -85,6 +85,7 @@ static const AVOption options[] = {
     { "teletext_dual_field", "transmit different consecutive rows on field 1 and field 2 (Polistream style) instead of duplicating one row per frame", OFFSET(teletext_dual_field), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "teletext_drip", "Polistream style: drip one page row every teletext_drip_gap frames with filler in between, instead of cycling the whole page every frame (pair with teletext_p31_filler)", OFFSET(teletext_drip), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "teletext_drip_gap", "frames of filler between dripped teletext rows (Polistream averages ~17)", OFFSET(teletext_drip_gap), AV_OPT_TYPE_INT, { .i64 = 17 }, 1, 500, ENC },
+    { "teletext_send_twice", "emit each teletext row twice for receiver reliability (Polistream 'Send Subtitles Twice (aus)')", OFFSET(teletext_send_twice), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "socket_path" , "Unix socket path for external frame input", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "socket_listen", "Listen on socket for external frame input", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "shm_name", "Shared memory name for cross-process frame buffer", OFFSET(shm_name), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },

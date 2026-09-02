@@ -2630,18 +2630,27 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
 /* Return the next stored teletext row to transmit and advance the carousel.
  * Applies the header C4-erase aging (assert erase once on the first header
  * after a content change, then clear it) so the decoder doesn't re-erase every
- * cycle. Called once per field in dual_field mode, once per frame otherwise. */
+ * cycle. Called once per field in dual_field mode, once per frame otherwise.
+ *
+ * With teletext_send_twice ("Send Subtitles Twice (aus)" in Polistream) each
+ * row is returned on two consecutive calls before advancing, so every row goes
+ * out twice for receiver reliability (the Australian requirement). */
 static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
 {
     int idx = ctx->teletext_row_index;
-    if (idx == 0) {
+    if (idx == 0 && !ctx->teletext_row_repeat) {
         if (ctx->teletext_erase_pending)
             ctx->teletext_erase_pending = 0;   /* first header keeps C4=1 */
         else
             teletext_clear_erase_bit(ctx->teletext_rows[0]);
     }
     const uint8_t *d = ctx->teletext_rows[idx];
-    ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
+    if (ctx->teletext_send_twice && !ctx->teletext_row_repeat) {
+        ctx->teletext_row_repeat = 1;          /* emit this same row once more */
+    } else {
+        ctx->teletext_row_repeat = 0;
+        ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
+    }
     return d;
 }
 
@@ -2696,6 +2705,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
             stored_new = 1;                   /* Reset the idle timer */
             ctx->teletext_drip_counter = ctx->teletext_drip_gap;  /* drip first row now */
+            ctx->teletext_row_repeat = 0;     /* start fresh row-doubling on new page */
 
             av_log(avctx, AV_LOG_DEBUG, "Teletext: storing %d data units from packet\n", num_units);
 
@@ -3500,6 +3510,8 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_drip = cctx->teletext_drip;
     ctx->teletext_drip_gap = cctx->teletext_drip_gap;
     ctx->teletext_drip_counter = 0;
+    ctx->teletext_send_twice = cctx->teletext_send_twice;
+    ctx->teletext_row_repeat = 0;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
