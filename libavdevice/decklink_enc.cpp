@@ -2160,14 +2160,9 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  *   Word 2: Cr1[9:0], Y3[9:0], Cb2[9:0], xx
  *   Word 3: Y4[9:0], Cr2[9:0], Y5[9:0], xx
  */
-#define TELETEXT_SHAPE_GAUSS 0
-#define TELETEXT_SHAPE_SINC  1
-
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
                                             const uint8_t *teletext_data, int data_len,
-                                            int vbi_offset, int shape_enable,
-                                            int shape_cutoff_khz, int shape_taps,
-                                            int shape_kernel)
+                                            int vbi_offset)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -2267,102 +2262,11 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         }
     }
 
-    /* Optional band-limiting of the waveform.
-     *
-     * The ideal luma[] above is a hard two-level square wave. Broadcast VBI-
-     * insertion hardware (e.g. the Deltacast card driving Polistream) instead
-     * emits an analog-shaped, band-limited pulse. When enabled, convolve luma[]
-     * with a windowed-sinc (Hann-windowed) low-pass FIR to approximate that
-     * eye. This is a source-side nicety, not an OP-42 requirement (OP-42 §7
-     * leaves eye restoration to a downstream re-timer), so it is off unless
-     * the caller sets teletext_shape. Cutoff and tap count are tunable so the
-     * eye can be matched to a reference capture without recompiling.
-     *
-     * The convolution output is clipped to the teletext rails [LUMA_LOW,
-     * LUMA_HIGH] (see below), which flattens the windowed-sinc's ring to
-     * Polistream's clean flat-topped eye and keeps luma in gamut. */
+    /* Emit the raw two-level square wave directly. Analog band-limiting/shaping
+     * was tried (windowed-sinc / Gaussian, matched to a Polistream capture) but
+     * it broke on-air rendering while the raw square renders correctly on the
+     * WVR / STB, so it was removed. See teletext-working-onair-config memory. */
     const uint16_t *out_luma = luma;
-    uint16_t shaped[2048];
-    if (shape_enable && shape_taps >= 3 && shape_cutoff_khz > 0) {
-        int taps = shape_taps;
-        if (taps > 63)
-            taps = 63;
-        if ((taps & 1) == 0)
-            taps++;                 /* force odd so the FIR is symmetric */
-        int M = taps / 2;
-        const double fs_khz = 13500.0;  /* PAL VBI sample rate */
-        double fc = shape_cutoff_khz;
-        if (fc > fs_khz / 2.0)
-            fc = fs_khz / 2.0;
-
-        double kern[64];
-        double ksum = 0.0;
-        if (shape_kernel == TELETEXT_SHAPE_GAUSS) {
-            /* Gaussian low-pass: monotonic step response, so it band-limits the
-             * waveform without ringing past the rails (no overshoot / sub-black,
-             * unlike the windowed-sinc). sigma set so the -6dB point is at fc. */
-            double sigma = fs_khz * sqrt(2.0 * log(2.0)) / (2.0 * M_PI * fc);
-            if (sigma < 0.3)
-                sigma = 0.3;
-            for (int n = 0; n < taps; n++) {
-                double m = n - M;
-                kern[n] = exp(-0.5 * (m / sigma) * (m / sigma));
-                ksum += kern[n];
-            }
-        } else {
-            /* Windowed-sinc (Hann): sharper cutoff but rings (overshoots). */
-            for (int n = 0; n < taps; n++) {
-                int m = n - M;
-                double sinc = (m == 0) ? (2.0 * fc / fs_khz)
-                                       : sin(2.0 * M_PI * fc / fs_khz * m) / (M_PI * m);
-                double win = 0.5 - 0.5 * cos(2.0 * M_PI * n / (taps - 1));  /* Hann */
-                kern[n] = sinc * win;
-                ksum += kern[n];
-            }
-        }
-        if (ksum != 0.0) {
-            for (int n = 0; n < taps; n++)
-                kern[n] /= ksum;    /* unity DC gain */
-        }
-
-        for (int i = 0; i < width; i++) {
-            double acc = 0.0;
-            for (int n = 0; n < taps; n++) {
-                int idx = i + n - M;
-                if (idx < 0)
-                    idx = 0;
-                else if (idx >= width)
-                    idx = width - 1;
-                acc += kern[n] * luma[idx];
-            }
-            /* Clip to the teletext signal rails, not the full 10-bit range.
-             * A sharp (windowed-sinc) low-pass rings past the rails; clamping
-             * the ring to [LUMA_LOW, LUMA_HIGH] reproduces Polistream's flat-
-             * topped eye (peak == the "1" level, floor == black, no sub-black)
-             * and keeps luma in gamut. This is what makes the sharp kernel
-             * usable: it removes the sub-black excursion that motivated the
-             * Gaussian fallback, so we get sinc's flat passband (full-amplitude
-             * clock run-in) without the gamut risk. Validated against a
-             * Polistream capture: sinc @4700 kHz clipped to rails matches poli's
-             * spectrum (>5.5 MHz energy 0.16% vs 0.15%) with CRI at full 160. */
-            int v = (int)lrint(acc);
-            if (v < LUMA_LOW)
-                v = LUMA_LOW;
-            else if (v > LUMA_HIGH)
-                v = LUMA_HIGH;
-            shaped[i] = (uint16_t)v;
-        }
-        out_luma = shaped;
-
-        static int shape_logged = 0;
-        if (!shape_logged) {
-            shape_logged = 1;
-            av_log(NULL, AV_LOG_INFO,
-                   "Teletext VBI waveform shaping: kernel=%s cutoff=%d kHz taps=%d\n",
-                   shape_kernel == TELETEXT_SHAPE_GAUSS ? "gauss" : "sinc",
-                   shape_cutoff_khz, taps);
-        }
-    }
 
     /* Convert to V210 format: 6 pixels per 16 bytes */
     uint32_t *v210 = (uint32_t *)line_buf;
@@ -2421,22 +2325,6 @@ static const uint8_t teletext_filler_packet[42] = {
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
-};
-
-/* Alternate filler: a packet 8/31 (magazine 8, row 31 = Independent Data Line),
- * captured verbatim from a Polistream reference. Polistream keeps the teletext
- * line continuously active by transmitting this on ~90% of fields, injecting
- * the subtitle page rows only when they change. Selectable via the
- * teletext_p31_filler option so we can match that idle behaviour on air. The
- * IDL payload is a static snapshot (Polistream increments a counter in it);
- * receivers that don't consume IDL ignore the content and just see a valid
- * magazine-8 packet keeping the data channel alive. */
-static const uint8_t teletext_filler_p31[42] = {
-    0xD0, 0xEA, 0x64, 0x38, 0xC7, 0xC7, 0xC7, 0xC7, 0xC7, 0xC7,
-    0x96, 0x4F, 0x4F, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50,
-    0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x51,
-    0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51, 0x51,
-    0x9A, 0xFE
 };
 
 /* Filler teletext data unit for HD VANC (OP-47 SDP format)
@@ -2613,9 +2501,7 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                        teletext_data, 42, ctx->teletext_vbi_offset,
-                                        ctx->teletext_shape, ctx->teletext_shape_cutoff,
-                                        ctx->teletext_shape_taps, ctx->teletext_shape_kernel);
+                                        teletext_data, 42, ctx->teletext_vbi_offset);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -2630,27 +2516,18 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
 /* Return the next stored teletext row to transmit and advance the carousel.
  * Applies the header C4-erase aging (assert erase once on the first header
  * after a content change, then clear it) so the decoder doesn't re-erase every
- * cycle. Called once per field in dual_field mode, once per frame otherwise.
- *
- * With teletext_send_twice ("Send Subtitles Twice (aus)" in Polistream) each
- * row is returned on two consecutive calls before advancing, so every row goes
- * out twice for receiver reliability (the Australian requirement). */
+ * cycle. Called once per frame. */
 static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
 {
     int idx = ctx->teletext_row_index;
-    if (idx == 0 && !ctx->teletext_row_repeat) {
+    if (idx == 0) {
         if (ctx->teletext_erase_pending)
             ctx->teletext_erase_pending = 0;   /* first header keeps C4=1 */
         else
             teletext_clear_erase_bit(ctx->teletext_rows[0]);
     }
     const uint8_t *d = ctx->teletext_rows[idx];
-    if (ctx->teletext_send_twice && !ctx->teletext_row_repeat) {
-        ctx->teletext_row_repeat = 1;          /* emit this same row once more */
-    } else {
-        ctx->teletext_row_repeat = 0;
-        ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
-    }
+    ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
     return d;
 }
 
@@ -2659,9 +2536,8 @@ static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
  * to VBI lines 21 (field 1) and 334 (field 2) per Australian OP-47.
  *
  * Each encoder packet contains multiple data units (rows). We store all rows
- * and cycle through them, sending one row per frame (or two rows per frame,
- * one per field, when teletext_dual_field is set). This transmits the full
- * teletext page over multiple frames.
+ * and cycle through them, sending one row per frame (same packet on both
+ * fields). This transmits the full teletext page over multiple frames.
  */
 static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                        IDeckLinkVideoFrameAncillary *vanc)
@@ -2704,8 +2580,6 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
             stored_new = 1;                   /* Reset the idle timer */
-            ctx->teletext_drip_counter = ctx->teletext_drip_gap;  /* drip first row now */
-            ctx->teletext_row_repeat = 0;     /* start fresh row-doubling on new page */
 
             av_log(avctx, AV_LOG_DEBUG, "Teletext: storing %d data units from packet\n", num_units);
 
@@ -2736,20 +2610,14 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     if (frames_10s > 2000)
         frames_10s = 2000;
 
-    /* Idle/lead-in filler. Optionally a packet 8/31 (Polistream style) instead
-     * of a dummy page header, to keep the data channel continuously active. */
-    const uint8_t *filler = ctx->teletext_p31_filler ? teletext_filler_p31
-                                                     : teletext_filler_packet;
-
-    /* Determine which data to transmit. In dual_field mode the two fields carry
-     * consecutive different rows (like Polistream); otherwise both fields carry
-     * the same packet. */
-    const uint8_t *data_f1, *data_f2;
+    /* Determine which data to transmit. The stored page is retransmitted one
+     * row per frame (continuous carousel), the same packet on both fields. */
+    const uint8_t *data_to_send;
     uint8_t cleardown[42];
     if (!ctx->has_teletext_data) {
         /* Lead-in, before any caption has arrived: filler so the line is never
          * dead and the decoder clock stays locked. */
-        data_f1 = data_f2 = filler;
+        data_to_send = teletext_filler_packet;
         av_log(avctx, AV_LOG_DEBUG, "Teletext: filler (no caption yet)\n");
     } else if (ctx->teletext_idle_frames >= frames_10s) {
         /* OP-42 s7: after 10s with no caption update, clear the page (blank
@@ -2760,52 +2628,29 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             uint8_t nib = ham84_decode[cleardown[5]];
             if (nib != 0xFF)
                 cleardown[5] = ham84_encode[(nib & 0x07) | 0x08];  /* set C4=1 */
-            data_f1 = data_f2 = cleardown;
+            data_to_send = cleardown;
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle cleardown (P801 C4=1)\n");
         } else {
-            data_f1 = data_f2 = filler;
+            data_to_send = teletext_filler_packet;
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle filler\n");
         }
     } else if (ctx->teletext_row_count > 0) {
-        /* Active or recently-updated caption. */
-        if (ctx->teletext_drip) {
-            /* Polistream-style drip: transmit one page row (or one per field in
-             * dual_field mode) every teletext_drip_gap frames, and send filler
-             * (8/31 when teletext_p31_filler is set) in between, rather than
-             * cycling the whole page every frame. A Polistream capture drips
-             * content on ~5% of frames (one isolated frame every ~17), letting
-             * the receiver accumulate and hold the page. The row's C4-erase
-             * aging is handled in teletext_next_row(). */
-            if (++ctx->teletext_drip_counter >= ctx->teletext_drip_gap) {
-                ctx->teletext_drip_counter = 0;
-                data_f1 = teletext_next_row(ctx);
-                data_f2 = ctx->teletext_dual_field ? teletext_next_row(ctx) : data_f1;
-                av_log(avctx, AV_LOG_DEBUG, "Teletext: drip row (gap=%d dual=%d)\n",
-                       ctx->teletext_drip_gap, ctx->teletext_dual_field);
-            } else {
-                data_f1 = data_f2 = filler;
-            }
-        } else {
-            /* Continuous carousel: retransmit the stored page every frame,
-             * aging out the header's C4 erase bit after the first transmission
-             * so the decoder doesn't clear and re-render every cycle. */
-            data_f1 = teletext_next_row(ctx);
-            data_f2 = ctx->teletext_dual_field ? teletext_next_row(ctx) : data_f1;
-            av_log(avctx, AV_LOG_DEBUG, "Teletext: sending rows (dual_field=%d) of %d\n",
-                   ctx->teletext_dual_field, ctx->teletext_row_count);
-        }
+        /* Active or recently-updated caption: retransmit the stored page every
+         * frame, aging out the header's C4 erase bit after the first
+         * transmission so the decoder doesn't clear and re-render every cycle. */
+        data_to_send = teletext_next_row(ctx);
     } else {
-        data_f1 = data_f2 = filler;
+        data_to_send = teletext_filler_packet;
     }
 
     /* Insert on VBI line 21 (field 1 / odd field) */
     if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_f1);
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
     }
 
     /* Insert on VBI line 334 (field 2 / even field) */
     if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_f2);
+        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
     }
 }
 
@@ -3501,17 +3346,6 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
     ctx->teletext_vbi_offset = cctx->teletext_vbi_offset;
-    ctx->teletext_shape = cctx->teletext_shape;
-    ctx->teletext_shape_cutoff = cctx->teletext_shape_cutoff;
-    ctx->teletext_shape_taps = cctx->teletext_shape_taps;
-    ctx->teletext_shape_kernel = cctx->teletext_shape_kernel;
-    ctx->teletext_p31_filler = cctx->teletext_p31_filler;
-    ctx->teletext_dual_field = cctx->teletext_dual_field;
-    ctx->teletext_drip = cctx->teletext_drip;
-    ctx->teletext_drip_gap = cctx->teletext_drip_gap;
-    ctx->teletext_drip_counter = 0;
-    ctx->teletext_send_twice = cctx->teletext_send_twice;
-    ctx->teletext_row_repeat = 0;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))

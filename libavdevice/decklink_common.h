@@ -150,17 +150,6 @@ struct decklink_ctx {
     DecklinkPacketQueue teletext_queue;
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;         /* VBI waveform start sample offset (0-20) */
-    int teletext_shape;              /* Band-limit the SD teletext VBI waveform (0=raw square wave) */
-    int teletext_shape_cutoff;       /* Shaping FIR -6dB cutoff in kHz */
-    int teletext_shape_taps;         /* Shaping FIR length in taps */
-    int teletext_shape_kernel;       /* Shaping FIR kernel: 0=gauss, 1=sinc */
-    int teletext_p31_filler;         /* Idle filler: 0=dummy header, 1=packet 8/31 (Polistream) */
-    int teletext_dual_field;         /* 1=different consecutive row per field (Polistream) */
-    int teletext_drip;               /* 1=drip one row every drip_gap frames, filler between (Polistream) */
-    int teletext_drip_gap;           /* frames of filler between dripped rows */
-    int teletext_drip_counter;       /* runtime: frames since last dripped row */
-    int teletext_send_twice;         /* 1=emit each row twice, "Send Subtitles Twice (aus)" */
-    int teletext_row_repeat;         /* runtime: pending second emit of current row */
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */

@@ -88,15 +88,6 @@ struct decklink_cctx {
     double audio_schedule_retry;
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;
-    int teletext_shape;
-    int teletext_shape_cutoff;
-    int teletext_shape_taps;
-    int teletext_shape_kernel;
-    int teletext_p31_filler;
-    int teletext_dual_field;
-    int teletext_drip;
-    int teletext_drip_gap;
-    int teletext_send_twice;
 
     /* Socket server options */
     char *socket_path;
