@@ -1226,6 +1226,9 @@ static int decklink_pre_render_init_device(AVFormatContext *avctx)
 
     ctx->pre_render_device_ready = 1;
     av_log(avctx, AV_LOG_INFO, "Pre-render: device initialized successfully\n");
+    if (ctx->pre_render_trigger_time)
+        av_log(avctx, AV_LOG_INFO, "Pre-render TIMING: device ready (output enabled) %.1f ms after trigger\n",
+               (av_gettime() - ctx->pre_render_trigger_time) / 1000.0);
 
     return 0;
 }
@@ -1271,6 +1274,9 @@ static void *decklink_pre_render_trigger_thread(void *arg)
         }
 
         if (should_trigger) {
+            /* Hand-off gap timing: mark when the trigger fired so the device
+             * init / first-frame / on-air milestones can be measured against it. */
+            ctx->pre_render_trigger_time = av_gettime();
             /* Initialize device */
             ret = decklink_pre_render_init_device(avctx);
             if (ret < 0) {
@@ -3042,8 +3048,12 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
     ctx->frames_buffer_available_spots--;
     pthread_mutex_unlock(&ctx->mutex);
 
-    if (ctx->first_pts == AV_NOPTS_VALUE)
+    if (ctx->first_pts == AV_NOPTS_VALUE) {
         ctx->first_pts = pkt->pts;
+        if (ctx->pre_render_trigger_time)
+            av_log(avctx, AV_LOG_INFO, "Pre-render TIMING: first video frame scheduled %.1f ms after trigger\n",
+                   (av_gettime() - ctx->pre_render_trigger_time) / 1000.0);
+    }
 
     /* Schedule frame for playback. */
     hr = ctx->dlo->ScheduleVideoFrame(frame,
@@ -3088,6 +3098,9 @@ static int decklink_schedule_video_packet(AVFormatContext *avctx, AVPacket *pkt)
             return AVERROR(EIO);
         }
         ctx->playback_started = 1;
+        if (ctx->pre_render_trigger_time)
+            av_log(avctx, AV_LOG_INFO, "Pre-render TIMING: ON-AIR (scheduled playback started) %.1f ms after trigger\n",
+                   (av_gettime() - ctx->pre_render_trigger_time) / 1000.0);
         /* Mark the output as on-air so fftools can report speed relative to
          * playout start, excluding the pre_render buffering phase. Set once. */
         av_dict_set(&avctx->metadata, "ffmpeg.onair", "1", 0);

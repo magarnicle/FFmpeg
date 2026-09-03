@@ -237,6 +237,7 @@ struct decklink_ctx {
     int64_t pre_render_start_time; /* Unix timestamp (microseconds) when playback should start */
     int pre_render_target_frames;  /* Number of frames to buffer before starting */
     int pre_render_device_ready;   /* Device initialization complete */
+    int64_t pre_render_trigger_time; /* av_gettime() when the trigger fired (hand-off gap timing) */
     pthread_t pre_render_trigger_thread;
     int pre_render_trigger_started;
     int pre_render_trigger_stop;
