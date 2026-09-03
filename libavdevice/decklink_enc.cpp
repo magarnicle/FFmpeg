@@ -1126,15 +1126,22 @@ static int decklink_pre_render_init_device(AVFormatContext *avctx)
 
     av_log(avctx, AV_LOG_INFO, "Pre-render: initializing DeckLink device\n");
 
-    /* Initialize DeckLink device */
-    ret = ff_decklink_init_device(avctx, avctx->url);
-    if (ret < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Pre-render: failed to initialize device\n");
-        return ret;
+    /* Initialize DeckLink device. Skipped if it was pre-opened during pre-render
+     * setup: device enumeration and the config/attr/output interface queries are
+     * non-exclusive (they succeed while the outgoing process still holds
+     * EnableVideoOutput), so doing them before the trigger keeps the trigger's
+     * critical path down to config/format + EnableVideoOutput + preroll. */
+    if (!ctx->dl) {
+        ret = ff_decklink_init_device(avctx, avctx->url);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: failed to initialize device\n");
+            return ret;
+        }
     }
 
-    /* Get output device */
-    if (ctx->dl->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void **) &ctx->dlo) != S_OK) {
+    /* Get output device (also skipped if already queried during pre-open) */
+    if (!ctx->dlo &&
+        ctx->dl->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void **) &ctx->dlo) != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Pre-render: could not open output device\n");
         ff_decklink_cleanup(avctx);
         return AVERROR(EIO);
@@ -3594,6 +3601,20 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
             return AVERROR(ret);
         }
         ctx->output_thread_started = 1;
+
+        /* Pre-open the device before the trigger fires. Device enumeration and
+         * the config/attr/output interface queries are not exclusive, so they
+         * succeed while the outgoing process still holds EnableVideoOutput.
+         * Doing them now shortens the trigger's critical path (the part that
+         * runs while the SDI is between processes) to config/format +
+         * EnableVideoOutput + preroll. Best-effort: the trigger-time init is
+         * guarded on ctx->dl/ctx->dlo and does a full init if this didn't
+         * complete. */
+        if (ff_decklink_init_device(avctx, avctx->url) == 0) {
+            if (ctx->dl->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void **)&ctx->dlo) != S_OK)
+                ctx->dlo = NULL;  /* trigger will retry the query */
+            av_log(avctx, AV_LOG_INFO, "Pre-render: device pre-opened; trigger path is enable-output only\n");
+        }
 
         /* Start trigger thread to monitor conditions and initialize device */
         ctx->pre_render_trigger_stop = 0;
