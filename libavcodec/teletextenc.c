@@ -90,6 +90,8 @@ typedef struct TeletextEncContext {
     int update_indicator; /* C8: Update indicator flag (OP-42 4g) */
     int subtitle_flag;    /* C6: Subtitle indicator flag (OP-42 4f) */
     int wrap_text;        /* Word-wrap lines wider than the row instead of truncating */
+    int translit;         /* Map non-G0 chars ([]->(), note->#, entities, accents) to G0-safe glyphs */
+    int note_x26;         /* Emit a real G2 music note via Packet X/26 (Polistream method) vs # fallback */
 
     /* Internal state */
     uint16_t page_bcd;  /* Page number in BCD */
@@ -146,6 +148,12 @@ static int hex_to_teletext_color(uint32_t rgb)
     return (r_bit << 0) | (g_bit << 1) | (b_bit << 2);
 }
 
+/* Internal placeholder byte for a music note in the page buffer. It is out of
+ * the 0x00-0x7F teletext code range so it can never collide with real content;
+ * it is resolved just before transmission into either a space (with a real G2
+ * note overlaid via Packet X/26) or the '#' fallback glyph. */
+#define TELETEXT_NOTE_MARK 0xFF
+
 /**
  * Transliterate a Unicode code point to teletext-safe ASCII.
  *
@@ -166,6 +174,13 @@ static const char *teletext_translit(unsigned cp)
     case 0x2013: case 0x2014: case 0x2015: case 0x2212: return "-";
     case 0x2026: return "...";
     case 0x00A0: case 0x2007: case 0x2009: case 0x200A: case 0x202F: return " ";
+    /* Music notes (U+266A eighth note, U+266B beamed notes) frame song lyrics
+     * in captions. Teletext G0 has no note glyph; a real note lives in the G2
+     * supplementary set and is placed via a Packet X/26 enhancement (see
+     * build_x26_row) - the Polistream on-air method. Emit a placeholder here;
+     * it is resolved at transmission time into a space (with the G2 note
+     * overlaid) or, when X/26 is disabled, the '#' fallback. */
+    case 0x266A: case 0x266B: case 0x2669: case 0x266C: return "\xff";
     /* Accented Latin -> base letter */
     case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5: return "A";
     case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5: return "a";
@@ -185,6 +200,41 @@ static const char *teletext_translit(unsigned cp)
     case 0x0152: return "OE"; case 0x0153: return "oe";
     default: return " ";
     }
+}
+
+/**
+ * Append one Unicode code point to the output buffer as G0-safe byte(s).
+ *
+ * With translit enabled the code point is folded to teletext-displayable
+ * glyphs: printable ASCII passes through (with the two square brackets, which
+ * have no G0 glyph, mapped to parentheses); everything else goes through
+ * teletext_translit(). With translit disabled only plain ASCII is emitted
+ * verbatim (brackets included, i.e. as their raw 0x5B/0x5D) and any non-ASCII
+ * code point is dropped to a space rather than leaking raw UTF-8 bytes.
+ */
+static int append_codepoint(uint8_t *output, int pos, int max_len,
+                            unsigned cp, int translit)
+{
+    if (cp >= 0x20 && cp <= 0x7E) {
+        uint8_t b = cp;
+        if (translit) {
+            /* 0x5B/0x5D are National Option Character Subset positions with no
+             * bracket glyph (the English subset shows them as left/right
+             * arrows). Parentheses live at 0x28/0x29, which are fixed in every
+             * subset, so "[soft music]" reads as "(soft music)". */
+            if (b == '[')      b = '(';
+            else if (b == ']') b = ')';
+        }
+        if (pos < max_len - 1)
+            output[pos++] = b;
+    } else if (translit) {
+        const char *rep = teletext_translit(cp);
+        while (*rep && pos < max_len - 1)
+            output[pos++] = *rep++;
+    } else if (pos < max_len - 1) {
+        output[pos++] = ' ';
+    }
+    return pos;
 }
 
 /**
@@ -280,19 +330,37 @@ static int strip_tags_and_format(TeletextEncContext *ctx, const char *input,
                 output[pos++] = ' ';
                 p += 6;
                 continue;
+            } else if (p[1] == '#') {
+                /* Numeric character reference: &#DDDD; (decimal) or
+                 * &#xHHHH; (hex). Common in captions for the music note
+                 * (&#9834;) and similar; decode to a code point and fold it
+                 * to a G0-safe glyph rather than leaking "&#9834;" as text. */
+                const char *q = p + 2;
+                unsigned cp = 0;
+                int base = 10;
+                if (*q == 'x' || *q == 'X') { base = 16; q++; }
+                const char *digits = q;
+                while (*q && *q != ';') q++;
+                if (*q == ';' && q > digits) {
+                    cp = (unsigned)strtoul(digits, NULL, base);
+                    pos = append_codepoint(output, pos, max_len, cp, ctx->translit);
+                    p = q + 1;
+                    continue;
+                }
             }
         }
 
         /* Copy character, converting to teletext-safe ASCII */
         unsigned char c = *p;
         if (c >= 0x20 && c <= 0x7E) {
-            output[pos++] = c;
+            pos = append_codepoint(output, pos, max_len, c, ctx->translit);
         } else if (c == '\n' || c == '\r') {
             output[pos++] = '\n';
         } else if (c >= 0x80) {
-            /* Decode the UTF-8 code point and transliterate it to teletext-safe
-             * ASCII (smart quotes, dashes, ellipsis, accented Latin), rather
-             * than dropping every non-ASCII character to a space. */
+            /* Decode the UTF-8 code point and (when translit is on) fold it to
+             * teletext-safe ASCII (smart quotes, dashes, ellipsis, accented
+             * Latin, music notes), rather than dropping every non-ASCII
+             * character to a space or leaking raw UTF-8 bytes. */
             unsigned cp;
             int nb;
             if ((c & 0xE0) == 0xC0)      { cp = c & 0x1F; nb = 2; }
@@ -303,9 +371,7 @@ static int strip_tags_and_format(TeletextEncContext *ctx, const char *input,
                 if ((p[k] & 0xC0) != 0x80) { nb = k; break; }  /* truncated */
                 cp = (cp << 6) | (p[k] & 0x3F);
             }
-            const char *rep = teletext_translit(cp);
-            while (*rep && pos < max_len - 1)
-                output[pos++] = *rep++;
+            pos = append_codepoint(output, pos, max_len, cp, ctx->translit);
             p += (nb - 1);  /* the trailing p++ consumes the final byte */
         } else {
             output[pos++] = ' ';
@@ -488,6 +554,93 @@ static void build_content_row(TeletextEncContext *ctx, uint8_t *line, int row)
         else
             line[2 + i] = ff_teletext_odd_parity(c);
     }
+}
+
+/**
+ * Hamming 24/18 encode one teletext triplet (ETS 300 706 s8.3).
+ *
+ * Packs an 18-bit value - address (6 bits), mode (5 bits), data (7 bits) - into
+ * a 3-byte triplet with five Hamming protection bits plus an overall parity bit,
+ * all using ODD parity. Validated byte-exact against Polistream's on-air X/26
+ * packets (e.g. addr=20,mode=0x0F,data=0x55 -> 28 bd d5).
+ */
+static void teletext_ham24(int addr, int mode, int data, uint8_t out[3])
+{
+    /* Data-bit transmit positions (1-indexed): P at 1,2,4,8,16,24; data elsewhere. */
+    static const int dpos[18] = { 3,5,6,7,9,10,11,12,13,14,15,17,18,19,20,21,22,23 };
+    unsigned D = (addr & 0x3F) | ((mode & 0x1F) << 6) | ((data & 0x7F) << 11);
+    uint8_t bit[25] = { 0 };  /* 1-indexed transmitted bits */
+
+    for (int k = 0; k < 18; k++)
+        bit[dpos[k]] = (D >> k) & 1;
+
+    /* Hamming parity bits at 1,2,4,8,16: odd parity over the data bits they cover. */
+    static const int pmask[5] = { 1, 2, 4, 8, 16 };
+    for (int pi = 0; pi < 5; pi++) {
+        int s = 0;
+        for (int j = 1; j <= 24; j++) {
+            if (j == 1 || j == 2 || j == 4 || j == 8 || j == 16 || j == 24)
+                continue;  /* skip the parity positions themselves */
+            if (j & pmask[pi])
+                s ^= bit[j];
+        }
+        bit[pmask[pi]] = s ^ 1;
+    }
+    /* Overall parity at position 24 makes the whole 24-bit word odd parity. */
+    {
+        int s = 0;
+        for (int j = 1; j <= 23; j++)
+            s ^= bit[j];
+        bit[24] = s ^ 1;
+    }
+
+    out[0] = out[1] = out[2] = 0;
+    for (int p = 1; p <= 24; p++)
+        if (bit[p])
+            out[(p - 1) / 8] |= 1 << ((p - 1) % 8);
+}
+
+/**
+ * Build a Packet X/26 enhancement row (42 bytes) that overlays real music-note
+ * glyphs from the G2 supplementary set onto the base display rows.
+ *
+ * This is how Polistream puts an actual note on air (decoded from a broadcast
+ * capture): a Level-1.5 enhancement packet whose triplets set the active row
+ * then place G2 character 0x55 (the eighth note) at the note's column. The base
+ * row carries a space at that column; the decoder composites the note over it.
+ *
+ * note_rc[i] = {row, col} for each note; entries must be grouped/sorted by row.
+ * Packets carry 13 triplets: per row a "set active position" triplet
+ * (address=40+row, mode=0x04) followed by one "G2 character" triplet per note
+ * (address=column, mode=0x0F, data=0x55), padded with terminators.
+ */
+static void build_x26_row(TeletextEncContext *ctx, uint8_t *line,
+                          const uint8_t (*note_rc)[2], int num_notes)
+{
+    /* Bytes 0-1: MRAG for packet 26 in this magazine */
+    encode_mrag(ctx->mag_encoded, 26, &line[0], &line[1]);
+    /* Byte 2: designation code 0 (first enhancement packet for the page) */
+    line[2] = ff_teletext_ham84(0);
+
+    /* Bytes 3-41: 13 Hamming 24/18 triplets */
+    uint8_t *tp = &line[3];
+    int t = 0;              /* triplet index 0..12 */
+    int cur_row = -1;
+    for (int i = 0; i < num_notes && t < 13; i++) {
+        int row = note_rc[i][0];
+        int col = note_rc[i][1];
+        if (row != cur_row && t < 13) {
+            teletext_ham24(40 + row, 0x04, 0, &tp[t * 3]);  /* set active position to row */
+            t++;
+            cur_row = row;
+        }
+        if (t < 13) {
+            teletext_ham24(col, 0x0F, 0x55, &tp[t * 3]);    /* G2 note (0x55) at column */
+            t++;
+        }
+    }
+    for (; t < 13; t++)
+        teletext_ham24(63, 0x1F, 0, &tp[t * 3]);            /* termination triplet */
 }
 
 int ff_teletext_build_data_unit(uint8_t *out, int data_unit_id,
@@ -735,6 +888,28 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
         write_to_page(ctx, row, col, lines[l], line_lens[l], line_colors[l]);
     }
 
+    /* Resolve music-note placeholders (see teletext_translit). Scan the laid-out
+     * page for the note mark, record each (row, col), and replace the cell: with
+     * X/26 enabled the base cell becomes a space and a real G2 note is overlaid
+     * there via an enhancement packet (Polistream's method); otherwise it falls
+     * back to '#', which renders as a hash in the default English G0 subset. */
+    uint8_t note_rc[TELETEXT_ROWS * TELETEXT_COLS][2];
+    int num_notes = 0;
+    for (int row = 0; row < TELETEXT_ROWS; row++) {
+        for (int col = 0; col < TELETEXT_COLS; col++) {
+            if (ctx->page_buffer[row][col] != TELETEXT_NOTE_MARK)
+                continue;
+            if (ctx->note_x26) {
+                ctx->page_buffer[row][col] = ' ';
+                note_rc[num_notes][0] = row;
+                note_rc[num_notes][1] = col;
+                num_notes++;
+            } else {
+                ctx->page_buffer[row][col] = 0x5F;  /* '#' in the English G0 subset */
+            }
+        }
+    }
+
     /* Assert C4 (erase page) on this header if the visible content differs
      * from what we last transmitted, so the decoder clears the old caption
      * before painting the new rows (OP-42 4h). */
@@ -777,6 +952,18 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
         }
     }
 
+    /* Enhancement row: overlay real G2 music notes via Packet X/26 (Polistream
+     * method). Sent after the base content rows it decorates. */
+    if (ctx->note_x26 && num_notes > 0) {
+        build_x26_row(ctx, line_data, note_rc, num_notes);
+        if (total_size + TELETEXT_DATA_UNIT_SIZE > buf_size)
+            return AVERROR_BUFFER_TOO_SMALL;
+
+        ff_teletext_build_data_unit(buf + total_size, TELETEXT_DATA_UNIT_EBU_TELETEXT_SUBTITLE,
+                                    0, 7, ctx->mag_encoded, 26, line_data);
+        total_size += TELETEXT_DATA_UNIT_SIZE;
+    }
+
     ctx->sequence_num++;
     return total_size;
 }
@@ -799,6 +986,8 @@ static const AVOption teletext_options[] = {
     { "update_indicator", "C8: Update indicator flag (OP-42 4g)", OFFSET(update_indicator), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { "subtitle_flag", "C6: Subtitle indicator flag (OP-42 4f)", OFFSET(subtitle_flag), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { "wrap_text", "Word-wrap subtitle lines wider than the teletext row instead of truncating (Polistream 'Wrap text if >ttxt width')", OFFSET(wrap_text), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
+    { "translit", "Fold characters with no G0 glyph to teletext-safe equivalents ([]->() , numeric entities, smart quotes, accents; music note via note_x26). Disable to pass raw ASCII bytes through unchanged", OFFSET(translit), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
+    { "note_x26", "Render a music note as a real G2 glyph via a Packet X/26 enhancement (Polistream method, needs a Level-1.5 decoder); disable to fall back to '#'", OFFSET(note_x26), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, VE },
     { NULL }
 };
 
