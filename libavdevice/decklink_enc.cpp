@@ -2257,9 +2257,23 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      *   - 336 bits data × 1.946 = 654 samples
      *   - Total: ~700 samples
      *
-     * To fit the waveform within the buffer: max start = 720 - 700 = 20 samples.
-     * The vbi_offset parameter (configurable via -teletext_vbi_offset) sets
-     * the start position, defaulting to 18.
+     * The vbi_offset parameter (configurable via -teletext_vbi_offset) is the
+     * sample at which clock-run-in bit 0 begins.
+     *
+     * H-TIMING (OP-42 Fig 2/3): the penultimate of the 8 clock-run-in "1"s must
+     * sit 12.0 +/- 0.288 us after the line-sync datum. Measured against a
+     * Polistream capture that the Bridge VB440 locks as WST (poli.txt, AJA dump,
+     * same 720-sample active grid), Polistream's run-in bit 0 is at sample 26 and
+     * its penultimate "1" at ~sample 50 = the 12 us datum. Our run-in starts at
+     * `vbi_offset` (1:1), so the default is 26 to match that datum. The earlier
+     * value (6) put the run-in ~20 samples / ~1.5 us early, which the VB440
+     * rejected as "Other data in VBI" rather than WST.
+     *
+     * The full 45-byte packet is ~701 samples, so at offset 26 it nominally ends
+     * ~sample 727, a ~7-sample overhang past the 720-sample line. Polistream has
+     * the identical overhang and is conformant: its real data ends by ~705 and
+     * only trailing padding clips (OP-42 Fig 3: "provided the last bit of the last
+     * character on the line is not blanked").
      */
     int pixel_pos = vbi_offset;
     int bit_pos_fp = 0;
