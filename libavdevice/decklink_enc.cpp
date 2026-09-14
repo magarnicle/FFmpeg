@@ -2323,32 +2323,78 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * limited path -- a strict WST slicer then reads peaks well above the nominal
      * level and rejects the eye as non-conformant ("Other data in VBI").
      *
-     * We low-pass the samples with a symmetric 3-tap kernel [g, 1, g] (normalised).
-     * Two hard constraints at this sample rate:
-     *  - The bit period is only 1.946 samples, so the kernel MUST stay within +/-1
-     *    sample. A wider kernel blurs each bit into its neighbours, drops the
-     *    amplitude of isolated bits below the slice point, and corrupts characters
-     *    (a +/-3-sample Gaussian dropped ~1 char in 12). Hence radius is fixed at 1.
-     *  - Both side taps are >= 0 and the taps sum to 1, so every output sample is a
-     *    weighted average of inputs in [LUMA_LOW, LUMA_HIGH] and cannot overshoot
-     *    that range (unlike a windowed-sinc). Unity DC gain preserves 66%/0% levels.
+     * FUNDAMENTAL CONSTRAINT: at 13.5 MHz the bit period is only 1.946 samples,
+     * which is *below* 2 samples/bit, so teletext is under-sampled at the output
+     * resolution and a perfectly open, clean eye is not achievable here. Any
+     * smoothing narrows the already-marginal eye. A crude output-grid filter closes
+     * it too far and drops characters (a 3-tap kernel dropped ~1 char in 12).
      *
-     * teletext_shape = sigma*10 sets only the side-tap weight g = exp(-1/(2 sigma^2))
-     * -- i.e. how hard the single-sample edges are rounded, from a light touch
-     * (shape ~8) up to a near-uniform 3-tap average (shape >= 20). This is the most
-     * band-limiting available at 13.5 MHz without closing the eye. */
+     * The least-damaging shaping is a proper Nyquist (raised-cosine) low-pass
+     * applied at HIGH internal resolution: a raised-cosine keeps the eye as open as
+     * possible for a given bandwidth (far more than a Gaussian) while rolling the
+     * edges off smoothly, so the downstream path has little left to ring on. We
+     * upsample OS-fold, apply the raised-cosine (beta = 1, the smoothest roll-off /
+     * least overshoot), then decimate back.
+     *
+     * teletext_shape is the -6 dB cutoff as a PERCENT of the 6.9375 MHz bit rate
+     * (e.g. 90 = 6.24 MHz). Higher = wider passband = more open eye but sharper
+     * edges (more overshoot); lower = softer edges (less overshoot) but tighter eye.
+     * It MUST be swept on the target slicer; at this sample rate there may be no
+     * value that satisfies both a strict overshoot mask and reliable decode. */
     const uint16_t *out_luma = luma;
     uint16_t filtered[2048];
     if (teletext_shape > 0) {
-        double sigma = teletext_shape / 10.0;
-        double g = exp(-1.0 / (2.0 * sigma * sigma));   /* side-tap weight */
-        double ksum = 1.0 + 2.0 * g;
-        double kc = 1.0 / ksum, ks = g / ksum;          /* centre, side (sum = 1) */
+        enum { OS = 4 };                                  /* internal oversample */
+        static double hires[2048 * OS];
+        static double filt[2048 * OS];
+        static double kern[1024];
+        const double PI = 3.14159265358979323846;
+        int hw = width * OS;
+        if (hw > (int)(sizeof(hires) / sizeof(hires[0])))
+            hw = (int)(sizeof(hires) / sizeof(hires[0]));
+        /* upsample the output-grid square wave (hold) to the hi-res grid */
+        for (int j = 0; j < hw; j++) {
+            int s = j / OS;
+            hires[j] = luma[s < width ? s : width - 1];
+        }
+        /* raised-cosine (Nyquist) low-pass kernel at the hi-res rate */
+        const double beta = 1.0;
+        double fs  = 13.5e6 * OS;
+        double f6  = (teletext_shape / 100.0) * 6.9375e6; /* -6 dB cutoff (Hz) */
+        double fcn = f6 / fs;                             /* cycles per hi-res sample */
+        int r = (int)(6.0 * (13.5 / 6.9375) * OS);        /* ~6 bit periods each side */
+        if (r < 1) r = 1;
+        if (r > (int)(sizeof(kern) / sizeof(kern[0])) / 2 - 1)
+            r = (int)(sizeof(kern) / sizeof(kern[0])) / 2 - 1;
+        double ksum = 0.0;
+        for (int n = -r; n <= r; n++) {
+            double sinc = (n == 0) ? 2.0 * fcn
+                                   : sin(2.0 * PI * fcn * n) / (PI * n);
+            double d = 1.0 - (4.0 * beta * fcn * n) * (4.0 * beta * fcn * n);
+            double ct = (fabs(d) < 1e-6) ? PI / 4.0
+                                         : cos(2.0 * PI * beta * fcn * n) / d;
+            double w = 0.5 - 0.5 * cos(2.0 * PI * (n + r) / (2.0 * r)); /* Hann */
+            kern[n + r] = sinc * ct * w;
+            ksum += kern[n + r];
+        }
+        for (int n = 0; n <= 2 * r; n++)
+            kern[n] /= ksum;                              /* unity DC gain */
+        for (int i = 0; i < hw; i++) {
+            double acc = 0.0;
+            for (int n = -r; n <= r; n++) {
+                int j = i + n;
+                if (j < 0) j = 0; else if (j >= hw) j = hw - 1;
+                acc += kern[n + r] * hires[j];
+            }
+            filt[i] = acc;
+        }
+        /* decimate back to the output grid, clamp to valid 10-bit range */
         for (int i = 0; i < width; i++) {
-            int im = (i > 0) ? i - 1 : 0;
-            int ip = (i < width - 1) ? i + 1 : width - 1;
-            double acc = ks * luma[im] + kc * luma[i] + ks * luma[ip];
-            filtered[i] = (uint16_t)(acc + 0.5);
+            int j = i * OS;
+            double v = filt[j < hw ? j : hw - 1];
+            if (v < 0.0) v = 0.0;
+            if (v > 1023.0) v = 1023.0;
+            filtered[i] = (uint16_t)(v + 0.5);
         }
         out_luma = filtered;
     }
