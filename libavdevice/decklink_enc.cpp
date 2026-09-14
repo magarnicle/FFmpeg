@@ -2787,12 +2787,25 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             data_to_send = teletext_filler_packet;
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle filler\n");
         }
-    } else if (ctx->teletext_row_count > 0) {
-        /* Active or recently-updated caption: retransmit the stored page every
-         * frame, aging out the header's C4 erase bit after the first
-         * transmission so the decoder doesn't clear and re-render every cycle. */
+    } else if (ctx->teletext_row_count > 0
+               && (ctx->teletext_continuous
+                   || ctx->teletext_idle_frames < ctx->teletext_burst_frames)) {
+        /* Active or recently-updated caption. Two modes:
+         *   Burst (default): retransmit the stored page only for the first
+         *     teletext_burst_frames after each update, then stop and drop to
+         *     filler while the decoder HOLDS the displayed page -- matching a real
+         *     subtitle inserter's short-burst-then-pause cadence (the MS Now
+         *     reference), instead of flooding a downstream caption extractor with
+         *     the same caption every frame. The end-of-caption cleardown above
+         *     still erases it at its end time / the 10s idle timer.
+         *   Continuous (-teletext_continuous 1): legacy carousel, retransmit
+         *     every frame.
+         * Either way, teletext_next_row ages out the header's C4 erase bit after
+         * the first transmission so the decoder doesn't clear and re-render. */
         data_to_send = teletext_next_row(ctx);
     } else {
+        /* Burst finished (or no rows): filler holds the line for OP-42 s4(b)
+         * while the decoder keeps displaying the last page. */
         data_to_send = teletext_filler_packet;
     }
 
@@ -3507,6 +3520,8 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_fields = cctx->teletext_fields;
     ctx->teletext_vbi_offset = cctx->teletext_vbi_offset;
     ctx->teletext_shape = cctx->teletext_shape;
+    ctx->teletext_continuous = cctx->teletext_continuous;
+    ctx->teletext_burst_frames = cctx->teletext_burst_frames;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;

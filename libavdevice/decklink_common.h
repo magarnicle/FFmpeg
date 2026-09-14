@@ -151,6 +151,8 @@ struct decklink_ctx {
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;         /* VBI waveform start sample offset (0-20) */
     int teletext_shape;              /* Gaussian band-limit sigma*10 (0 = raw square) */
+    int teletext_continuous;         /* 1 = legacy continuous carousel; 0 = burst then hold */
+    int teletext_burst_frames;       /* frames to retransmit a caption in burst mode */
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */

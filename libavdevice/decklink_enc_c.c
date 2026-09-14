@@ -76,6 +76,8 @@ static const AVOption options[] = {
     { "even"        , "insert on even field (field 2) only",        0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "teletext_vbi_offset", "teletext VBI clock-run-in start sample (26 = OP-42 12us datum, matches Polistream/VB440)", OFFSET(teletext_vbi_offset), AV_OPT_TYPE_INT, { .i64 = 26 }, 0, 200, ENC },
     { "teletext_shape", "band-limit teletext eye: raised-cosine -6dB cutoff as %% of bit rate (0=raw square, try 85-100; sweep on the target slicer)", OFFSET(teletext_shape), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 200, ENC },
+    { "teletext_continuous", "retransmit each caption every frame (legacy carousel) instead of a burst-then-hold", OFFSET(teletext_continuous), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "teletext_burst_frames", "burst mode: frames to retransmit a caption after each update, then hold", OFFSET(teletext_burst_frames), AV_OPT_TYPE_INT, { .i64 = 8 }, 1, 250, ENC },
     { "socket_path" , "Unix socket path for external frame input", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "socket_listen", "Listen on socket for external frame input", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "shm_name", "Shared memory name for cross-process frame buffer", OFFSET(shm_name), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },

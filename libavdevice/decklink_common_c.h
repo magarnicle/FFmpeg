@@ -89,6 +89,8 @@ struct decklink_cctx {
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;
     int teletext_shape;
+    int teletext_continuous;
+    int teletext_burst_frames;
 
     /* Socket server options */
     char *socket_path;
