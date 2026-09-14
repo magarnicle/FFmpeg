@@ -2203,7 +2203,7 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  */
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
                                             const uint8_t *teletext_data, int data_len,
-                                            int vbi_offset)
+                                            int vbi_offset, int teletext_shape)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -2317,11 +2317,53 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         }
     }
 
-    /* Emit the raw two-level square wave directly. Analog band-limiting/shaping
-     * was tried (windowed-sinc / Gaussian, matched to a Polistream capture) but
-     * it broke on-air rendering while the raw square renders correctly on the
-     * WVR / STB, so it was removed. See teletext-working-onair-config memory. */
+    /* Optional band-limiting of the teletext eye (teletext_shape > 0, off by
+     * default). The raw square wave has instantaneous 64<->640 edges whose
+     * out-of-band energy rings and overshoots in any downstream analog / band-
+     * limited path -- a strict WST slicer then reads peaks well above the nominal
+     * level and rejects the eye as non-conformant ("Other data in VBI").
+     *
+     * We low-pass the samples with a GAUSSIAN kernel. The key property: every tap
+     * is >= 0 and the taps are normalised to sum to 1, so each output sample is a
+     * weighted average of input samples that all lie in [LUMA_LOW, LUMA_HIGH].
+     * The result therefore cannot leave that range -- no overshoot, by
+     * construction. (A windowed-sinc has negative side-lobes and DOES overshoot;
+     * that is deliberately avoided here.) Unity DC gain preserves the 66%/0%
+     * levels on sustained runs.
+     *
+     * teletext_shape is sigma * 10 in samples (e.g. 8 => sigma 0.8). Larger =
+     * softer edges / less overshoot but a more closed eye. The 10-90% rise is
+     * ~2.56*sigma samples (bit period is 1.946 samples), so 8-12 gives a rise of
+     * roughly one bit to one-and-a-half bits. */
     const uint16_t *out_luma = luma;
+    uint16_t filtered[2048];
+    if (teletext_shape > 0) {
+        double sigma = teletext_shape / 10.0;
+        int radius = (int)ceil(3.0 * sigma);
+        if (radius < 1) radius = 1;
+        if (radius > 16) radius = 16;
+        double kernel[33];
+        double ksum = 0.0;
+        for (int k = -radius; k <= radius; k++) {
+            double w = exp(-(double)(k * k) / (2.0 * sigma * sigma));
+            kernel[k + radius] = w;
+            ksum += w;
+        }
+        for (int k = 0; k <= 2 * radius; k++)
+            kernel[k] /= ksum;              /* unity DC gain */
+
+        for (int i = 0; i < width; i++) {
+            double acc = 0.0;
+            for (int k = -radius; k <= radius; k++) {
+                int j = i + k;
+                if (j < 0) j = 0;            /* clamp/extend at the line edges */
+                else if (j >= width) j = width - 1;
+                acc += kernel[k + radius] * luma[j];
+            }
+            filtered[i] = (uint16_t)(acc + 0.5);
+        }
+        out_luma = filtered;
+    }
 
     /* Convert to V210 format: 6 pixels per 16 bytes */
     uint32_t *v210 = (uint32_t *)line_buf;
@@ -2556,7 +2598,8 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
-                                        teletext_data, 42, ctx->teletext_vbi_offset);
+                                        teletext_data, 42, ctx->teletext_vbi_offset,
+                                        ctx->teletext_shape);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -3429,6 +3472,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->duplex_mode  = cctx->duplex_mode;
     ctx->teletext_fields = cctx->teletext_fields;
     ctx->teletext_vbi_offset = cctx->teletext_vbi_offset;
+    ctx->teletext_shape = cctx->teletext_shape;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
