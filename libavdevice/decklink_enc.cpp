@@ -2323,43 +2323,31 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * limited path -- a strict WST slicer then reads peaks well above the nominal
      * level and rejects the eye as non-conformant ("Other data in VBI").
      *
-     * We low-pass the samples with a GAUSSIAN kernel. The key property: every tap
-     * is >= 0 and the taps are normalised to sum to 1, so each output sample is a
-     * weighted average of input samples that all lie in [LUMA_LOW, LUMA_HIGH].
-     * The result therefore cannot leave that range -- no overshoot, by
-     * construction. (A windowed-sinc has negative side-lobes and DOES overshoot;
-     * that is deliberately avoided here.) Unity DC gain preserves the 66%/0%
-     * levels on sustained runs.
+     * We low-pass the samples with a symmetric 3-tap kernel [g, 1, g] (normalised).
+     * Two hard constraints at this sample rate:
+     *  - The bit period is only 1.946 samples, so the kernel MUST stay within +/-1
+     *    sample. A wider kernel blurs each bit into its neighbours, drops the
+     *    amplitude of isolated bits below the slice point, and corrupts characters
+     *    (a +/-3-sample Gaussian dropped ~1 char in 12). Hence radius is fixed at 1.
+     *  - Both side taps are >= 0 and the taps sum to 1, so every output sample is a
+     *    weighted average of inputs in [LUMA_LOW, LUMA_HIGH] and cannot overshoot
+     *    that range (unlike a windowed-sinc). Unity DC gain preserves 66%/0% levels.
      *
-     * teletext_shape is sigma * 10 in samples (e.g. 8 => sigma 0.8). Larger =
-     * softer edges / less overshoot but a more closed eye. The 10-90% rise is
-     * ~2.56*sigma samples (bit period is 1.946 samples), so 8-12 gives a rise of
-     * roughly one bit to one-and-a-half bits. */
+     * teletext_shape = sigma*10 sets only the side-tap weight g = exp(-1/(2 sigma^2))
+     * -- i.e. how hard the single-sample edges are rounded, from a light touch
+     * (shape ~8) up to a near-uniform 3-tap average (shape >= 20). This is the most
+     * band-limiting available at 13.5 MHz without closing the eye. */
     const uint16_t *out_luma = luma;
     uint16_t filtered[2048];
     if (teletext_shape > 0) {
         double sigma = teletext_shape / 10.0;
-        int radius = (int)ceil(3.0 * sigma);
-        if (radius < 1) radius = 1;
-        if (radius > 16) radius = 16;
-        double kernel[33];
-        double ksum = 0.0;
-        for (int k = -radius; k <= radius; k++) {
-            double w = exp(-(double)(k * k) / (2.0 * sigma * sigma));
-            kernel[k + radius] = w;
-            ksum += w;
-        }
-        for (int k = 0; k <= 2 * radius; k++)
-            kernel[k] /= ksum;              /* unity DC gain */
-
+        double g = exp(-1.0 / (2.0 * sigma * sigma));   /* side-tap weight */
+        double ksum = 1.0 + 2.0 * g;
+        double kc = 1.0 / ksum, ks = g / ksum;          /* centre, side (sum = 1) */
         for (int i = 0; i < width; i++) {
-            double acc = 0.0;
-            for (int k = -radius; k <= radius; k++) {
-                int j = i + k;
-                if (j < 0) j = 0;            /* clamp/extend at the line edges */
-                else if (j >= width) j = width - 1;
-                acc += kernel[k + radius] * luma[j];
-            }
+            int im = (i > 0) ? i - 1 : 0;
+            int ip = (i < width - 1) ? i + 1 : width - 1;
+            double acc = ks * luma[im] + kc * luma[i] + ks * luma[ip];
             filtered[i] = (uint16_t)(acc + 0.5);
         }
         out_luma = filtered;
