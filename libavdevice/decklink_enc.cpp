@@ -2764,14 +2764,24 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     }
 
     /* Determine which data to transmit. The stored page is retransmitted one
-     * row per frame (continuous carousel), the same packet on both fields. */
+     * row per frame (continuous carousel), the same packet on both fields.
+     *
+     * data_to_send == NULL means "send nothing" -- leave line 21/334 blank this
+     * frame. That only happens where we would otherwise send P8FF FILLER, and only
+     * when -teletext_blank_idle is set: some downstream encoders flag the continuous
+     * filler as "extra data on line 21" and expect the line blank between caption
+     * bursts (as the MS Now reference does). It steps outside OP-42 s4(b) (which
+     * wants dummy headers when idle), so it is opt-in. The cleardown packets and the
+     * caption rows are NEVER blanked -- the cleardown carries the erase command the
+     * decoder needs, so it must always go out. */
     const uint8_t *data_to_send;
     uint8_t cleardown[42];
     if (!ctx->has_teletext_data) {
         /* Lead-in, before any caption has arrived: filler so the line is never
-         * dead and the decoder clock stays locked. */
-        data_to_send = teletext_filler_packet;
-        av_log(avctx, AV_LOG_DEBUG, "Teletext: filler (no caption yet)\n");
+         * dead and the decoder clock stays locked (or blank if blank_idle). */
+        data_to_send = ctx->teletext_blank_idle ? NULL : teletext_filler_packet;
+        av_log(avctx, AV_LOG_DEBUG, "Teletext: %s (no caption yet)\n",
+               data_to_send ? "filler" : "blank");
     } else if (ctx->teletext_idle_frames >= frames_10s) {
         /* OP-42 s7: after 10s with no caption update, clear the page (blank
          * P801 with C4=1, no StartBox) and drop to continuous filler,
@@ -2781,11 +2791,12 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             uint8_t nib = ham84_decode[cleardown[5]];
             if (nib != 0xFF)
                 cleardown[5] = ham84_encode[(nib & 0x07) | 0x08];  /* set C4=1 */
-            data_to_send = cleardown;
+            data_to_send = cleardown;   /* erase command -- always sent, never blanked */
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle cleardown (P801 C4=1)\n");
         } else {
-            data_to_send = teletext_filler_packet;
-            av_log(avctx, AV_LOG_DEBUG, "Teletext: idle filler\n");
+            data_to_send = ctx->teletext_blank_idle ? NULL : teletext_filler_packet;
+            av_log(avctx, AV_LOG_DEBUG, "Teletext: idle %s\n",
+                   data_to_send ? "filler" : "blank");
         }
     } else if (ctx->teletext_row_count > 0
                && (ctx->teletext_continuous
@@ -2805,18 +2816,18 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         data_to_send = teletext_next_row(ctx);
     } else {
         /* Burst finished (or no rows): filler holds the line for OP-42 s4(b)
-         * while the decoder keeps displaying the last page. */
-        data_to_send = teletext_filler_packet;
+         * while the decoder keeps displaying the last page (or blank if
+         * blank_idle -- the decoder holds the page regardless). */
+        data_to_send = ctx->teletext_blank_idle ? NULL : teletext_filler_packet;
     }
 
-    /* Insert on VBI line 21 (field 1 / odd field) */
-    if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
-    }
-
-    /* Insert on VBI line 334 (field 2 / even field) */
-    if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
-        insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
+    /* Insert on VBI line 21/334. data_to_send == NULL leaves the line blank
+     * (blank_idle): we simply skip insertion, so the line stays at black. */
+    if (data_to_send) {
+        if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN)
+            insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
+        if (ctx->teletext_fields != TELETEXT_FIELDS_ODD)
+            insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
     }
 }
 
@@ -3522,6 +3533,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_shape = cctx->teletext_shape;
     ctx->teletext_continuous = cctx->teletext_continuous;
     ctx->teletext_burst_frames = cctx->teletext_burst_frames;
+    ctx->teletext_blank_idle = cctx->teletext_blank_idle;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
