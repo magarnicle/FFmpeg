@@ -92,6 +92,8 @@ struct decklink_cctx {
     int teletext_continuous;
     int teletext_burst_frames;
     int teletext_blank_idle;
+    int teletext_dual_field;
+    int teletext_level;
 
     /* Socket server options */
     char *socket_path;

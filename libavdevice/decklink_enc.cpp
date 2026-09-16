@@ -2203,7 +2203,8 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  */
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
                                             const uint8_t *teletext_data, int data_len,
-                                            int vbi_offset, int teletext_shape)
+                                            int vbi_offset, int teletext_shape,
+                                            int teletext_level)
 {
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
@@ -2213,14 +2214,13 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
     const int FP_SHIFT = 8;
 
-    /* 10-bit luma levels for teletext signal
-     * Binary "1": 66% of peak white = 64 + 0.66*(940-64) = 642 (~640)
-     * Binary "0": 0% +/- 2% (black level) = 64
-     * OP-42 quotes 70% (677) for Australian broadcast, but Polistream — the
-     * reference that decodes on our STB — drives 66% (~640, matching ETS 300
-     * 706). We follow Polistream's level to match what the receiver expects.
-     */
-    const uint16_t LUMA_HIGH = 640;   /* 66% per ETS 300 706 / Polistream */
+    /* Binary "1" level, tunable via -teletext_level (percent of peak white).
+     * 66% (default) matches ETS 300 706 / Polistream and decodes on our STBs;
+     * OP-42 Fig 1 specifies 70% +/-3%. 10-bit: black=64, peak white=940. */
+    int lvl = teletext_level;
+    if (lvl < 40) lvl = 40;
+    if (lvl > 100) lvl = 100;
+    const uint16_t LUMA_HIGH = (uint16_t)(64 + lvl * (940 - 64) / 100);
     const uint16_t LUMA_LOW  = 64;    /* Black level (0 IRE) */
     const uint16_t LUMA_BLACK = 64;   /* Black level */
     const uint16_t CHROMA_NEUTRAL = 512;  /* Neutral chroma */
@@ -2633,7 +2633,7 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
                                         teletext_data, 42, ctx->teletext_vbi_offset,
-                                        ctx->teletext_shape);
+                                        ctx->teletext_shape, ctx->teletext_level);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -2786,6 +2786,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
      * caption rows are NEVER blanked -- the cleardown carries the erase command the
      * decoder needs, so it must always go out. */
     const uint8_t *data_to_send;
+    const uint8_t *data_f2 = NULL;   /* field-2 override for dual-field; NULL = copy field 1 */
     uint8_t cleardown[42];
     if (!ctx->has_teletext_data) {
         /* Lead-in, before any caption has arrived: filler so the line is never
@@ -2825,11 +2826,19 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
          * Either way, teletext_next_row ages out the header's C4 erase bit after
          * the first transmission so the decoder doesn't clear and re-render. */
         data_to_send = teletext_next_row(ctx);
+        /* Dual-field (ala MS Now): field 2 (line 334) carries the NEXT row rather
+         * than a copy of field 1, so a multi-row page transmits in half the frames.
+         * Only meaningful with >1 row and both fields active; filler/cleardown below
+         * stay identical on both fields. teletext_next_row also ages the C4 erase
+         * bit, so the header still erases correctly whichever field it lands on. */
+        if (ctx->teletext_dual_field && ctx->teletext_row_count > 1
+            && ctx->teletext_fields == TELETEXT_FIELDS_BOTH)
+            data_f2 = teletext_next_row(ctx);
         av_log(avctx, AV_LOG_DEBUG,
-               "Teletext: burst row (idle=%d/%d rows=%d idx=%d continuous=%d)\n",
+               "Teletext: burst row (idle=%d/%d rows=%d idx=%d continuous=%d dual=%d)\n",
                ctx->teletext_idle_frames, ctx->teletext_burst_frames,
                ctx->teletext_row_count, ctx->teletext_row_index,
-               ctx->teletext_continuous);
+               ctx->teletext_continuous, data_f2 != NULL);
     } else {
         /* Burst finished (or no rows): filler holds the line for OP-42 s4(b)
          * while the decoder keeps displaying the last page (or blank if
@@ -2847,7 +2856,8 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN)
             insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
         if (ctx->teletext_fields != TELETEXT_FIELDS_ODD)
-            insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2, data_to_send);
+            insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2,
+                                     data_f2 ? data_f2 : data_to_send);
     }
 }
 
@@ -3554,6 +3564,8 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_continuous = cctx->teletext_continuous;
     ctx->teletext_burst_frames = cctx->teletext_burst_frames;
     ctx->teletext_blank_idle = cctx->teletext_blank_idle;
+    ctx->teletext_dual_field = cctx->teletext_dual_field;
+    ctx->teletext_level = cctx->teletext_level;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;

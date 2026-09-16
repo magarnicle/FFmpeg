@@ -154,6 +154,8 @@ struct decklink_ctx {
     int teletext_continuous;         /* 1 = legacy continuous carousel; 0 = burst then hold */
     int teletext_burst_frames;       /* frames to retransmit a caption in burst mode */
     int teletext_blank_idle;         /* 1 = blank line 21/334 when idle instead of P8FF filler */
+    int teletext_dual_field;         /* 1 = different row on each field (line 21 vs 334), ala MS Now */
+    int teletext_level;              /* Binary "1" level as % of peak white (OP-42=70, ETS/Polistream=66) */
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */
