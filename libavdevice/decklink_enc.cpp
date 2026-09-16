@@ -2825,11 +2825,20 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
          * Either way, teletext_next_row ages out the header's C4 erase bit after
          * the first transmission so the decoder doesn't clear and re-render. */
         data_to_send = teletext_next_row(ctx);
+        av_log(avctx, AV_LOG_DEBUG,
+               "Teletext: burst row (idle=%d/%d rows=%d idx=%d continuous=%d)\n",
+               ctx->teletext_idle_frames, ctx->teletext_burst_frames,
+               ctx->teletext_row_count, ctx->teletext_row_index,
+               ctx->teletext_continuous);
     } else {
         /* Burst finished (or no rows): filler holds the line for OP-42 s4(b)
          * while the decoder keeps displaying the last page (or blank if
          * blank_idle -- the decoder holds the page regardless). */
         data_to_send = ctx->teletext_blank_idle ? NULL : teletext_filler_packet;
+        av_log(avctx, AV_LOG_DEBUG,
+               "Teletext: hold %s (idle=%d/%d rows=%d)\n",
+               data_to_send ? "filler" : "blank", ctx->teletext_idle_frames,
+               ctx->teletext_burst_frames, ctx->teletext_row_count);
     }
 
     /* Insert on VBI line 21/334. data_to_send == NULL leaves the line blank
