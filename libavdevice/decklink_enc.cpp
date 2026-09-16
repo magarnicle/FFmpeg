@@ -2755,10 +2755,21 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     /* Prompt clear at the caption's own end time: when the current caption's
      * display duration has elapsed and no newer caption has arrived, jump the
      * idle timer to the cleardown point so the OP-42 s7 erase fires now instead
-     * of ~10s later (which left the caption lingering past program end). */
+     * of ~10s later (which left the caption lingering past program end).
+     *
+     * MUST NOT fire until the burst has finished. The burst gate below is
+     * teletext_idle_frames < teletext_burst_frames, and this jump sets
+     * teletext_idle_frames to frames_10s -- so firing it mid-burst kills the burst
+     * after as little as one frame. That happens whenever the caption's end_pts is
+     * already <= last_pts on arrival (short display duration, or captions delivered
+     * at/behind the video clock), which cut on-air captions to a single frame.
+     * Guard it so a caption always gets its full burst_frames of retransmission
+     * first; only then may the end-time clear it. (Continuous mode: idle_frames
+     * climbs past burst_frames immediately, so this guard is a no-op there.) */
     if (ctx->has_teletext_data && !stored_new
         && ctx->teletext_caption_end_pts != AV_NOPTS_VALUE
         && ctx->last_pts >= ctx->teletext_caption_end_pts
+        && ctx->teletext_idle_frames >= ctx->teletext_burst_frames
         && ctx->teletext_idle_frames < frames_10s) {
         ctx->teletext_idle_frames = frames_10s;
     }
