@@ -8,6 +8,14 @@ our bit-slicer mis-timed poli's more heavily-shaped waveform. With per-file timi
 recovery both files now decode at ~96% valid Hamming, and these are the true differences.
 Each is annotated: EXISTING flag, CAN-ADD flag, or NOT-A-SETTING (program/capture).
 
+UPDATE 2026-09-18 (new_deck3.txt, run with -teletext_vbi_offset 6 -teletext_shape 50
+-teletext_filler idl -teletext_dual_field 1): with the shaper rebuilt to generate from
+fractional bit positions (commit 9d5f0b270f), most of the differences below are now
+CLOSED. deck at offset 6 + shape 50 matches poli on CRI position, has ~54 sample levels
+(vs poli 65, was 8), decodes cleanly, uses the X/31 IDL filler, and splits fields. The
+inline "deck =" figures below are the OLD deck.txt (offset 2, shape 90, 8FF filler);
+current-config values are noted per line.
+
 WHAT POLI'S X/31 FILLER IS
 poli's idle line carries Packet 8/31 = an Independent Data Line (IDL / teletext
 datacasting): MRAG mag 8 row 31, a format byte, a fixed service-address run (0xC7 x5),
@@ -16,26 +24,30 @@ It is a live data service riding alongside the visible page-801 subtitles, not d
 header filler. Its content is not identifiable without the datacast service spec.
 
 REAL DIFFERENCES
-A. Clock-run-in start: deck ~sample 2, poli ~sample 6-7.
-   FLAG (EXISTS): -teletext_vbi_offset 6  (we run 2 for the Foxtel source).
-B. Black level (min): deck = 15, poli = 16.
-   deck's 15 is a 1-LSB shaping undershoot below black. NO flag (could clamp to 16).
-C. Binary-"1" level (max): deck = 161, poli = 160.
-   FLAG (EXISTS): -teletext_level 66 (default; ~160-161). Essentially matched.
-D. Waveform sample levels: deck = 8 distinct, poli = 65.
-   REAL: Deltacast shapes its waveform far more finely than our raised-cosine. This is
-   genuine, not noise. NO flag yet; would need higher oversampling in our shaper.
-E. Idle filler packet: deck = 8FF dummy header; poli = Packet 8/31 IDL datacast (above).
-   FLAG (CAN ADD): a filler-type toggle. CAVEAT: poli's X/31 is a live datacast whose
-   payload changes every packet, so only the packet TYPE can be matched, not its content.
-F. 8FF filler control byte 7: deck = 0x5E (C6=0, C7/C8/C9=0); poli's 8FF = 0xD0
-   (C6=1, C7/C8/C9=1) - poli's dummy header carries the same control bits as its subtitle
-   header. FLAG (CAN ADD): filler header control bits.
-G. 8FF filler subcode: deck = 0x3F7E; poli = 0x0000.
-   FLAG (CAN ADD): -teletext_filler_subcode.
-H. Fields differing (line 21 vs 334): deck = 32/500 (8FF filler identical on both fields);
-   poli = 500/500 (its X/31 datacast differs per field via the continuity counter).
-   STATUS: consequence of E; follows automatically from an X/31 filler.
+A. Clock-run-in start: old deck ~sample 2, poli ~sample 6. CURRENT: MATCHED at 6.
+   FLAG (EXISTS): -teletext_vbi_offset 6.
+B. Black level (min): old deck = 15, poli = 16. CURRENT (shape 50): deck = 14.
+   deck dips ~1-2 LSB below black on the shaped edges; poli stays at 16. NO flag
+   (could clamp the shaper to >= 16).
+C. Binary-"1" level (max): old deck = 161, poli = 160. CURRENT (shape 50): 161-162.
+   FLAG (EXISTS): -teletext_level 66 (default). Essentially matched (~1-2 LSB high).
+D. Waveform sample levels: old deck = 8 distinct, poli = 65. CURRENT: deck = ~54 at
+   shape 50 (39 at shape 70), NEARLY MATCHED. The old ~8 was a shaper bug (it filtered
+   the quantised output grid, which crushed the eye and forced shape 90). Fixed in
+   9d5f0b270f (generate from fractional bit positions); FLAG (EXISTS): lower
+   -teletext_shape gives more levels. shape 50 ~= poli's smoothness and still decodes.
+E. Idle filler packet: old deck = 8FF dummy header; poli = Packet 8/31 IDL datacast.
+   CURRENT: MATCHED type (deck uses -teletext_filler idl). CAVEAT: poli's X/31 payload
+   is a live datacast (only the packet TYPE is matched, not its content).
+F. 8FF filler control byte 7: old deck = 0x5E (C6=0, C7/C8/C9=0); poli's 8FF = 0xD0
+   (C6=1, C7/C8/C9=1). FLAG: -teletext_filler_ctrl 1. MOOT now (idl filler in use; this
+   only affects the 8FF dummy header).
+G. 8FF filler subcode: old deck = 0x3F7E; poli = 0x0000.
+   FLAG: -teletext_filler_subcode. MOOT now (idl filler in use).
+H. Fields differing (line 21 vs 334): old deck = 32/500; poli = 500/500.
+   CURRENT: deck = 66/500 (dual-field caption rows). Its idl filler is the same on both
+   fields (poli's X/31 differs per field via the continuity counter, which we increment
+   once per frame not per field). Largely a consequence of E.
 
 NOT DIFFERENCES (identical once decoded correctly)
 - Subtitle header (page 801): byte 7 = 0xD0, C6 = 1, C7/C8/C9 = 1, subcode 0x0000. SAME.
@@ -49,17 +61,21 @@ NOT A SETTING (program content or capture)
 - Line mean luma, caption rows used, per-row box-code counts: program content
   (deck and poli are now different programs), or a side effect of E's X/31 payload.
 
-SUMMARY - HOW TO MIMIC POLISTREAM (flags added 2026-09-18, commit 9cbc75596e)
-- CRI position (A): -teletext_vbi_offset 6
-- Level (C):        -teletext_level 66  (default)
-- Filler type (E):  -teletext_filler idl        (8/31 IDL; type only, not poli's payload)
-- Filler ctrl (F):  -teletext_filler_ctrl 1      (dummy filler C6/C7/C8/C9 = 1)
-- Filler subcode(G):-teletext_filler_subcode 0   (poli uses 0; default 0x3F7E)
-- Sample levels (D):-teletext_shape <lower>      (existing cutoff; 90=~9 levels, 50=~37;
-                     lower approaches poli's 65 but trades against decode margin)
-- Not matchable: poli's live X/31 datacast payload (no source); program content.
+SUMMARY - HOW TO MIMIC POLISTREAM
+Current best-match command (new_deck3.txt), verified to decode cleanly:
+  -teletext_vbi_offset 6 -teletext_shape 50 -teletext_filler idl -teletext_dual_field 1
+  -teletext_level 66 (default) -double_height 1
+This matches poli on: CRI position (6), levels (~66%), waveform smoothness (~54 levels
+vs 65), X/31 IDL filler type, and per-field row split. Push -teletext_shape a little
+lower (toward 40-45) for even more levels if the slicer stays happy; watch for the eye
+tightening (new_deck3 black dipped to 14 and peaks to 162).
 
-Closest single-command poli mimic (idle filler as 8/31 IDL, like poli):
-  -teletext_vbi_offset 6 -teletext_level 66 -teletext_filler idl
-Or keep 8FF dummy headers but match poli's control bits/subcode:
-  -teletext_vbi_offset 6 -teletext_filler_ctrl 1 -teletext_filler_subcode 0
+Remaining, NOT matchable:
+- poli's live X/31 datacast payload (a running data service; no source).
+- the last ~11 sample levels (65 vs 54): lower -teletext_shape closes the gap but trades
+  decode margin.
+- program content (which rows, caption text).
+
+Flags reference: -teletext_vbi_offset, -teletext_shape, -teletext_level, -teletext_filler
+[dummy|idl], -teletext_filler_ctrl, -teletext_filler_subcode, -teletext_dual_field.
+The _ctrl/_subcode flags only affect the 8FF dummy filler (moot with -teletext_filler idl).
