@@ -49,6 +49,11 @@ typedef enum DecklinkTeletextFields {
     TELETEXT_FIELDS_EVEN = 2,  /* Field 2 only */
 } DecklinkTeletextFields;
 
+typedef enum DecklinkTeletextFiller {
+    TELETEXT_FILLER_DUMMY = 0,  /* page 8FF dummy header (OP-42 s8) */
+    TELETEXT_FILLER_IDL   = 1,  /* Packet 8/31 Independent Data Line (like Polistream) */
+} DecklinkTeletextFiller;
+
 struct decklink_cctx {
     const AVClass *cclass;
 
@@ -94,6 +99,9 @@ struct decklink_cctx {
     int teletext_blank_idle;
     int teletext_dual_field;
     int teletext_level;
+    int teletext_filler;
+    int teletext_filler_ctrl;
+    int teletext_filler_subcode;
 
     /* Socket server options */
     char *socket_path;

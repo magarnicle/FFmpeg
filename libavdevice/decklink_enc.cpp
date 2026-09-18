@@ -2458,6 +2458,51 @@ static const uint8_t teletext_filler_packet[42] = {
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
 };
 
+/* Build the configurable SD idle-filler packet into ctx->teletext_filler_buf and
+ * return it. Two types, selected by -teletext_filler:
+ *   DUMMY (default): a page 8FF dummy header (OP-42 s8). The page subcode
+ *     (-teletext_filler_subcode, default 0x3F7E; Polistream uses 0) and the header
+ *     control bits C6/C7/C8/C9 (-teletext_filler_ctrl: 0 = all zero, our default;
+ *     1 = all one, as Polistream sends) are configurable. Default values reproduce
+ *     the historical teletext_filler_packet byte-for-byte.
+ *   IDL: a Packet 8/31 Independent Data Line, matching Polistream's filler TYPE
+ *     (MRAG mag 8 / row 31, a format+address template, and a per-packet continuity
+ *     counter). The payload is a fixed template, NOT Polistream's live datacast
+ *     content, which is a running data service we do not have the source for. */
+static const uint8_t *teletext_build_filler(struct decklink_ctx *ctx)
+{
+    uint8_t *p = ctx->teletext_filler_buf;
+    if (ctx->teletext_filler == TELETEXT_FILLER_IDL) {
+        p[0] = ham84_encode[8];            /* MRAG: mag 8 (0), row bit0=1 (row 31) */
+        p[1] = ham84_encode[15];           /* row bits 1-4 = 1111 -> row 31 */
+        p[2] = ham84_encode[4];            /* format/designation (matches poli 0x64) */
+        p[3] = ham84_encode[6];            /* 0x38 */
+        for (int i = 4; i < 10; i++)
+            p[i] = ham84_encode[9];        /* 0xC7 service-address run */
+        p[10] = (uint8_t)(ctx->teletext_idl_ci++ & 0xff);  /* continuity counter */
+        for (int i = 11; i < 42; i++)
+            p[i] = 0x20;                   /* fixed payload (not poli's live data) */
+        return p;
+    }
+    /* DUMMY: page 8FF header with configurable subcode + control bits. */
+    int sc = ctx->teletext_filler_subcode;
+    int S1 = sc & 0xF, S2 = (sc >> 4) & 0x7, S3 = (sc >> 8) & 0xF, S4 = (sc >> 12) & 0x3;
+    int c = ctx->teletext_filler_ctrl ? 1 : 0;
+    p[0] = ham84_encode[0];                /* MRAG: mag 8 (0), row 0 */
+    p[1] = ham84_encode[0];
+    p[2] = ham84_encode[15];               /* page FF (units) */
+    p[3] = ham84_encode[15];               /* page FF (tens) */
+    p[4] = ham84_encode[S1];               /* S1 */
+    p[5] = ham84_encode[S2];               /* S2 + C4=0 */
+    p[6] = ham84_encode[S3];               /* S3 */
+    p[7] = ham84_encode[(S4 | (c << 3)) & 0xF];       /* S4 + C5=0 + C6 */
+    p[8] = ham84_encode[(c | (c << 1) | (c << 2)) & 0xF];  /* C7 C8 C9, C10=0 */
+    p[9] = ham84_encode[0];                /* C11-C14 = 0 */
+    for (int i = 10; i < 42; i++)
+        p[i] = 0x20;                       /* 32 spaces */
+    return p;
+}
+
 /* Filler teletext data unit for HD VANC (OP-47 SDP format)
  * Contains dummy header per OP-42 Section 8 (page 8FF)
  * Structure: data_unit_id (0x02=non-subtitle), length (0x2C=44),
@@ -2791,7 +2836,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     if (!ctx->has_teletext_data) {
         /* Lead-in, before any caption has arrived: filler so the line is never
          * dead and the decoder clock stays locked (or blank if blank_idle). */
-        data_to_send = ctx->teletext_blank_idle ? NULL : teletext_filler_packet;
+        data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
         av_log(avctx, AV_LOG_DEBUG, "Teletext: %s (no caption yet)\n",
                data_to_send ? "filler" : "blank");
     } else if (ctx->teletext_idle_frames >= frames_10s) {
@@ -2806,7 +2851,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             data_to_send = cleardown;   /* erase command -- always sent, never blanked */
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle cleardown (P801 C4=1)\n");
         } else {
-            data_to_send = ctx->teletext_blank_idle ? NULL : teletext_filler_packet;
+            data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle %s\n",
                    data_to_send ? "filler" : "blank");
         }
@@ -2843,7 +2888,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         /* Burst finished (or no rows): filler holds the line for OP-42 s4(b)
          * while the decoder keeps displaying the last page (or blank if
          * blank_idle -- the decoder holds the page regardless). */
-        data_to_send = ctx->teletext_blank_idle ? NULL : teletext_filler_packet;
+        data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
         av_log(avctx, AV_LOG_DEBUG,
                "Teletext: hold %s (idle=%d/%d rows=%d)\n",
                data_to_send ? "filler" : "blank", ctx->teletext_idle_frames,
@@ -3566,6 +3611,9 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_blank_idle = cctx->teletext_blank_idle;
     ctx->teletext_dual_field = cctx->teletext_dual_field;
     ctx->teletext_level = cctx->teletext_level;
+    ctx->teletext_filler = cctx->teletext_filler;
+    ctx->teletext_filler_ctrl = cctx->teletext_filler_ctrl;
+    ctx->teletext_filler_subcode = cctx->teletext_filler_subcode;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
