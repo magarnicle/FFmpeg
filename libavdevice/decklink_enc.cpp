@@ -2276,45 +2276,37 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * character on the line is not blanked").
      */
     int pixel_pos = vbi_offset;
-    int bit_pos_fp = 0;
 
-    /* Generate clock run-in: 16 bits of alternating 1/0, starting with 1 */
-    for (int bit = 0; bit < 16; bit++) {
-        uint16_t value = (bit & 1) ? LUMA_LOW : LUMA_HIGH;
-        int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
-        int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
-        for (int p = start_pixel; p < end_pixel && p < width; p++)
-            luma[p] = value;
-        bit_pos_fp += SAMPLES_PER_BIT_FP;
-    }
-
-    /* Framing code: on-air bit pattern 11100100 (first bit transmitted first,
-     * per ETS 300 706 / ITU-R BT.653). The loop below emits LSB-first, so the
-     * byte constant must be 0x27 (0x27 = 0b00100111 -> LSB-first on air =
-     * 11100100). The previous 0xE4 is the MSB-first spelling; emitted LSB-first
-     * it put 00100111 on air (reversed), which no teletext slicer frame-locks
-     * on. Verified against a Polistream reference capture. */
+    /* Build the on-air bit sequence into bitlvl[]: 16-bit clock run-in (1010...,
+     * starting high), 8-bit framing code, then the 42 data bytes LSB-first. Both
+     * the raw output grid and the high-res shaped waveform render from the SAME
+     * bits, so keep the sequence in one place.
+     *
+     * Framing 0x27 = on-air 11100100 (first bit first, per ETS 300 706 / ITU-R
+     * BT.653), emitted LSB-first. 0xE4 is the MSB-first spelling and frame-locks on
+     * nothing; verified against a Polistream capture. */
+    uint16_t bitlvl[24 + 42 * 8];
+    int nbits = 0;
+    for (int bit = 0; bit < 16; bit++)
+        bitlvl[nbits++] = (bit & 1) ? LUMA_LOW : LUMA_HIGH;
     uint8_t framing = 0x27;
-    for (int bit = 0; bit < 8; bit++) {
-        uint16_t value = (framing & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
-        int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
-        int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
-        for (int p = start_pixel; p < end_pixel && p < width; p++)
-            luma[p] = value;
-        bit_pos_fp += SAMPLES_PER_BIT_FP;
-    }
-
-    /* Generate 42 bytes of teletext data (MRAG + 40 data bytes), LSB first */
+    for (int bit = 0; bit < 8; bit++)
+        bitlvl[nbits++] = (framing & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
     for (int byte_idx = 0; byte_idx < 42 && byte_idx < data_len; byte_idx++) {
         uint8_t byte = teletext_data[byte_idx];
-        for (int bit = 0; bit < 8; bit++) {
-            uint16_t value = (byte & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
-            int start_pixel = pixel_pos + (bit_pos_fp >> FP_SHIFT);
-            int end_pixel = pixel_pos + ((bit_pos_fp + SAMPLES_PER_BIT_FP) >> FP_SHIFT);
-            for (int p = start_pixel; p < end_pixel && p < width; p++)
-                luma[p] = value;
-            bit_pos_fp += SAMPLES_PER_BIT_FP;
-        }
+        for (int bit = 0; bit < 8; bit++)
+            bitlvl[nbits++] = (byte & (1 << bit)) ? LUMA_HIGH : LUMA_LOW;
+    }
+
+    /* Render the raw output-grid square wave (used when shaping is off). Bit b
+     * covers output samples [offset + floor(b*SPB), offset + floor((b+1)*SPB)),
+     * with SPB = SAMPLES_PER_BIT_FP/256. */
+    for (int b = 0; b < nbits; b++) {
+        int start_pixel = pixel_pos + ((b * SAMPLES_PER_BIT_FP) >> FP_SHIFT);
+        int end_pixel = pixel_pos + (((b + 1) * SAMPLES_PER_BIT_FP) >> FP_SHIFT);
+        for (int p = start_pixel; p < end_pixel && p < width; p++)
+            if (p >= 0)
+                luma[p] = bitlvl[b];
     }
 
     /* Optional band-limiting of the teletext eye (teletext_shape > 0, off by
@@ -2323,28 +2315,25 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * limited path -- a strict WST slicer then reads peaks well above the nominal
      * level and rejects the eye as non-conformant ("Other data in VBI").
      *
-     * FUNDAMENTAL CONSTRAINT: at 13.5 MHz the bit period is only 1.946 samples,
-     * which is *below* 2 samples/bit, so teletext is under-sampled at the output
-     * resolution and a perfectly open, clean eye is not achievable here. Any
-     * smoothing narrows the already-marginal eye. A crude output-grid filter closes
-     * it too far and drops characters (a 3-tap kernel dropped ~1 char in 12).
-     *
-     * The least-damaging shaping is a proper Nyquist (raised-cosine) low-pass
-     * applied at HIGH internal resolution: a raised-cosine keeps the eye as open as
-     * possible for a given bandwidth (far more than a Gaussian) while rolling the
-     * edges off smoothly, so the downstream path has little left to ring on. We
-     * upsample OS-fold, apply the raised-cosine (beta = 1, the smoothest roll-off /
-     * least overshoot), then decimate back.
+     * We build the waveform at HIGH internal resolution directly from the bit
+     * sequence (bitlvl[]) at each bit's TRUE fractional position, apply a raised-
+     * cosine (Nyquist, beta=1) low-pass, then decimate to the output grid. Building
+     * the hi-res grid from the bits -- rather than upsampling the already-quantised
+     * output-grid square -- is what keeps the eye open. Quantising the bit edges to
+     * whole output samples first jitters the bit timing by up to +/-0.5 sample
+     * (~0.26 bit); at ~1.95 samples/bit that alone nearly shuts the eye regardless
+     * of cutoff (which is why lower shape values used to drop characters). Placing
+     * the edges at OS-times finer resolution keeps the eye wide open, so the cutoff
+     * can go lower (smoother edges, more sample levels, closer to a hardware
+     * inserter) without corrupting data.
      *
      * teletext_shape is the -6 dB cutoff as a PERCENT of the 6.9375 MHz bit rate
-     * (e.g. 90 = 6.24 MHz). Higher = wider passband = more open eye but sharper
-     * edges (more overshoot); lower = softer edges (less overshoot) but tighter eye.
-     * It MUST be swept on the target slicer; at this sample rate there may be no
-     * value that satisfies both a strict overshoot mask and reliable decode. */
+     * (e.g. 90 = 6.24 MHz). Lower = softer edges / less overshoot / more sample
+     * levels but a tighter eye; sweep it on the target slicer. */
     const uint16_t *out_luma = luma;
     uint16_t filtered[2048];
     if (teletext_shape > 0) {
-        enum { OS = 4 };                                  /* internal oversample */
+        enum { OS = 8 };                                  /* internal oversample */
         static double hires[2048 * OS];
         static double filt[2048 * OS];
         static double kern[1024];
@@ -2352,10 +2341,15 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
         int hw = width * OS;
         if (hw > (int)(sizeof(hires) / sizeof(hires[0])))
             hw = (int)(sizeof(hires) / sizeof(hires[0]));
-        /* upsample the output-grid square wave (hold) to the hi-res grid */
+        /* Build the hi-res waveform from the bit sequence at fractional positions.
+         * hi-res sample j is at output position j/OS; the covering bit is
+         * floor((j/OS - offset) / SPB), SPB = SAMPLES_PER_BIT_FP/256. In hi-res
+         * units: bit = (j - offset*OS) * 256 / (SAMPLES_PER_BIT_FP * OS). */
         for (int j = 0; j < hw; j++) {
-            int s = j / OS;
-            hires[j] = luma[s < width ? s : width - 1];
+            long long rel = (long long)j - (long long)vbi_offset * OS;
+            if (rel < 0) { hires[j] = LUMA_BLACK; continue; }
+            long long bit = rel * 256 / ((long long)SAMPLES_PER_BIT_FP * OS);
+            hires[j] = (bit < nbits) ? bitlvl[bit] : LUMA_BLACK;
         }
         /* raised-cosine (Nyquist) low-pass kernel at the hi-res rate */
         const double beta = 1.0;
