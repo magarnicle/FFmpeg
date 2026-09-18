@@ -116,12 +116,15 @@ def calibrate(lines):
     """Find (spb, start, phase) that maximises valid-Hamming header bytes.
 
     Returns (valid_fraction, spb, start, phase). Uses the first lines that frame-lock
-    on 0x27. Nominal spb is 13.5/6.9375=1.9459 but the best sampling trajectory through
-    a shaped waveform is often a little lower; sweep a small window around it.
+    on 0x27. spb is pinned to a tight window around the true bit period
+    (13.5/6.9375 = 1.9459, and the code's fixed-point 498/256 = 1.9453). A wider sweep
+    overfits: on a heavily-shaped waveform a far-off spb (e.g. 1.932) can pass the 10
+    control bytes checked here yet drift enough to garble the 40 data bytes. Keep it near
+    the real rate so the whole line decodes, not just the header.
     """
     best = None
-    for spb in [x / 1000 for x in range(1928, 1962, 1)]:
-        for start in range(0, 10):
+    for spb in [x / 10000 for x in range(19430, 19491, 5)]:
+        for start in range(0, 12):
             for phase in [p / 10 for p in range(-10, 11)]:
                 good = tot = 0
                 for v in lines[:20]:
