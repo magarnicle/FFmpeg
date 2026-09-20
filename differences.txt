@@ -1,81 +1,23 @@
-Differences between deck.txt (our teletext) and poli.txt (old Polistream system)
-================================================================================
-Caption text contents excluded. Generated from teletext_tools/vbi_compare.py.
+Differences between deck.txt (our teletext) and poli.txt (Polistream), lines 21/334.
+Caption text excluded. Generated from teletext_tools/vbi_compare.py.
 
-REVISED 2026-09-18. Both cards are digital 3G-SDI, so poli.txt is bit-exact (no analog
-noise). An earlier revision wrongly blamed "capture artifacts": the real cause was that
-our bit-slicer mis-timed poli's more heavily-shaped waveform. With per-file timing
-recovery both files now decode at ~96% valid Hamming, and these are the true differences.
-Each is annotated: EXISTING flag, CAN-ADD flag, or NOT-A-SETTING (program/capture).
+deck config: -teletext_vbi_offset 6 -teletext_shape 50 -teletext_filler idl
+             -teletext_dual_field 1 -teletext_level 66 -double_height 1
 
-UPDATE 2026-09-18 (new_deck3.txt, run with -teletext_vbi_offset 6 -teletext_shape 50
--teletext_filler idl -teletext_dual_field 1): with the shaper rebuilt to generate from
-fractional bit positions (commit 9d5f0b270f), most of the differences below are now
-CLOSED. deck at offset 6 + shape 50 matches poli on CRI position, has ~54 sample levels
-(vs poli 65, was 8), decodes cleanly, uses the X/31 IDL filler, and splits fields. The
-inline "deck =" figures below are the OLD deck.txt (offset 2, shape 90, 8FF filler);
-current-config values are noted per line.
+DIFFERENCES
+1. Waveform sample levels: deck ~54 distinct 8-bit levels, poli 65.
+   Lower -teletext_shape raises deck's count.
+2. Peak "1" level (max): deck 161-162, poli 160.  (-teletext_level)
+3. Black level (min): deck 14, poli 16.
+4. Idle-filler payload: both send Packet 8/31 IDL. poli's payload is a live datacast
+   that changes every packet; deck's is a fixed template plus a per-packet counter.
+5. Per-field filler: poli's IDL differs on every field (continuity counter advances per
+   field); deck's filler is identical on both fields (counter advances per frame).
+   Fields differ: deck 66/500, poli 500/500.
+6. Program content: caption text and which rows are used (deck and poli are different
+   programs).
 
-WHAT POLI'S X/31 FILLER IS
-poli's idle line carries Packet 8/31 = an Independent Data Line (IDL / teletext
-datacasting): MRAG mag 8 row 31, a format byte, a fixed service-address run (0xC7 x5),
-a continuity counter (byte 10, +1 per packet), then user data that changes every packet.
-It is a live data service riding alongside the visible page-801 subtitles, not dummy-
-header filler. Its content is not identifiable without the datacast service spec.
-
-REAL DIFFERENCES
-A. Clock-run-in start: old deck ~sample 2, poli ~sample 6. CURRENT: MATCHED at 6.
-   FLAG (EXISTS): -teletext_vbi_offset 6.
-B. Black level (min): old deck = 15, poli = 16. CURRENT (shape 50): deck = 14.
-   deck dips ~1-2 LSB below black on the shaped edges; poli stays at 16. NO flag
-   (could clamp the shaper to >= 16).
-C. Binary-"1" level (max): old deck = 161, poli = 160. CURRENT (shape 50): 161-162.
-   FLAG (EXISTS): -teletext_level 66 (default). Essentially matched (~1-2 LSB high).
-D. Waveform sample levels: old deck = 8 distinct, poli = 65. CURRENT: deck = ~54 at
-   shape 50 (39 at shape 70), NEARLY MATCHED. The old ~8 was a shaper bug (it filtered
-   the quantised output grid, which crushed the eye and forced shape 90). Fixed in
-   9d5f0b270f (generate from fractional bit positions); FLAG (EXISTS): lower
-   -teletext_shape gives more levels. shape 50 ~= poli's smoothness and still decodes.
-E. Idle filler packet: old deck = 8FF dummy header; poli = Packet 8/31 IDL datacast.
-   CURRENT: MATCHED type (deck uses -teletext_filler idl). CAVEAT: poli's X/31 payload
-   is a live datacast (only the packet TYPE is matched, not its content).
-F. 8FF filler control byte 7: old deck = 0x5E (C6=0, C7/C8/C9=0); poli's 8FF = 0xD0
-   (C6=1, C7/C8/C9=1). FLAG: -teletext_filler_ctrl 1. MOOT now (idl filler in use; this
-   only affects the 8FF dummy header).
-G. 8FF filler subcode: old deck = 0x3F7E; poli = 0x0000.
-   FLAG: -teletext_filler_subcode. MOOT now (idl filler in use).
-H. Fields differing (line 21 vs 334): old deck = 32/500; poli = 500/500.
-   CURRENT: deck = 66/500 (dual-field caption rows). Its idl filler is the same on both
-   fields (poli's X/31 differs per field via the continuity counter, which we increment
-   once per frame not per field). Largely a consequence of E.
-
-NOT DIFFERENCES (identical once decoded correctly)
-- Subtitle header (page 801): byte 7 = 0xD0, C6 = 1, C7/C8/C9 = 1, subcode 0x0000. SAME.
-  (Earlier "#12/#13 subtitle byte7/C6 differ" was a slicer error.)
-- Magazine: 8 for both. The X/31 is mag 8, row 31 - not mag 4. (Earlier "#15" was wrong.)
-- Framing code 0x27, page 801, region 0, C11 = 0, double-height rows, Start/End boxing.
-
-NOT A SETTING (program content or capture)
-- First frame number (deck 2, poli 3): capture start.
-- Program video / signal-line count: both have video; different programs.
-- Line mean luma, caption rows used, per-row box-code counts: program content
-  (deck and poli are now different programs), or a side effect of E's X/31 payload.
-
-SUMMARY - HOW TO MIMIC POLISTREAM
-Current best-match command (new_deck3.txt), verified to decode cleanly:
-  -teletext_vbi_offset 6 -teletext_shape 50 -teletext_filler idl -teletext_dual_field 1
-  -teletext_level 66 (default) -double_height 1
-This matches poli on: CRI position (6), levels (~66%), waveform smoothness (~54 levels
-vs 65), X/31 IDL filler type, and per-field row split. Push -teletext_shape a little
-lower (toward 40-45) for even more levels if the slicer stays happy; watch for the eye
-tightening (new_deck3 black dipped to 14 and peaks to 162).
-
-Remaining, NOT matchable:
-- poli's live X/31 datacast payload (a running data service; no source).
-- the last ~11 sample levels (65 vs 54): lower -teletext_shape closes the gap but trades
-  decode margin.
-- program content (which rows, caption text).
-
-Flags reference: -teletext_vbi_offset, -teletext_shape, -teletext_level, -teletext_filler
-[dummy|idl], -teletext_filler_ctrl, -teletext_filler_subcode, -teletext_dual_field.
-The _ctrl/_subcode flags only affect the 8FF dummy filler (moot with -teletext_filler idl).
+IDENTICAL
+CRI start (sample 6), framing code 0x27, page 801, magazine 8, subtitle header
+(byte7 0xD0, C6/C7/C8/C9 = 1, subcode 0), region 0, C11 0, double-height rows,
+Start/End boxing, idle-filler packet type (Packet 8/31 IDL).
