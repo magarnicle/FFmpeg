@@ -1,0 +1,61 @@
+Catch-up / nDVR caption issue ("start from beginning") - findings
+=================================================================
+
+SYMPTOM
+On the set-top box "start from beginning" (always-recording catch-up) feature:
+- Live broadcast teletext decodes fine on the STB (both Polistream and DeckLink).
+- Catch-up captions are NOT styled like teletext, so the headend converts the VBI
+  teletext into a rendered subtitle format (DVB bitmap subtitles, DVB teletext, or a
+  text sidecar) when it records. That transcoder is the point of failure.
+- With Polistream as the source, catch-up captions appear and update correctly.
+- With our DeckLink source, the caption box flashes at the correct times but the text
+  is frozen on the last caption Polistream output before the switch. Switching back to
+  Polistream, captions update again immediately.
+- Not known whether catch-up has EVER worked with the DeckLink source.
+
+MECHANISM
+The transcoder is receiving our caption timing/page events (box flashes) but is not
+applying our text rows to its page memory, so it keeps rendering the last complete page
+it decoded (Polistream's). Control/header bytes are Hamming-coded (error-correctable, so
+the box/timing survives); text is parity-only (a bit error discards the character), but
+that is not the cause here (see below).
+
+RULED OUT (measured from SDI captures deck*.txt vs poli*.txt, decoded with
+teletext_tools/vbi_compare.py; our output matches Polistream on all of these):
+- Waveform / decode reliability: our text rows decode at 0% parity errors even off
+  optimal timing; vertical eye is on par with Polistream.
+- Packet format: page 801, magazine 8, framing 0x27, double-height, Start/End boxing -
+  identical.
+- Header control bits: byte7 0xD0 (C6=1), byte8 0x2F (C7/C8/C9=1), C11=0, region 0 -
+  identical.
+- Subcode: both hold P801 subcode at 0 (no per-caption change).
+- Dual-field split: both distribute header + row20 + row22 across the two fields the
+  same way (row20 on one field, row22 on the other).
+- Header/erase frequency: our old ratio was header:row 1.47:1 with many erase headers vs
+  Polistream 0.84:1 with few; -teletext_defer_erase brings this toward Polistream, but it
+  did NOT fix catch-up.
+
+CONFIG CHANGES TRIED
+- -teletext_header_once 1: BROKE live teletext (header dropped to ~8 in 500 frames; a
+  teletext decoder needs the header every carousel cycle). Do NOT use. Reverted.
+- -teletext_defer_erase 1: live teletext OK, but catch-up still frozen. Did not fix it.
+
+CONCLUSION
+The difference that breaks the transcoder is not visible in the SDI packet captures - our
+teletext matches Polistream's in every measurable respect and decodes cleanly. The cause
+is therefore either in the real-time transmission cadence (which the frame-dropping AJA
+grab cannot show) or in a transcoder-specific interaction only visible at the headend.
+
+NEXT STEPS (need the service provider / headend)
+1. Capture of the transcoded caption stream across a Polistream->DeckLink switch (the
+   recorded DVB subtitle / teletext / sidecar). Shows exactly what the transcoder emits
+   for each source and where it stops updating text. This is the definitive diagnostic.
+2. Transcoder make/model and the catch-up caption format. Its spec states what it expects
+   from the input teletext, to check our stream against directly.
+
+STILL WORTH DOING ON OUR SIDE
+- Plain-config test: -teletext_continuous 1 -teletext_filler dummy -teletext_dual_field 0
+  -teletext_shape 0 -teletext_vbi_offset 6 -double_height 1. If catch-up works with any
+  config, a specific feature is the cause; re-enable one at a time.
+- ffmpeg -loglevel debug log (the "Teletext:" lines) to characterise our exact per-frame
+  cadence, which the grab hides, in case of a transmission-timing anomaly.
