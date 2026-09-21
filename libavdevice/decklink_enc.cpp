@@ -2589,6 +2589,7 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
         if (num_units > 0) {
             ctx->teletext_row_count = num_units;
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
+            ctx->teletext_header_sent = 0;  /* header_once: re-send header for this caption */
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
 
@@ -2696,9 +2697,17 @@ static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
             ctx->teletext_erase_pending = 0;   /* first header keeps C4=1 */
         else
             teletext_clear_erase_bit(ctx->teletext_rows[0]);
+        ctx->teletext_header_sent = 1;
     }
     const uint8_t *d = ctx->teletext_rows[idx];
-    ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
+    int next = (idx + 1) % ctx->teletext_row_count;
+    /* header_once: after the header (index 0) has gone out once for this caption,
+     * cycle only the display rows (skip index 0) so we don't re-send the header
+     * every carousel cycle. Fewer P801 headers on the wire, closer to Polistream. */
+    if (ctx->teletext_header_once && next == 0 && ctx->teletext_header_sent
+        && ctx->teletext_row_count > 1)
+        next = 1;
+    ctx->teletext_row_index = next;
     return d;
 }
 
@@ -2748,6 +2757,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         if (num_units > 0) {
             ctx->teletext_row_count = num_units;
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
+            ctx->teletext_header_sent = 0;  /* header_once: re-send header for this caption */
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
             stored_new = 1;                   /* Reset the idle timer */
@@ -2805,11 +2815,16 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
      * Guard it so a caption always gets its full burst_frames of retransmission
      * first; only then may the end-time clear it. (Continuous mode: idle_frames
      * climbs past burst_frames immediately, so this guard is a no-op there.) */
-    if (ctx->has_teletext_data && !stored_new
+    if (!ctx->teletext_defer_erase
+        && ctx->has_teletext_data && !stored_new
         && ctx->teletext_caption_end_pts != AV_NOPTS_VALUE
         && ctx->last_pts >= ctx->teletext_caption_end_pts
         && ctx->teletext_idle_frames >= ctx->teletext_burst_frames
         && ctx->teletext_idle_frames < frames_10s) {
+        /* teletext_defer_erase off (default): promptly clear the caption at its end
+         * time via the OP-42 s7 cleardown. On: skip this, so no standalone erase
+         * header is sent per caption -- the next caption's C4 erase clears it (or the
+         * 10s idle cleardown), which cuts our erase-header count toward Polistream's. */
         ctx->teletext_idle_frames = frames_10s;
     }
 
@@ -3608,6 +3623,8 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_filler = cctx->teletext_filler;
     ctx->teletext_filler_ctrl = cctx->teletext_filler_ctrl;
     ctx->teletext_filler_subcode = cctx->teletext_filler_subcode;
+    ctx->teletext_header_once = cctx->teletext_header_once;
+    ctx->teletext_defer_erase = cctx->teletext_defer_erase;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
     ctx->socket_fd    = -1;
