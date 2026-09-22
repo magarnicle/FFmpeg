@@ -3048,7 +3048,9 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             if (nib != 0xFF)
                 cleardown[5] = ham84_encode[(nib & 0x07) | 0x08];  /* set C4=1 */
             data_to_send = cleardown;   /* erase command -- always sent, never blanked */
-            av_log(avctx, AV_LOG_DEBUG, "Teletext: idle cleardown (P801 C4=1)\n");
+            av_log(avctx, AV_LOG_DEBUG,
+                   "Teletext: idle cleardown (pts=%"PRId64" idle=%d)\n",
+                   ctx->last_pts, ctx->teletext_idle_frames);
         } else {
             data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
             data_is_filler = data_to_send != NULL;
@@ -3113,10 +3115,11 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             }
         }
         av_log(avctx, AV_LOG_DEBUG,
-               "Teletext: burst row (idle=%d/%d rows=%d idx=%d continuous=%d dual=%d)\n",
-               ctx->teletext_idle_frames, ctx->teletext_burst_frames,
-               ctx->teletext_row_count, ctx->teletext_row_index,
-               ctx->teletext_continuous, data_f2 != NULL);
+               "Teletext: burst row (pts=%"PRId64" idle=%d/%d rows=%d sent=%d idx=%d "
+               "continuous=%d dual=%d)\n",
+               ctx->last_pts, ctx->teletext_idle_frames, ctx->teletext_burst_frames,
+               ctx->teletext_row_count, ctx->teletext_rows_sent,
+               ctx->teletext_row_index, ctx->teletext_continuous, data_f2 != NULL);
     } else {
         /* Burst finished (or no rows): filler holds the line for OP-42 s4(b)
          * while the decoder keeps displaying the last page (or blank if
