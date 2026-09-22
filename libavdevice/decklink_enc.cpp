@@ -2984,19 +2984,24 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
      * caption's end_pts is already <= last_pts on arrival, from a short display
      * duration or captions delivered at or behind the video clock.
      *
-     * The guard used to be teletext_idle_frames >= teletext_burst_frames, which
-     * asked the wrong question. burst_frames defaults to 8, and half of the
-     * captions in deck_halfworking.txt arrive less than 8 frames after the one
-     * before, so each new caption reset the counter before the previous one's
-     * erase could ever fire -- and the caption stayed on screen until the next
-     * one replaced it, with no end time at all. What the guard actually wants to
-     * know is whether the page has been sent, so ask that: teletext_rows_sent
-     * counts row transmissions since the page was stored, and in dual-field mode
-     * a four-row page completes in two frames rather than eight. */
+     * Two conditions, and both are needed. teletext_idle_frames >=
+     * teletext_burst_frames keeps a caption on air for its burst even when its
+     * end time had already passed when it arrived, which is what a short display
+     * duration or delivery behind the video clock looks like; without it the
+     * caption is cut to a single frame. teletext_rows_sent >= teletext_row_count
+     * additionally requires that the page has actually been transmitted, so a
+     * page whose rows have not all gone out is never erased from under itself.
+     *
+     * An earlier revision dropped the burst_frames half, on the reading that
+     * captions arriving closer together than burst_frames could never reach the
+     * erase. On-air logs show caption bursts running their full eight frames
+     * with 16 to 95 frames between them, so that case does not arise in this
+     * material and dropping the guard only reinstated the single-frame bug. */
     if (!ctx->teletext_defer_erase
         && ctx->has_teletext_data && !stored_new
         && ctx->teletext_caption_end_pts != AV_NOPTS_VALUE
         && ctx->last_pts >= ctx->teletext_caption_end_pts
+        && ctx->teletext_idle_frames >= ctx->teletext_burst_frames
         && ctx->teletext_rows_sent >= ctx->teletext_row_count
         && ctx->teletext_idle_frames < frames_10s) {
         /* teletext_defer_erase off (default): promptly clear the caption at its end

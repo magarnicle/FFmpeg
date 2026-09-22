@@ -540,13 +540,22 @@ them instead of ending at their own end time, and captions are sometimes
 skipped. Three defects found, all in construct_teletext_vbi_sd and its
 carousel.
 
-1. The end-of-caption erase was gated on teletext_idle_frames >=
-   teletext_burst_frames. burst_frames defaults to 8 and 41 of 67 caption gaps
-   in deck_halfworking are shorter than that, so each new caption reset the
-   counter before the previous one's erase could fire. Those captions have no
-   end time at all. Now gated on teletext_rows_sent >= teletext_row_count -
-   has the page actually been transmitted - which a four-row page reaches in
-   two frames in dual-field mode.
+1. WITHDRAWN. I read the captures as showing captions arriving closer together
+   than burst_frames, and replaced the teletext_idle_frames >=
+   teletext_burst_frames guard on the end-of-caption erase with
+   teletext_rows_sent >= teletext_row_count. An on-air debug log then showed
+   bursts running their full eight frames with 16 to 95 frames between them,
+   so that case does not arise, and dropping the guard only reinstated the
+   known single-frame bug it was there to prevent. Both conditions are now
+   required: the burst guard, and the new page-transmitted test, which is a
+   strict improvement over the original on its own.
+
+   Unresolved: deck_halfworking.txt (04:26) shows captions on air for runs of
+   1 or 2 frames, never 8, while the log (04:51) shows full 8-frame bursts on
+   what should be the same options. Something differs between those two runs
+   and it matters, because a 1-2 frame burst is far less robust. Needs the
+   build identity of each, and the "Teletext: storing" and "idle cleardown"
+   log lines, which carry the packet durations the erase depends on.
 
 2. Storing a packet replaced the page outright, losing any row that had not
    been transmitted yet. Happens when several packets come due in one frame,
