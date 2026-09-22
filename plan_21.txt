@@ -1,0 +1,432 @@
+plan_21.txt - what to do about each difference in differences_21.txt
+====================================================================
+
+Scope note: "deck" is our DeckLink SD PAL VBI inserter in
+libavdevice/decklink_enc.cpp; "poli" is the Polistream capture. Line numbers
+are from the working tree at the time of writing. Importance is rated
+High / Medium / Low against one question: does it change whether a caption
+reaches air correctly on a conformant WST slicer?
+
+Caveat that applies to sections 7 and 12: the two captures cover different
+parts of the programme, so cadence numbers are not a like-for-like comparison.
+Before changing any scheduling default, recapture both inserters from the same
+source at the same timecode.
+
+
+--------------------------------------------------------------------------
+1. Bit rate: deck 6939.9 kbit/s vs poli 6937.5 kbit/s (nominal)
+--------------------------------------------------------------------------
+Importance: High. This is a plain bug with a known cause and an exact fix.
+
+Cause: decklink_enc.cpp:2214
+
+    const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
+
+498/256 = 1.9453125 samples/bit. The true value is 13.5/6.9375 = 72/37 =
+1.9459459... samples/bit. The stored constant is 0.0326% short, which gives
+13.5e6 * 256/498 = 6939.76 kbit/s - matching the 6939.9 kbit/s measured off
+air. The error is systematic, not noise.
+
+Effect: the packet clock runs fast and accumulates 0.24 samples (18 ns) of
+slip by bit 359. A slicer that locks on the clock run-in and then free-runs at
+nominal samples the last data bits about 12% of a bit period early. It decoded
+cleanly here (0 parity and 0 Hamming errors in 1000 packets), so this is eye
+margin we are giving away rather than a live failure.
+
+Fix (bugfix, no flag - there is no reason to want the wrong bit rate):
+replace the 8-bit fixed point with the exact rational 72/37.
+
+  - decklink_enc.cpp:2305-2306, raw square path:
+        int start_pixel = pixel_pos + (b * 72) / 37;
+        int end_pixel   = pixel_pos + ((b + 1) * 72) / 37;
+  - decklink_enc.cpp:2351, hi-res shaped path:
+        long long bit = rel * 37 / (72LL * OS);
+  - Delete SAMPLES_PER_BIT_FP and FP_SHIFT, or redefine them as
+    SPB_NUM 72 / SPB_DEN 37 so both paths share one definition.
+
+Verify: reslice a capture and refit the bit period; it must come out at
+1.94595 samples / 6937.5 kbit/s, matching poli.
+
+
+--------------------------------------------------------------------------
+2. Start offset: deck bit 0 centred at 6.971 samples, poli at 6.594
+--------------------------------------------------------------------------
+Importance: High, but the first action is to resolve a contradiction, not to
+change code.
+
+This is the OP-42 h-timing datum, which is what a WST slicer uses to qualify
+the line in the first place. Two things are in conflict:
+
+  a) The comment at decklink_enc.cpp:2262-2276 states that Polistream's
+     run-in bit 0 sits at sample 26 of the 720-sample active grid, and the
+     default -teletext_vbi_offset is 26 on that basis
+     (decklink_enc_c.c:77).
+  b) poli_21.txt, on the same AJA 720-sample grid, puts poli's run-in bit 0
+     at about sample 5.62 (bit 0 centre 6.594 minus half a bit period).
+
+Both cannot be right. The deck capture was evidently taken at offset 6, which
+lands 0.377 samples (27.9 ns) later than poli - i.e. the capture was made with
+a setting that nearly matches poli, while the code default is 20 samples
+(1.5 us) away from it.
+
+Action, in order:
+  1. Establish which 720-sample window each measurement used. The claim in
+     (a) came from a different capture file (poli.txt); if that file was
+     dumped with a different VANC mode or a different active-line origin, the
+     two numbers are not comparable and the comment needs correcting rather
+     than the code.
+  2. Once settled, set the -teletext_vbi_offset default to the measured
+     Polistream value and rewrite the comment to cite the capture it came
+     from, with the grid it was measured on.
+  3. Keep -teletext_vbi_offset as the existing flag; no new flag needed.
+
+Related feature (see section 3b): matching poli exactly needs a fractional
+offset of about 5.62 samples, which the current integer option cannot express.
+
+
+--------------------------------------------------------------------------
+3. Edge shape: deck 165/167 ns with +/-0.7 LSB ringing, poli 115/114 ns clean
+--------------------------------------------------------------------------
+Importance: Medium. Nothing failed to decode, but the ringing is the kind of
+thing a conformance analyser measures, and the rise time is not currently
+settable to a number you can check against a spec.
+
+3a. Ringing (feature, behind a flag)
+
+Cause: the shaping path (decklink_enc.cpp:2312-2400) applies a raised-cosine
+(Nyquist, beta=1) low-pass built from a windowed sinc. A sinc-derived kernel
+has sidelobes, so the step response overshoots and undershoots - exactly the
++0.7 / -0.6 LSB we measured, with the level touching 161 and 14 either side of
+the nominal 160/16. poli never leaves 16...160, so its edge is monotonic: a
+sine-squared (integrated raised-cosine) EDGE, not a Nyquist channel filter.
+
+Fix: add a second shaping mode that generates a monotonic sine-squared
+transition of a specified duration instead of convolving with a sinc. In the
+hi-res builder, replace the hard bit-level assignment with a transition ramp
+of the form 0.5 - 0.5*cos(pi*t/Tr) spanning the edge; this cannot overshoot
+because it never leaves [LUMA_LOW, LUMA_HIGH].
+
+Flag: extend -teletext_shape with a mode selector, or add
+      -teletext_edge {nyquist,sinesq}  (default: current behaviour)
+so existing command lines keep their measured on-air result. Do not change the
+default until a capture with the new mode has been sliced and compared.
+
+3b. Rise time is not directly settable (feature, behind a flag)
+
+-teletext_shape is a -6 dB cutoff expressed as a percentage of the bit rate,
+which cannot be checked against a spec or against poli without a capture. Add
+
+      -teletext_rise_ns <int>   (0 = off, else 10-90% edge duration in ns)
+
+to drive the sine-squared mode. poli measures 115 ns rise and 114 ns fall, so
+115 is the value to try first for a like-for-like match.
+
+3c. Sub-sample start offset (feature, behind a flag)
+
+The hi-res path already places bit edges at fractional positions, so a
+fractional start costs nothing there. Add
+
+      -teletext_vbi_offset_frac <int>   (1/256ths of a sample, default 0)
+
+added to the integer -teletext_vbi_offset, and use it in both the hi-res
+builder (decklink_enc.cpp:2348-2352) and, rounded, in the raw path. Needed to
+land on poli's ~5.62 rather than 5 or 6. Only meaningful when shaping is on;
+document that.
+
+
+--------------------------------------------------------------------------
+4. Levels: identical (16/160, amplitude 144 = 65.8% of 700 mV)
+--------------------------------------------------------------------------
+Importance: none - this one matches and should be kept matching.
+
+No action, except: lock it in. -teletext_level 66 is correct and the capture
+proves it end to end. Add the settled low/high levels to the regression check
+in section 14 so a future change to LUMA_HIGH or to the V210 packing is caught
+by a capture rather than on air.
+
+
+--------------------------------------------------------------------------
+5. Chroma: identical (0x80 across all 720,000 sampled positions)
+--------------------------------------------------------------------------
+Importance: none. No action. Add to the regression check.
+
+
+--------------------------------------------------------------------------
+6. Line and field usage: identical (line 21 F1, line 334 F2, every field)
+--------------------------------------------------------------------------
+Importance: none. No action. Add to the regression check.
+
+
+--------------------------------------------------------------------------
+7. Hamming and parity: both clean (0 errors in 1000 packets each)
+--------------------------------------------------------------------------
+Importance: none. No action. Add to the regression check - this is the single
+most valuable assertion in the set, because it fails loudly if the bit-period
+or offset work in sections 1-3 goes wrong.
+
+
+--------------------------------------------------------------------------
+8. Header packets: deck always P801 C4=1; poli mixes P801 C4=0, P801 C4=1, P8FF
+--------------------------------------------------------------------------
+Importance: Medium. It changes what a receiver that joins mid-caption sees.
+
+deck only emits a header when it has something to erase, so between captions
+there is no page context on air at all: a decoder that tunes in mid-caption
+has to wait for the next caption before it knows what page 801 is. poli keeps
+a header in circulation - P801 with C4=0 re-asserts the page without clearing
+it, and P8FF is the OP-42 s8 time-filling header.
+
+Fix (feature, behind a flag):
+  - Add -teletext_header_refresh <frames> (0 = off, default 0): while a
+    caption is displayed, re-send its header with C4 forced to 0 every N
+    frames. The C4-clearing machinery already exists (teletext_next_row ages
+    the erase bit, and the cleardown path at decklink_enc.cpp:2858-2862
+    already rewrites byte 5 to set C4), so this is the same edit with the bit
+    cleared instead of set.
+  - Add -teletext_filler_mix <ratio> (0 = off, default 0) to interleave the
+    existing P8FF dummy header (teletext_build_filler DUMMY branch) into the
+    IDL filler stream at a chosen rate, so idle lines carry page context as
+    poli's do rather than IDL only.
+
+Both default off; neither changes current on-air behaviour until asked for.
+
+
+--------------------------------------------------------------------------
+9. Header display row: deck 32 spaces, poli 0x06 (Alpha Cyan) + 31 spaces
+--------------------------------------------------------------------------
+Importance: Low. C7 (suppress header) is 1 in both captures, so this row is
+never rendered by a conformant decoder.
+
+Fix: one-line change in teletext_build_filler (decklink_enc.cpp:2478-2479) and
+in the row-0 builder, writing 0x86 (0x06 with odd parity) as the first display
+character. It costs nothing and removes a gratuitous difference from the
+reference inserter.
+
+Flag: not worth one on its own. Fold it into the -teletext_filler_ctrl family
+if we want it selectable, otherwise just match poli.
+
+
+--------------------------------------------------------------------------
+10. IDL filler payload: deck 1 counter byte + 31 x 0x20; poli 32 varying bytes
+--------------------------------------------------------------------------
+Importance: Low for caption delivery. poli's payload is its live datacast
+service and we do not have the source data, which the code already says
+(decklink_enc.cpp:2461-2464). We are not going to reproduce its content and
+should not pretend to.
+
+One thing worth checking rather than copying: 0x20 is a single set bit per
+byte, so 31 consecutive 0x20s put a long, sparse, highly repetitive pattern on
+the line every field. If anything downstream is AC-coupled or does energy-based
+line qualification, that is a different stimulus from poli's ramp. Measure
+before deciding it does not matter.
+
+Fix (feature, behind a flag, low priority):
+      -teletext_idl_payload {spaces,ramp,prbs}   (default spaces)
+"ramp" reproduces poli's structural shape (a non-decreasing byte ramp
+continuing across packets) without claiming to be its data; "prbs" gives a
+spectrally flat payload if the sparse-pattern concern above turns out to be
+real.
+
+
+--------------------------------------------------------------------------
+11. IDL continuity byte: deck identical in both fields, poli +1 per field
+--------------------------------------------------------------------------
+Importance: Medium. This is a bug: the counter does not do its job.
+
+Cause: teletext_build_filler (decklink_enc.cpp:2466) is called once per frame
+and the returned buffer is handed to both field insertions
+(decklink_enc.cpp:2911-2914). The post-increment at decklink_enc.cpp:2476
+therefore advances once per frame, and both fields carry the same value -
+measured as 430/430 frames identical, against poli's 476/476 frames
+incrementing by exactly 1. A receiver cannot tell a lost field-1 packet from a
+lost field-2 packet, which is the only reason the byte exists.
+
+Fix (bugfix, no new flag - it is already gated by -teletext_filler idl):
+build the filler separately for each field. Either call
+teletext_build_filler(ctx) twice into two buffers, or, simpler, have
+insert_teletext_vbi_line take a "rebuild filler" path so each inserted line
+gets its own packet. Keep the DUMMY branch unchanged - it has no counter.
+
+Verify: reslice and confirm the F2-minus-F1 delta of user byte 0 is 1 on every
+frame where both fields carry filler.
+
+
+--------------------------------------------------------------------------
+12. Caption scheduling: deck 68 caption frames / 6-frame median gap;
+    poli 17 / 26; deck repeats a row in both fields 24x, poli never;
+    poli pairs a header with 15 of its 17 caption frames
+--------------------------------------------------------------------------
+Importance: High to investigate, Low to change right now.
+
+Every knob involved already exists: -teletext_burst_frames,
+-teletext_continuous, -teletext_dual_field, -teletext_header_once,
+-teletext_defer_erase, -teletext_blank_idle. Nothing here points at a code
+defect - it points at which settings the deck capture was taken with, and at
+the fact that the two captures cover different dialogue.
+
+Action:
+  1. Recapture both inserters from the same source at the same timecode. Until
+     then the 68-vs-17 and 6-vs-26 numbers cannot carry weight.
+  2. Record the exact deck command line alongside the capture. The deck
+     capture shows each caption transmitted in exactly one frame with no
+     repeats, which does not follow from the shipped defaults
+     (teletext_burst_frames 8, teletext_continuous 0) - so either the capture
+     used a non-default burst setting, or the burst counter is not doing what
+     the comment at decklink_enc.cpp:2872-2884 describes. Resolve which before
+     touching defaults.
+  3. Only then decide whether to move any default.
+
+The one sub-item that is safe to act on now is section 13.
+
+
+--------------------------------------------------------------------------
+13. Row order within a frame: deck sends row 22 then row 20; poli row 20 then 22
+--------------------------------------------------------------------------
+Importance: Medium. Small change, real visible effect.
+
+In dual-field mode (decklink_enc.cpp:2888-2891) field 1 gets the row that
+teletext_next_row happens to return first, and in the capture that is row 22 -
+the bottom line. So for a two-line caption the decoder renders the new bottom
+line one field (20 ms) before the new top line. poli sends row 20 first, which
+is the order a viewer expects to see a caption build in.
+
+Fix (bugfix, no flag): in the dual-field branch, emit the two rows in
+ascending row-address order within the frame - take both rows first, then
+assign the lower row address to field 1 and the higher to field 2. Leave
+non-dual-field behaviour alone.
+
+Verify: reslice and confirm the (F1 row, F2 row) pattern is (20, 22), not
+(22, 20).
+
+
+--------------------------------------------------------------------------
+14. Single-row captions repeated in both fields (deck 24x, poli never)
+--------------------------------------------------------------------------
+Importance: Low. This is dual-field mode falling back to a copy when the page
+has one row, and the redundancy is arguably a feature: a one-line caption that
+loses a field still arrives.
+
+No fix proposed. Note it in the delivery documentation, because it doubles the
+on-air packet count for one-line captions and will show up in any
+packets-per-second comparison against poli.
+
+
+--------------------------------------------------------------------------
+15. Distinct luma values per line: deck 78, poli 65
+--------------------------------------------------------------------------
+Importance: none on its own - it is a consequence of the edge shape in
+section 3. It will move when section 3 is done. No separate action.
+
+
+--------------------------------------------------------------------------
+16. Character set and content coding: identical
+--------------------------------------------------------------------------
+Importance: none - G0 Latin with odd parity, national option 0, same spacing
+attributes (0x0D, 0x0B 0x0B, 0x0A 0x0A), no X/26, X/28 or X/29 in either.
+
+No action. Add to the regression check: any appearance of a packet X/26, a
+non-zero C12-C14, or a byte outside 0x20-0x7A after parity stripping is a
+change we did not intend.
+
+
+--------------------------------------------------------------------------
+Regression check to build alongside this work
+--------------------------------------------------------------------------
+Importance: High. Most of the items above were only visible because the line
+was sliced and decoded, and several of the fixes (1, 2, 3, 11, 13) can be
+verified in seconds from a capture and not at all by reading the code.
+
+Turn the slicer used for differences_21.txt into a checked-in tool that takes
+an AJA frame dump and asserts:
+
+  - lines 21/334 present on every field, nothing on other VBI lines
+  - 0 Hamming errors, 0 parity errors
+  - settled levels exactly 16 and 160, chroma 0x80
+  - fitted bit period 1.94595 +/- 0.0002 samples
+  - bit 0 centre within a stated tolerance of the target offset
+  - 10-90% rise within a stated tolerance, and no sample outside 16...160
+    when the monotonic edge mode is on
+  - IDL continuity byte delta of 1 between fields
+  - (F1 row, F2 row) = (20, 22) for two-row captions
+  - character inventory inside 0x20-0x7A after parity strip; no X/26,
+    X/28 or X/29
+
+Run it on a deck capture and a poli capture after each change in sections
+1-3, 11 and 13.
+
+
+--------------------------------------------------------------------------
+Suggested order of work
+--------------------------------------------------------------------------
+  1. Regression check (above) - nothing else is verifiable without it.
+  2. Section 1, bit period 72/37. Bugfix, exact, no behaviour risk.
+  3. Section 11, per-field IDL continuity. Bugfix, contained.
+  4. Section 13, dual-field row order. Bugfix, contained.
+  5. Section 2, resolve the h-timing premise, then set the offset default.
+  6. Section 3, sine-squared edge mode + rise-time and fractional-offset
+     flags, all defaulting to current behaviour.
+  7. Section 12, recapture like-for-like, then revisit scheduling defaults.
+  8. Sections 8, 9, 10 as wanted; none is on the path to air.
+
+
+==========================================================================
+STATUS - work done on 2026-09-21
+==========================================================================
+
+Done: order items 2, 3 and 4 (plan sections 1, 11 and 13), plus removal of
+-teletext_header_once. All in libavdevice/.
+
+  Section 1  - exact bit period. SAMPLES_PER_BIT_FP/FP_SHIFT (498/256)
+               replaced with SPB_NUM/SPB_DEN = 72/37 in both render paths:
+               the raw square grid and the hi-res shaped builder.
+               Verified by modelling the hi-res path's bit-boundary mapping
+               and fitting it: 6939.76 kbit/s before, 6937.49 after, against
+               a nominal 6937.50. The raw-square path cannot be measured this
+               way - it quantises every edge to a whole 13.5 MHz sample, so
+               its realised period is dominated by that quantisation. The
+               arithmetic is now exact in both, which is what the fix was.
+
+  Section 11 - per-field IDL continuity. construct_teletext_vbi_sd now
+               rebuilds the filler for field 2 instead of re-sending field 1's
+               bytes, so the counter advances once per packet. Guarded so it
+               only rebuilds when field 1 actually went out (-teletext_fields
+               even would otherwise skip a count). A new data_is_filler flag
+               distinguishes filler from cleardown and caption rows, which
+               must stay identical across the two fields.
+
+  Section 13 - dual-field row order. New helper teletext_row_address()
+               decodes a row's MRAG through the existing ham84_decode table;
+               the dual-field branch swaps the two rows when both are display
+               rows and field 1's row address is the higher. A page header
+               (row 0) is never moved behind its text, and an uncorrectable
+               MRAG (-1) disables the swap. The helper round-trips all 32 row
+               addresses in magazine 8 correctly.
+
+  -teletext_header_once - REMOVED, along with the teletext_header_once and
+               teletext_header_sent context fields and the skip-index-0 branch
+               in teletext_next_row.
+
+               Reason: its stated purpose was "fewer headers, ala Polistream",
+               and the capture says the opposite. Polistream sent 22 headers in
+               500 frames against deck's 8, and paired a header with 15 of its
+               17 caption-bearing frames. Cutting our header count moves away
+               from the reference, not toward it. Section 8 of this plan, which
+               proposes -teletext_header_refresh to send MORE headers, is the
+               direction the measurement supports; header_once would have had
+               to be removed to build it anyway.
+
+Verification available in this sandbox: the configure in claude_build.bash
+does not pass --enable-decklink, so a full build never compiles these files.
+They were compiled standalone against the DeckLink SDK at
+decklink/Blackmagic_DeckLink_SDK_15.0/Linux/include - decklink_enc.cpp to an
+object file, decklink_enc_c.c syntax-checked - both clean. The full tree was
+rebuilt afterwards and links (serially; three parallel debug links exhaust
+memory in this sandbox).
+
+NOT done, still open in order: item 1 (the regression checker), item 5
+(section 2, the h-timing premise - unchanged and still contradictory), item 6
+(section 3, edge shaping), item 7 (section 12), item 8 (sections 8, 9, 10).
+
+None of this has been on air. The bit-period and row-order changes alter what
+the inserter transmits and want a capture before they go anywhere near a
+service.

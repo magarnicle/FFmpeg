@@ -1,0 +1,134 @@
+deck_21.txt vs poli_21.txt - decoded differences
+================================================
+
+Both files are AJA frame dumps of 500 frames, 625i50, 8-bit YCbCr, VANC mode
+TALLER, 612 total raster lines, 884736-byte buffer. Every VBI line in both was
+sliced with a common clock-recovery/slicer and the teletext packets decoded.
+
+
+1. Capture framing
+------------------
+                              deck_21.txt              poli_21.txt
+  Frames                      4-504, frame 5 absent    2-504, frames 3-5 absent
+  Lines carrying data         line 21 (F1),            same
+                              line 334 (F2)
+  Packets decoded             1000                     1000
+  Hamming errors              0                        0
+  Parity errors               0                        0
+
+Both fill every field of every frame with one packet, on the same two lines.
+Chroma is 0x80 across all 720,000 sampled positions in both.
+
+
+2. Waveform
+-----------
+                              deck                     poli
+  Settled low / high          16 / 160                 16 / 160
+  Amplitude                   144 (65.8% of 700 mV)    144 (65.8%)
+  10-90% rise                 165 ns                   115 ns
+  90-10% fall                 167 ns                   114 ns
+  Overshoot / undershoot      +0.7 / -0.6 LSB          none
+                              (peaks 160.7, dips 15.4; (never leaves 16...160)
+                              extremes 161 and 14)
+  Distinct luma values/line   78                       65
+
+Rise and fall are symmetric in both; the mid-amplitude crossing sits at the same
+place for rising and falling edges in each file, so neither has duty-cycle
+distortion.
+
+
+3. Bit timing
+-------------
+                              deck                     poli
+  Bit period (LSQ, 120 lines) 1.94528 samples          1.94595 samples
+  Bit rate                    6939.9 kbit/s            6937.5 kbit/s (nominal)
+  Centre of bit 0, from start
+  of the 720-sample active
+  line                        6.971 samples            6.594 samples
+
+deck's packet starts 0.377 samples (27.9 ns) later and its clock is 0.035%
+fast, which accumulates about 0.24 samples (18 ns) of slip by the end of the
+360-bit packet. poli's clock is at nominal.
+
+
+4. Packet mix
+-------------
+  Packet                      deck                     poli
+  8/31 filler                 860                      959
+  Row 20                      42 (all F2)              7  (2 F1, 5 F2)
+  Row 22                      90 (64 F1, 26 F2)        12 (10 F1, 2 F2)
+  Row 0 header                8  (6 F1, 2 F2)          22 (5 F1, 17 F2)
+
+Both use magazine 8 only, and rows 0, 20, 22, 31 only.
+
+
+5. Header packets (row 0)
+-------------------------
+deck sends one variant, 8 times: page 801, S=0000, C4 erase=1, C5=0,
+C6 subtitle=1, C7=1, C8=1, C9=1, C10=0, C11=0, national option 0.
+
+poli sends three variants: page 801 with C4 erase=0 (x9), page 801 with
+C4 erase=1 (x7), and page 8FF with C4 erase=0 (x6). All other control bits
+match deck's.
+
+The 32-character header display row also differs: deck sends 32 spaces; poli
+sends 0x86 (0x06 = Alpha Cyan spacing attribute, odd parity) followed by 31
+spaces.
+
+
+6. Filler packets (8/31, IDL)
+-----------------------------
+The IDL envelope is byte-identical in both: 0x64, 0x38, then 0xC7 six times
+(Hamming 4, 6, then 9 x6 - Format A with a six-nibble service packet address of
+999999), followed by 32 bytes of 8-bit user data. The user data differs:
+
+  - deck: byte 0 varies; bytes 1-31 are 0x20 in all 860 packets.
+  - poli: all 32 bytes vary. Bytes 1-29 are a non-decreasing ramp (steps of 0
+    or +1) in all 958 packets, continuing across packet boundaries; the final
+    two bytes are uncorrelated with the ramp.
+  - deck's user byte 0 is identical in both fields of a frame (430/430 frames).
+    poli's increments by exactly 1 from F1 to F2 (476/476 frames).
+
+
+7. Caption scheduling
+---------------------
+                              deck                     poli
+  Frames with a caption row   68                       17
+  Median gap between them     6 frames (0.24 s)        26 frames (1.04 s)
+  Frames with a header        6                        22
+
+Per-frame (F1 row, F2 row) patterns for frames that are not all-filler:
+
+  deck: (22, 20) x40, (22, 22) x24, (0, 22) x2, (0, 0) x2, (0, 20) x2
+  poli: (22, 0) x10, (31, 0) x7, (0, 20) x5, (20, 22) x2
+
+deck puts the two rows of a caption in one frame with row 22 in F1 and row 20
+in F2, so the bottom row goes first; in poli's two two-row frames the order is
+reversed, row 20 in F1 and row 22 in F2. deck repeats the same row in both
+fields of a frame 24 times; poli never repeats a row. poli pairs a header
+packet with the caption row in 15 of its 17 caption-bearing frames; deck sends
+headers in 6 frames and mostly transmits caption rows with no header.
+
+Caveat: the two captures are of different parts of the programme, so the
+caption rate is partly a property of the material, not only of the inserter.
+
+
+8. Character set and content coding
+-----------------------------------
+No difference in character set:
+
+  - Both use G0 Latin with odd parity. Every byte in both, after stripping
+    parity, lies in 0x20-0x7A; neither uses a national-option position
+    (# $ @ [ \ ] ^ ` { | } ~).
+  - C12-C14 (national option subset) is 0 in every header of both files.
+  - Neither capture contains a packet X/26, X/28 or X/29, so neither uses G2
+    supplementary characters or a charset designation.
+  - Caption rows in both use the same spacing attributes and nothing else:
+    0x0D (double height) at column 0, 0x0B 0x0B (start box, twice),
+    0x0A 0x0A (end box, twice). Both pad with spaces to centre the text. One
+    poli row fills all 32 columns and so carries no end-box pair.
+  - The only character-level difference is the header display row: 0x06 Alpha
+    Cyan in poli, space in deck.
+
+The caption text itself covers different segments of the same programme in the
+two files, so the words are not comparable.
