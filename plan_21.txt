@@ -524,3 +524,56 @@ REVISED ORDER OF REMAINING WORK:
   3. Section 3: sine-squared edge mode, -teletext_rise_ns, fractional offset.
   4. -teletext_burst_frames: reconcile behaviour with its documentation.
   5. Sections 9 and 10, and the page 8FF filler header left over from 8.
+
+
+==========================================================================
+deck_halfworking / poli_halfworking - 2026-09-22, caption delivery
+==========================================================================
+
+Waveform is now a match: 6937.5 kbit/s, run-in bit 0 at 5.620 against poli's
+5.621, rise 87 ns against 86, levels exactly 16/160, header attribute 0x86,
+and all 28 P8FF packets in the spare field behind a caption row. Everything
+left is packet scheduling.
+
+Two symptoms reported from air: captions linger until the next one replaces
+them instead of ending at their own end time, and captions are sometimes
+skipped. Three defects found, all in construct_teletext_vbi_sd and its
+carousel.
+
+1. The end-of-caption erase was gated on teletext_idle_frames >=
+   teletext_burst_frames. burst_frames defaults to 8 and 41 of 67 caption gaps
+   in deck_halfworking are shorter than that, so each new caption reset the
+   counter before the previous one's erase could fire. Those captions have no
+   end time at all. Now gated on teletext_rows_sent >= teletext_row_count -
+   has the page actually been transmitted - which a four-row page reaches in
+   two frames in dual-field mode.
+
+2. Storing a packet replaced the page outright, losing any row that had not
+   been transmitted yet. Happens when several packets come due in one frame,
+   and when a caption arrives while the previous one is still going out; the
+   encoder splits captions across packets, and the capture shows [r20, r22]
+   followed a frame later by [header, r18]. The unsent tail is now carried
+   forward ahead of the new rows. Rows already sent are safe, since a decoder
+   holds them in page memory until the page is erased.
+
+3. The carousel aged the C4 erase bit by rewriting teletext_rows[0] whenever
+   the row index was 0, and the cleardown built its erase from teletext_rows[0]
+   as well. Index 0 is not always the header - pages are stored as [r22,
+   header] and [r20, r22] too - so both could rewrite byte 5 of a text row,
+   which is its fourth display character, into a Hamming codeword. The
+   cleardown case is worse: it would re-send the caption instead of erasing it.
+   The carousel now checks the row address, and the cleardown builds from the
+   last header actually seen. No capture shows either firing, so both were
+   latent.
+
+Measured caption lifetime, standalone erases as a share of captions:
+   deck_22 (defer_erase on)      0%
+   deck_halfworking               21%
+   poli_halfworking               25%
+   poli_22                        21%
+Dropping -teletext_defer_erase already moved us from 0 to about poli's rate;
+fix 1 should close the rest. teletext_vbi_check.py now reports this and takes
+--min-cleared-pct.
+
+Still open: -teletext_burst_frames does not behave as documented (item 4 of
+the previous list), and the IDL filler payload cannot be reproduced.

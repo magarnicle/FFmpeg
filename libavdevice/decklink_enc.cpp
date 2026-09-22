@@ -2824,14 +2824,22 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
 static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
 {
     int idx = ctx->teletext_row_index;
-    if (idx == 0) {
+    /* Age the C4 erase bit on the row we are about to send, and only if it is
+     * actually a page header. This used to key off idx == 0 and rewrite
+     * teletext_rows[0] regardless, but the encoder does not always put the
+     * header first -- captures show pages stored as [r22, header] and
+     * [r20, r22] -- so it could mangle byte 5 of a text row, which is the
+     * fourth display character, into a Hamming codeword. */
+    if (teletext_row_address(ctx->teletext_rows[idx]) == 0) {
         if (ctx->teletext_erase_pending)
             ctx->teletext_erase_pending = 0;   /* first header keeps C4=1 */
         else
-            teletext_clear_erase_bit(ctx->teletext_rows[0]);
+            teletext_clear_erase_bit(ctx->teletext_rows[idx]);
     }
     const uint8_t *d = ctx->teletext_rows[idx];
     ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
+    if (ctx->teletext_rows_sent < INT_MAX)
+        ctx->teletext_rows_sent++;
     return d;
 }
 
@@ -2879,29 +2887,69 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             num_units = 5;  /* Limit to 5 rows max */
 
         if (num_units > 0) {
-            ctx->teletext_row_count = num_units;
+            /* Storing a packet used to replace the page outright, which lost any
+             * row of the previous one that had not been transmitted yet. Two
+             * ways that happens: several packets come due in the same frame, and
+             * a caption arrives while the one before it is still going out (the
+             * encoder splits a caption across packets -- captures show [r20, r22]
+             * followed a frame later by [header, r18]). Either way the dropped
+             * rows never reach air and that part of the caption is simply
+             * missing. Rows already sent are safe, since a decoder keeps them in
+             * page memory until the page is erased; only the unsent tail matters,
+             * so carry it forward ahead of the new rows. */
+            int base;
+            if (stored_new) {
+                base = ctx->teletext_row_count;      /* another packet, same frame */
+            } else if (ctx->has_teletext_data
+                       && ctx->teletext_rows_sent < ctx->teletext_row_count) {
+                int keep = ctx->teletext_row_count - ctx->teletext_rows_sent;
+                memmove(ctx->teletext_rows[0],
+                        ctx->teletext_rows[ctx->teletext_rows_sent], keep * 42);
+                av_log(avctx, AV_LOG_DEBUG,
+                       "Teletext: carrying %d unsent row(s) into the new page\n", keep);
+                base = keep;
+            } else {
+                base = 0;
+            }
+            if (base + num_units > 5)
+                num_units = 5 - base;
+            if (num_units <= 0) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "Teletext: more than 5 rows due this frame, dropping the rest\n");
+                av_packet_unref(&teletext_pkt);
+                continue;
+            }
+            for (int i = 0; i < num_units; i++) {
+                uint8_t *du = teletext_pkt.data + (i * 46);
+                /* Copy 42-byte payload (bytes 4-45 of each data unit) */
+                memcpy(ctx->teletext_rows[base + i], du + 4, 42);
+                if (teletext_row_address(du + 4) == 0) {
+                    memcpy(ctx->teletext_last_header, du + 4, 42);
+                    ctx->teletext_have_header = 1;
+                }
+            }
+            ctx->teletext_row_count = base + num_units;
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
+            ctx->teletext_rows_sent = 0;  /* Nothing of this page has gone out */
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
             stored_new = 1;                   /* Reset the idle timer */
             /* Remember when this caption should stop being displayed, so we can
              * erase it promptly at its end instead of waiting for the OP-42 s7
              * idle cleardown (which lingers the caption up to ~10s). Falls back
-             * to the idle timer when the packet carries no duration. */
-            ctx->teletext_caption_end_pts = (teletext_pkt.duration > 0)
-                ? teletext_pkt.pts + teletext_pkt.duration
-                : AV_NOPTS_VALUE;
+             * to the idle timer when the packet carries no duration. The latest
+             * end time wins when several packets make up one caption. */
+            int64_t end = (teletext_pkt.duration > 0)
+                ? teletext_pkt.pts + teletext_pkt.duration : AV_NOPTS_VALUE;
+            if (base == 0 || end == AV_NOPTS_VALUE
+                || ctx->teletext_caption_end_pts == AV_NOPTS_VALUE
+                || end > ctx->teletext_caption_end_pts)
+                ctx->teletext_caption_end_pts = end;
 
             av_log(avctx, AV_LOG_DEBUG,
-                   "Teletext: storing %d data units (pts=%"PRId64" dur=%"PRId64" end=%"PRId64")\n",
-                   num_units, teletext_pkt.pts, teletext_pkt.duration,
+                   "Teletext: storing %d data units at %d (pts=%"PRId64" dur=%"PRId64" end=%"PRId64")\n",
+                   num_units, base, teletext_pkt.pts, teletext_pkt.duration,
                    ctx->teletext_caption_end_pts);
-
-            for (int i = 0; i < num_units; i++) {
-                uint8_t *du = teletext_pkt.data + (i * 46);
-                /* Copy 42-byte payload (bytes 4-45 of each data unit) */
-                memcpy(ctx->teletext_rows[i], du + 4, 42);
-            }
         }
 
         av_packet_unref(&teletext_pkt);
@@ -2929,20 +2977,27 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
      * idle timer to the cleardown point so the OP-42 s7 erase fires now instead
      * of ~10s later (which left the caption lingering past program end).
      *
-     * MUST NOT fire until the burst has finished. The burst gate below is
-     * teletext_idle_frames < teletext_burst_frames, and this jump sets
-     * teletext_idle_frames to frames_10s -- so firing it mid-burst kills the burst
-     * after as little as one frame. That happens whenever the caption's end_pts is
-     * already <= last_pts on arrival (short display duration, or captions delivered
-     * at/behind the video clock), which cut on-air captions to a single frame.
-     * Guard it so a caption always gets its full burst_frames of retransmission
-     * first; only then may the end-time clear it. (Continuous mode: idle_frames
-     * climbs past burst_frames immediately, so this guard is a no-op there.) */
+     * MUST NOT fire before the page has been transmitted. The jump sets
+     * teletext_idle_frames to frames_10s, which also closes the burst gate below
+     * (teletext_idle_frames < teletext_burst_frames), so firing it too early cuts
+     * the caption off after as little as one frame. That happens whenever the
+     * caption's end_pts is already <= last_pts on arrival, from a short display
+     * duration or captions delivered at or behind the video clock.
+     *
+     * The guard used to be teletext_idle_frames >= teletext_burst_frames, which
+     * asked the wrong question. burst_frames defaults to 8, and half of the
+     * captions in deck_halfworking.txt arrive less than 8 frames after the one
+     * before, so each new caption reset the counter before the previous one's
+     * erase could ever fire -- and the caption stayed on screen until the next
+     * one replaced it, with no end time at all. What the guard actually wants to
+     * know is whether the page has been sent, so ask that: teletext_rows_sent
+     * counts row transmissions since the page was stored, and in dual-field mode
+     * a four-row page completes in two frames rather than eight. */
     if (!ctx->teletext_defer_erase
         && ctx->has_teletext_data && !stored_new
         && ctx->teletext_caption_end_pts != AV_NOPTS_VALUE
         && ctx->last_pts >= ctx->teletext_caption_end_pts
-        && ctx->teletext_idle_frames >= ctx->teletext_burst_frames
+        && ctx->teletext_rows_sent >= ctx->teletext_row_count
         && ctx->teletext_idle_frames < frames_10s) {
         /* teletext_defer_erase off (default): promptly clear the caption at its end
          * time via the OP-42 s7 cleardown. On: skip this, so no standalone erase
@@ -2977,8 +3032,13 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         /* OP-42 s7: after 10s with no caption update, clear the page (blank
          * P801 with C4=1, no StartBox) and drop to continuous filler,
          * repeating the cleardown every 10s. */
-        if (ctx->teletext_idle_frames % frames_10s < 5) {
-            memcpy(cleardown, ctx->teletext_rows[0], 42);
+        if (ctx->teletext_idle_frames % frames_10s < 5 && ctx->teletext_have_header) {
+            /* Build the erase from the last page header we saw, not from
+             * teletext_rows[0]. Index 0 is not always the header -- the encoder
+             * stores pages as [r22, header] and [r20, r22] too -- and setting
+             * "C4" on byte 5 of a text row rewrites a display character into a
+             * Hamming codeword and re-sends the caption instead of erasing it. */
+            memcpy(cleardown, ctx->teletext_last_header, 42);
             uint8_t nib = ham84_decode[cleardown[5]];
             if (nib != 0xFF)
                 cleardown[5] = ham84_encode[(nib & 0x07) | 0x08];  /* set C4=1 */

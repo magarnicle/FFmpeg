@@ -169,6 +169,9 @@ struct decklink_ctx {
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */
+    int teletext_rows_sent;          /* Row transmissions since this page was stored */
+    uint8_t teletext_last_header[42];/* Most recent page header, for the cleardown */
+    int teletext_have_header;        /* teletext_last_header holds a real header */
     int has_teletext_data;           /* Whether we have valid teletext data */
     int teletext_erase_pending;      /* Header still carries C4=1; clear it after first transmission */
     int teletext_idle_frames;        /* Frames since the last caption update (for the OP-42 s7 cleardown) */

@@ -394,6 +394,9 @@ def main():
     ap.add_argument('--expect-header-attr', type=int, default=None,
                     help='spacing attribute every page header should lead with '
                          '(6 = Alpha Cyan, as Polistream)')
+    ap.add_argument('--min-cleared-pct', type=float, default=None,
+                    help='fail if fewer than this %% of captions get an erase '
+                         'before the next caption replaces them')
     ap.add_argument('--expect-dual-field', action='store_true',
                     help='require ascending row order across the two fields')
     ap.add_argument('--expect-idl', action='store_true',
@@ -567,6 +570,66 @@ def main():
             rep.check(set(leads) == {want},
                       'every header leads with attribute %02x (saw %s)'
                       % (want, ' '.join('%02x' % b for b in sorted(leads))))
+
+    # --- caption lifetime -------------------------------------------------
+    # A caption that is never erased stays on screen until the next one
+    # overwrites it, so it has no end time. Walk the packets in transmission
+    # order and ask, for each run of text rows, whether an erase header (C4=1)
+    # arrives before the next text row does.
+    # An erase that shares its frame with a caption row belongs to the caption
+    # arriving, not the one leaving: it clears the page so the new text can be
+    # written. Only a standalone erase, in a frame carrying no text at all, ends
+    # a caption at its own end time. Counting the attached ones would score a
+    # caption that lingered until it was overwritten as correctly cleared.
+    timeline = []
+    for frame in frames:
+        packets = [d['sliced']['bytes'] for k, d in
+                   sorted(frame['lines'].items(), key=lambda kv: kv[0][1])
+                   if d['sliced']]
+        has_text = any(row_address(p) in (18, 20, 22) for p in packets)
+        for packet in packets:
+            row = row_address(packet)
+            if row in (18, 20, 22):
+                timeline.append((frame['frame'], 'text', bytes(packet[5:45])))
+            elif row == 0 and not has_text:
+                units = HAM_DECODE.get(packet[8])   # S2 + C4 (erase page)
+                if units is not None and units & 0x08:
+                    timeline.append((frame['frame'], 'erase', None))
+    captions = 0
+    cleared = 0
+    gaps = []
+    last_text = None
+    pending = False
+    for frame_no, kind, payload in timeline:
+        if kind == 'text':
+            if payload != last_text:
+                if pending:
+                    captions += 1        # replaced without an erase
+                if last_text is not None:
+                    gaps.append(frame_no - last_seen)
+                pending = True
+                last_text = payload
+            last_seen = frame_no
+        elif kind == 'erase' and pending:
+            captions += 1
+            cleared += 1
+            pending = False
+            last_text = None
+    if pending:
+        captions += 1
+    if captions:
+        rep.line('')
+        pct = 100.0 * cleared / captions
+        rep.line('Captions: %d   ended by a standalone erase: %d (%.0f%%)'
+                 % (captions, cleared, pct))
+        if gaps:
+            rep.line('Frames between captions: median %.0f, %d of %d closer than '
+                     '8 frames' % (statistics.median(gaps),
+                                   sum(1 for g in gaps if g < 8), len(gaps)))
+        if args.min_cleared_pct is not None:
+            rep.check(pct >= args.min_cleared_pct,
+                      'at least %.0f%% of captions end with an erase (got %.0f%%)'
+                      % (args.min_cleared_pct, pct))
 
     # --- per-field behaviour ---------------------------------------------
     rep.line('')
