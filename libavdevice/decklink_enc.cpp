@@ -2279,20 +2279,38 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * The vbi_offset parameter (configurable via -teletext_vbi_offset) is the
      * sample at which clock-run-in bit 0 begins.
      *
-     * H-TIMING (OP-42 Fig 2/3): the penultimate of the 8 clock-run-in "1"s must
-     * sit 12.0 +/- 0.288 us after the line-sync datum. Measured against a
-     * Polistream capture that the Bridge VB440 locks as WST (poli.txt, AJA dump,
-     * same 720-sample active grid), Polistream's run-in bit 0 is at sample 26 and
-     * its penultimate "1" at ~sample 50 = the 12 us datum. Our run-in starts at
-     * `vbi_offset` (1:1), so the default is 26 to match that datum. The earlier
-     * value (6) put the run-in ~20 samples / ~1.5 us early, which the VB440
-     * rejected as "Other data in VBI" rather than WST.
+     * H-TIMING (OP-42 Fig 2/3): the penultimate of the eight clock-run-in "1"s
+     * (bit 12 of the 16-bit run-in) must sit 12.0 +/- 0.288 us after the
+     * line-sync datum, i.e. in 11.712 .. 12.288 us.
      *
-     * The full 45-byte packet is ~701 samples, so at offset 26 it nominally ends
-     * ~sample 727, a ~7-sample overhang past the 720-sample line. Polistream has
-     * the identical overhang and is conformant: its real data ends by ~705 and
-     * only trailing padding clips (OP-42 Fig 3: "provided the last bit of the last
-     * character on the line is not blanked").
+     * Measured on three Polistream captures -- poli.txt, poli_21.txt and
+     * poli_22.txt, all AJA dumps with VANCMode TALLER, a 720-sample active line
+     * and data on lines 21/334, so all on this same grid -- Polistream's run-in
+     * bit 0 starts at sample 5.62 (bit-0 centre 6.594) and its penultimate "1"
+     * centres at sample 29.95. ITU-R BT.656 puts the start of the 625-line
+     * digital active line 132 samples after 0H, so that edge lands at
+     * (132 + 29.95) / 13.5 = 11.996 us: the datum, near enough exactly.
+     *
+     * Our run-in starts at `vbi_offset` (1:1), so:
+     *   offset  6 -> penultimate "1" at 12.024 us   (inside the window)
+     *   offset 26 -> penultimate "1" at 13.506 us   (1.2 us outside it)
+     * Offset 6 is what production runs, and what a service provider set by eye
+     * against a reference feed it trusted. The default here is still 26.
+     *
+     * An earlier revision of this comment said poli.txt showed Polistream's
+     * run-in bit 0 at sample 26 and its penultimate "1" at ~sample 50, and set
+     * the default to 26 on that basis. Re-measured, that same file gives 5.62
+     * and 29.95. Wherever the sample-26 figure came from, it was not that file
+     * on this grid. Left standing but unexplained: at offset 6 a Bridge VB440
+     * is reported to have called the line "Other data in VBI" rather than
+     * locking it as WST, which is the only argument for 26 and does not fit
+     * these measurements.
+     *
+     * The full 45-byte packet is ~701 samples, so it nominally ends ~sample 707
+     * at offset 6 and ~sample 727 at offset 26, overhanging the 720-sample line
+     * in the latter case. Polistream has the same shape and is conformant: its
+     * real data ends by ~705 and only trailing padding would clip (OP-42 Fig 3:
+     * "provided the last bit of the last character on the line is not blanked").
      */
     int pixel_pos = vbi_offset;
 
