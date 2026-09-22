@@ -150,7 +150,9 @@ struct decklink_ctx {
     DecklinkPacketQueue teletext_queue;
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;         /* VBI waveform start sample offset (0-20) */
+    int teletext_vbi_offset_frac;    /* sub-sample part of the start offset, in 1/256ths */
     int teletext_shape;              /* Gaussian band-limit sigma*10 (0 = raw square) */
+    int teletext_rise_ns;            /* sine-squared edge 10-90% rise, ns (0 = off, overrides shape) */
     int teletext_continuous;         /* 1 = legacy continuous carousel; 0 = burst then hold */
     int teletext_burst_frames;       /* frames to retransmit a caption in burst mode */
     int teletext_blank_idle;         /* 1 = blank line 21/334 when idle instead of P8FF filler */
@@ -159,6 +161,8 @@ struct decklink_ctx {
     int teletext_filler;             /* idle filler packet type: 0=8FF dummy header, 1=8/31 IDL */
     int teletext_filler_ctrl;        /* 1 = dummy filler carries C6/C7/C8/C9=1 (like Polistream) */
     int teletext_filler_subcode;     /* dummy filler page subcode (0x3F7E default, Polistream=0) */
+    int teletext_filler_mix;         /* with filler=idl: every Nth filler is a P8FF header (0 = never) */
+    unsigned teletext_filler_seq;    /* runtime: filler packets built, for the filler_mix cadence */
     uint8_t teletext_filler_buf[42]; /* scratch: the built idle filler packet */
     unsigned teletext_idl_ci;        /* IDL continuity counter (increments per filler packet) */
     int teletext_defer_erase;        /* 1 = no erase/cleardown at caption end (next caption clears) */

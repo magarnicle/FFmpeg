@@ -2214,7 +2214,8 @@ static int build_op47_sdp_packet(uint16_t *vanc_words, int max_words,
  */
 static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
                                             const uint8_t *teletext_data, int data_len,
-                                            int vbi_offset, int teletext_shape,
+                                            int vbi_offset, int vbi_offset_frac,
+                                            int teletext_shape, int teletext_rise_ns,
                                             int teletext_level)
 {
     /* Teletext timing parameters for PAL/625:
@@ -2312,7 +2313,12 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * real data ends by ~705 and only trailing padding would clip (OP-42 Fig 3:
      * "provided the last bit of the last character on the line is not blanked").
      */
-    int pixel_pos = vbi_offset;
+    /* Start of clock-run-in bit 0, in output samples. -teletext_vbi_offset_frac
+     * adds a sub-sample part in 1/256ths: the shaped paths place edges between
+     * samples, so they can honour it, while the raw square grid can only round.
+     * Polistream sits at 5 + 159/256 = 5.62 (see H-TIMING above). */
+    double start_s = (double)vbi_offset + vbi_offset_frac / 256.0;
+    int pixel_pos = (int)(start_s + 0.5);
 
     /* Build the on-air bit sequence into bitlvl[]: 16-bit clock run-in (1010...,
      * starting high), 8-bit framing code, then the 42 data bytes LSB-first. Both
@@ -2369,7 +2375,67 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      * levels but a tighter eye; sweep it on the target slicer. */
     const uint16_t *out_luma = luma;
     uint16_t filtered[2048];
-    if (teletext_shape > 0) {
+    if (teletext_rise_ns > 0) {
+        /* Monotonic sine-squared (raised-cosine) EDGE, evaluated analytically on
+         * the output grid. Each bit boundary k contributes a step
+         *   d * S((t - tk)/Tfull + 0.5),  S(x) = 0.5 - 0.5*cos(pi*x) on [0,1]
+         * and the steps superpose. S is monotonic, so the result can never leave
+         * [LUMA_LOW, LUMA_HIGH] -- which is the point of having this path at all.
+         * -teletext_shape band-limits with a sinc-derived Nyquist kernel, whose
+         * sidelobes ring about 1 LSB past both rails; measured off air at
+         * shape 45 the level reaches 161 and 14 against nominal 160 and 16,
+         * where Polistream never leaves 16...160.
+         *
+         * S rises from 10% to 90% over 0.590334 of its full width, so a wanted
+         * 10-90% rise of R samples needs a full transition width of R/0.590334.
+         * A width over one bit period is normal and is what Polistream does: its
+         * clock run-in does not reach the rails, settling only on longer runs.
+         *
+         * -teletext_rise_ns 86 reproduces Polistream. Beware when checking that
+         * against a capture: interpolating a 13.5 MHz dump between samples reads
+         * a smooth edge about 30 ns wide of the truth, and averaging transitions
+         * does not cancel it, so poli reads 115 ns by that method and 86 ns when
+         * the shape is fitted. tools/teletext_vbi_check.py reports both.
+         *
+         * This path ignores -teletext_shape and needs no oversampling, since the
+         * edge is computed in closed form rather than filtered. */
+        const double PI = 3.14159265358979323846;
+        double rise_samples = teletext_rise_ns * 13.5 / 1000.0;   /* ns -> samples */
+        double tfull = rise_samples / 0.590334;
+        double acc[2048];
+        if (tfull < 1e-3)
+            tfull = 1e-3;
+        for (int i = 0; i < width; i++)
+            acc[i] = 0.0;
+        for (int k = 0; k <= nbits; k++) {
+            double prev = (k == 0)     ? (double)LUMA_BLACK : (double)bitlvl[k - 1];
+            double next = (k == nbits) ? (double)LUMA_BLACK : (double)bitlvl[k];
+            double d = next - prev;
+            if (d == 0.0)
+                continue;
+            double tk = start_s + (double)k * SPB_NUM / SPB_DEN;
+            int j0 = (int)(tk - tfull / 2.0);
+            int j1 = (int)(tk + tfull / 2.0) + 1;
+            if (j0 < 0) j0 = 0;
+            if (j1 > width) j1 = width;
+            for (int i = j0; i < j1; i++) {
+                double x = ((double)i - tk) / tfull + 0.5;
+                double sx = (x <= 0.0) ? 0.0
+                          : (x >= 1.0) ? 1.0
+                                       : 0.5 - 0.5 * cos(PI * x);
+                acc[i] += d * sx;
+            }
+            for (int i = j1; i < width; i++)
+                acc[i] += d;
+        }
+        for (int i = 0; i < width; i++) {
+            double v = (double)LUMA_BLACK + acc[i];
+            if (v < 0.0) v = 0.0;
+            if (v > 1023.0) v = 1023.0;
+            filtered[i] = (uint16_t)(v + 0.5);
+        }
+        out_luma = filtered;
+    } else if (teletext_shape > 0) {
         enum { OS = 8 };                                  /* internal oversample */
         static double hires[2048 * OS];
         static double filt[2048 * OS];
@@ -2383,7 +2449,7 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
          * floor((j/OS - offset) / SPB), SPB = SPB_NUM/SPB_DEN. In hi-res
          * units: bit = (j - offset*OS) * SPB_DEN / (SPB_NUM * OS). */
         for (int j = 0; j < hw; j++) {
-            long long rel = (long long)j - (long long)vbi_offset * OS;
+            long long rel = (long long)j - (long long)(start_s * OS + 0.5);
             if (rel < 0) { hires[j] = LUMA_BLACK; continue; }
             long long bit = rel * SPB_DEN / ((long long)SPB_NUM * OS);
             hires[j] = (bit < nbits) ? bitlvl[bit] : LUMA_BLACK;
@@ -2503,7 +2569,16 @@ static const uint8_t teletext_filler_packet[42] = {
 static const uint8_t *teletext_build_filler(struct decklink_ctx *ctx)
 {
     uint8_t *p = ctx->teletext_filler_buf;
-    if (ctx->teletext_filler == TELETEXT_FILLER_IDL) {
+    /* -teletext_filler_mix N: with filler=idl, every Nth filler packet goes out
+     * as the P8FF time-filling header instead of an IDL packet, so an idle line
+     * still carries page context. Polistream mixes them -- 6 P8FF headers among
+     * 959 fillers in poli_21, 2 among 974 in poli_22 -- while filler=idl alone
+     * sends none. Off by default. The IDL continuity counter only advances on
+     * packets actually built as IDL, so substituting one leaves no gap in its
+     * numbering. */
+    int mix_now = ctx->teletext_filler_mix > 0
+                  && (ctx->teletext_filler_seq++ % ctx->teletext_filler_mix) == 0;
+    if (ctx->teletext_filler == TELETEXT_FILLER_IDL && !mix_now) {
         p[0] = ham84_encode[8];            /* MRAG: mag 8 (0), row bit0=1 (row 31) */
         p[1] = ham84_encode[15];           /* row bits 1-4 = 1111 -> row 31 */
         p[2] = ham84_encode[4];            /* format/designation (matches poli 0x64) */
@@ -2515,7 +2590,8 @@ static const uint8_t *teletext_build_filler(struct decklink_ctx *ctx)
             p[i] = 0x20;                   /* fixed payload (not poli's live data) */
         return p;
     }
-    /* DUMMY: page 8FF header with configurable subcode + control bits. */
+    /* DUMMY: page 8FF header with configurable subcode + control bits. Also the
+     * substitute emitted by -teletext_filler_mix while filler=idl. */
     int sc = ctx->teletext_filler_subcode;
     int S1 = sc & 0xF, S2 = (sc >> 4) & 0x7, S3 = (sc >> 8) & 0xF, S4 = (sc >> 12) & 0x3;
     int c = ctx->teletext_filler_ctrl ? 1 : 0;
@@ -2709,7 +2785,9 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
                                         teletext_data, 42, ctx->teletext_vbi_offset,
-                                        ctx->teletext_shape, ctx->teletext_level);
+                                        ctx->teletext_vbi_offset_frac,
+                                        ctx->teletext_shape, ctx->teletext_rise_ns,
+                                        ctx->teletext_level);
         av_log(avctx, AV_LOG_INFO,
                "Inserted teletext VBI line %d: MRAG=%02x%02x data=%02x%02x%02x%02x... (buf=%p)\n",
                line_num, teletext_data[0], teletext_data[1],
@@ -3683,6 +3761,9 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_filler = cctx->teletext_filler;
     ctx->teletext_filler_ctrl = cctx->teletext_filler_ctrl;
     ctx->teletext_filler_subcode = cctx->teletext_filler_subcode;
+    ctx->teletext_filler_mix = cctx->teletext_filler_mix;
+    ctx->teletext_vbi_offset_frac = cctx->teletext_vbi_offset_frac;
+    ctx->teletext_rise_ns = cctx->teletext_rise_ns;
     ctx->teletext_defer_erase = cctx->teletext_defer_erase;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
