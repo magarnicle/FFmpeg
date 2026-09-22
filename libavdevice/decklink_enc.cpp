@@ -3057,7 +3057,15 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         }
     } else if (ctx->teletext_row_count > 0
                && (ctx->teletext_continuous
-                   || ctx->teletext_idle_frames < ctx->teletext_burst_frames)) {
+                   || ctx->teletext_idle_frames < ctx->teletext_burst_frames
+                   || ctx->teletext_rows_sent < ctx->teletext_row_count)) {
+        /* The teletext_rows_sent test is a floor under teletext_burst_frames:
+         * keep transmitting until every row of the page has gone out at least
+         * once, however short the burst is set. Dual-field sends two rows per
+         * frame, so a three- or four-row page needs two frames, and a burst of
+         * one would have left the last row -- usually the bottom line of the
+         * caption -- never transmitted at all. On-air logs show 3- and 4-row
+         * pages making up over half the captions. */
         /* Active or recently-updated caption. Two modes:
          *   Burst (default): retransmit the stored page only for the first
          *     teletext_burst_frames after each update, then stop and drop to
