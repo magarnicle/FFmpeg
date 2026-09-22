@@ -1956,6 +1956,17 @@ static void teletext_clear_erase_bit(uint8_t *header_row)
         header_row[5] = ham84_encode[nibble & 0x07];
 }
 
+/* Decode the packet row address (0-31) from a 42-byte teletext row's MRAG.
+ * Returns -1 if either Hamming 8/4 address byte is uncorrectable. */
+static int teletext_row_address(const uint8_t *row)
+{
+    uint8_t a0 = ham84_decode[row[0]];
+    uint8_t a1 = ham84_decode[row[1]];
+    if (a0 == 0xFF || a1 == 0xFF)
+        return -1;
+    return (a0 | (a1 << 4)) >> 3;
+}
+
 /* Extract and log text content from teletext data units for debugging.
  * Teletext data unit structure (46 bytes):
  *   [0]: data_unit_id
@@ -2209,10 +2220,18 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
     /* Teletext timing parameters for PAL/625:
      * Sample rate: 13.5 MHz
      * Data rate: 6.9375 Mbps
-     * Samples per bit: 13.5 / 6.9375 = 1.946
+     * Samples per bit: 13.5 / 6.9375 = 72/37 = 1.9459459...
+     *
+     * Keep this as the exact rational 72/37. The 8-bit fixed point it replaces
+     * (498/256 = 1.9453125) was 0.0326% short, which ran the packet clock at
+     * 6939.8 kbit/s instead of 6937.5 and accumulated 0.24 samples (18 ns) of
+     * slip by bit 359 -- measured off air, against a Polistream capture that
+     * sits on nominal. A strict slicer locks on the clock run-in and then
+     * free-runs, so that slip came straight off the eye at the end of the line.
+     * Integer maths is safe here: the largest product is 360 * 72.
      */
-    const int SAMPLES_PER_BIT_FP = 498;  /* 1.946 * 256 (fixed point) */
-    const int FP_SHIFT = 8;
+    const int SPB_NUM = 72;
+    const int SPB_DEN = 37;
 
     /* Binary "1" level, tunable via -teletext_level (percent of peak white).
      * 66% (default) matches ETS 300 706 / Polistream and decodes on our STBs;
@@ -2252,9 +2271,9 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
      *
      * The DeckLink VBI buffer is 720 samples (same width as PAL active video).
      * The teletext waveform requires approximately 700 samples:
-     *   - 16 bits clock run-in × 1.946 samples/bit = 31 samples
-     *   - 8 bits framing code × 1.946 = 16 samples
-     *   - 336 bits data × 1.946 = 654 samples
+     *   - 16 bits clock run-in × 1.9459 samples/bit = 31 samples
+     *   - 8 bits framing code × 1.9459 = 16 samples
+     *   - 336 bits data × 1.9459 = 654 samples
      *   - Total: ~700 samples
      *
      * The vbi_offset parameter (configurable via -teletext_vbi_offset) is the
@@ -2300,10 +2319,10 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
 
     /* Render the raw output-grid square wave (used when shaping is off). Bit b
      * covers output samples [offset + floor(b*SPB), offset + floor((b+1)*SPB)),
-     * with SPB = SAMPLES_PER_BIT_FP/256. */
+     * with SPB = SPB_NUM/SPB_DEN. */
     for (int b = 0; b < nbits; b++) {
-        int start_pixel = pixel_pos + ((b * SAMPLES_PER_BIT_FP) >> FP_SHIFT);
-        int end_pixel = pixel_pos + (((b + 1) * SAMPLES_PER_BIT_FP) >> FP_SHIFT);
+        int start_pixel = pixel_pos + (b * SPB_NUM) / SPB_DEN;
+        int end_pixel = pixel_pos + ((b + 1) * SPB_NUM) / SPB_DEN;
         for (int p = start_pixel; p < end_pixel && p < width; p++)
             if (p >= 0)
                 luma[p] = bitlvl[b];
@@ -2343,12 +2362,12 @@ static void generate_teletext_vbi_waveform(uint8_t *line_buf, int line_width,
             hw = (int)(sizeof(hires) / sizeof(hires[0]));
         /* Build the hi-res waveform from the bit sequence at fractional positions.
          * hi-res sample j is at output position j/OS; the covering bit is
-         * floor((j/OS - offset) / SPB), SPB = SAMPLES_PER_BIT_FP/256. In hi-res
-         * units: bit = (j - offset*OS) * 256 / (SAMPLES_PER_BIT_FP * OS). */
+         * floor((j/OS - offset) / SPB), SPB = SPB_NUM/SPB_DEN. In hi-res
+         * units: bit = (j - offset*OS) * SPB_DEN / (SPB_NUM * OS). */
         for (int j = 0; j < hw; j++) {
             long long rel = (long long)j - (long long)vbi_offset * OS;
             if (rel < 0) { hires[j] = LUMA_BLACK; continue; }
-            long long bit = rel * 256 / ((long long)SAMPLES_PER_BIT_FP * OS);
+            long long bit = rel * SPB_DEN / ((long long)SPB_NUM * OS);
             hires[j] = (bit < nbits) ? bitlvl[bit] : LUMA_BLACK;
         }
         /* raised-cosine (Nyquist) low-pass kernel at the hi-res rate */
@@ -2589,7 +2608,6 @@ static void construct_teletext(AVFormatContext *avctx, struct decklink_ctx *ctx,
         if (num_units > 0) {
             ctx->teletext_row_count = num_units;
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
-            ctx->teletext_header_sent = 0;  /* header_once: re-send header for this caption */
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
 
@@ -2688,7 +2706,7 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
 /* Return the next stored teletext row to transmit and advance the carousel.
  * Applies the header C4-erase aging (assert erase once on the first header
  * after a content change, then clear it) so the decoder doesn't re-erase every
- * cycle. Called once per frame. */
+ * cycle. Called once per transmitted field (twice per frame in dual-field). */
 static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
 {
     int idx = ctx->teletext_row_index;
@@ -2697,17 +2715,9 @@ static const uint8_t *teletext_next_row(struct decklink_ctx *ctx)
             ctx->teletext_erase_pending = 0;   /* first header keeps C4=1 */
         else
             teletext_clear_erase_bit(ctx->teletext_rows[0]);
-        ctx->teletext_header_sent = 1;
     }
     const uint8_t *d = ctx->teletext_rows[idx];
-    int next = (idx + 1) % ctx->teletext_row_count;
-    /* header_once: after the header (index 0) has gone out once for this caption,
-     * cycle only the display rows (skip index 0) so we don't re-send the header
-     * every carousel cycle. Fewer P801 headers on the wire, closer to Polistream. */
-    if (ctx->teletext_header_once && next == 0 && ctx->teletext_header_sent
-        && ctx->teletext_row_count > 1)
-        next = 1;
-    ctx->teletext_row_index = next;
+    ctx->teletext_row_index = (idx + 1) % ctx->teletext_row_count;
     return d;
 }
 
@@ -2757,7 +2767,6 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         if (num_units > 0) {
             ctx->teletext_row_count = num_units;
             ctx->teletext_row_index = 0;  /* Reset to start of new content */
-            ctx->teletext_header_sent = 0;  /* header_once: re-send header for this caption */
             ctx->has_teletext_data = 1;
             ctx->teletext_erase_pending = 1;  /* New content: header carries C4=1 */
             stored_new = 1;                   /* Reset the idle timer */
@@ -2841,11 +2850,13 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
      * decoder needs, so it must always go out. */
     const uint8_t *data_to_send;
     const uint8_t *data_f2 = NULL;   /* field-2 override for dual-field; NULL = copy field 1 */
+    int data_is_filler = 0;          /* set when data_to_send came from the filler builder */
     uint8_t cleardown[42];
     if (!ctx->has_teletext_data) {
         /* Lead-in, before any caption has arrived: filler so the line is never
          * dead and the decoder clock stays locked (or blank if blank_idle). */
         data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
+        data_is_filler = data_to_send != NULL;
         av_log(avctx, AV_LOG_DEBUG, "Teletext: %s (no caption yet)\n",
                data_to_send ? "filler" : "blank");
     } else if (ctx->teletext_idle_frames >= frames_10s) {
@@ -2861,6 +2872,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle cleardown (P801 C4=1)\n");
         } else {
             data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
+            data_is_filler = data_to_send != NULL;
             av_log(avctx, AV_LOG_DEBUG, "Teletext: idle %s\n",
                    data_to_send ? "filler" : "blank");
         }
@@ -2886,8 +2898,22 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
          * stay identical on both fields. teletext_next_row also ages the C4 erase
          * bit, so the header still erases correctly whichever field it lands on. */
         if (ctx->teletext_dual_field && ctx->teletext_row_count > 1
-            && ctx->teletext_fields == TELETEXT_FIELDS_BOTH)
+            && ctx->teletext_fields == TELETEXT_FIELDS_BOTH) {
             data_f2 = teletext_next_row(ctx);
+            /* Send the pair in ascending row order within the frame. The carousel
+             * hands rows over in stored order, which put the bottom line of a
+             * two-line caption on field 1 and the top line on field 2, so a
+             * decoder drew the caption bottom-first for one field (20 ms).
+             * Only swap two display rows: a page header (row 0) carries the C4
+             * erase and has to stay ahead of the text it erases for. */
+            int r_f1 = teletext_row_address(data_to_send);
+            int r_f2 = teletext_row_address(data_f2);
+            if (r_f1 > 0 && r_f2 > 0 && r_f1 > r_f2) {
+                const uint8_t *swap = data_to_send;
+                data_to_send = data_f2;
+                data_f2 = swap;
+            }
+        }
         av_log(avctx, AV_LOG_DEBUG,
                "Teletext: burst row (idle=%d/%d rows=%d idx=%d continuous=%d dual=%d)\n",
                ctx->teletext_idle_frames, ctx->teletext_burst_frames,
@@ -2898,6 +2924,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
          * while the decoder keeps displaying the last page (or blank if
          * blank_idle -- the decoder holds the page regardless). */
         data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
+        data_is_filler = data_to_send != NULL;
         av_log(avctx, AV_LOG_DEBUG,
                "Teletext: hold %s (idle=%d/%d rows=%d)\n",
                data_to_send ? "filler" : "blank", ctx->teletext_idle_frames,
@@ -2907,11 +2934,26 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     /* Insert on VBI line 21/334. data_to_send == NULL leaves the line blank
      * (blank_idle): we simply skip insertion, so the line stays at black. */
     if (data_to_send) {
-        if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN)
+        int sent_f1 = 0;
+        if (ctx->teletext_fields != TELETEXT_FIELDS_EVEN) {
             insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD1, data_to_send);
-        if (ctx->teletext_fields != TELETEXT_FIELDS_ODD)
+            sent_f1 = 1;
+        }
+        if (ctx->teletext_fields != TELETEXT_FIELDS_ODD) {
+            const uint8_t *f2 = data_f2;
+            /* Filler is a fresh packet on each field, not a copy of field 1's.
+             * The IDL filler carries a per-packet continuity counter, and
+             * re-sending field 1's bytes advanced it only once per frame, so a
+             * receiver could not tell a lost field-1 packet from a lost field-2
+             * one -- the only thing the counter is for. Rebuild only when field 1
+             * actually went out, otherwise (fields=even) the counter would skip.
+             * Safe to overwrite the shared build buffer here: field 1's waveform
+             * has already been rendered into the VANC line. */
+            if (!f2 && sent_f1 && data_is_filler)
+                f2 = teletext_build_filler(ctx);
             insert_teletext_vbi_line(avctx, ctx, vanc, AUS_SD_LINE_FIELD2,
-                                     data_f2 ? data_f2 : data_to_send);
+                                     f2 ? f2 : data_to_send);
+        }
     }
 }
 
@@ -3623,7 +3665,6 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_filler = cctx->teletext_filler;
     ctx->teletext_filler_ctrl = cctx->teletext_filler_ctrl;
     ctx->teletext_filler_subcode = cctx->teletext_filler_subcode;
-    ctx->teletext_header_once = cctx->teletext_header_once;
     ctx->teletext_defer_erase = cctx->teletext_defer_erase;
     ctx->teletext_caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;

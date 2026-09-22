@@ -161,9 +161,7 @@ struct decklink_ctx {
     int teletext_filler_subcode;     /* dummy filler page subcode (0x3F7E default, Polistream=0) */
     uint8_t teletext_filler_buf[42]; /* scratch: the built idle filler packet */
     unsigned teletext_idl_ci;        /* IDL continuity counter (increments per filler packet) */
-    int teletext_header_once;        /* 1 = send page header once per burst, then only text rows */
     int teletext_defer_erase;        /* 1 = no erase/cleardown at caption end (next caption clears) */
-    int teletext_header_sent;        /* runtime: header already sent for the current caption */
     uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
     int teletext_row_count;          /* Number of stored rows */
     int teletext_row_index;          /* Current row index for cycling */

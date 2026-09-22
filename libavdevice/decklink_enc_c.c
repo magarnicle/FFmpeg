@@ -86,7 +86,6 @@ static const AVOption options[] = {
     { "idl", "Packet 8/31 Independent Data Line, like Polistream (structure only, not its live datacast payload)", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, ENC, .unit = "teletext_filler" },
     { "teletext_filler_ctrl", "dummy filler header control bits C6/C7/C8/C9 = 1 (matches Polistream) instead of 0", OFFSET(teletext_filler_ctrl), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "teletext_filler_subcode", "dummy filler page subcode (OP-42 recommends 0x3F7E; Polistream uses 0)", OFFSET(teletext_filler_subcode), AV_OPT_TYPE_INT, { .i64 = 0x3F7E }, 0, 0x3F7F, ENC },
-    { "teletext_header_once", "send the page header once at the start of each caption burst, then repeat only the text rows (fewer headers, ala Polistream)", OFFSET(teletext_header_once), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "teletext_defer_erase", "don't send an erase/cleardown at each caption's end; let the next caption's C4 erase clear it (fewer erase headers; caption holds until the next one or the 10s idle cleardown)", OFFSET(teletext_defer_erase), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "socket_path" , "Unix socket path for external frame input", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "socket_listen", "Listen on socket for external frame input", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
