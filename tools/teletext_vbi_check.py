@@ -656,6 +656,30 @@ def main():
         if args.expect_idl:
             rep.check(set(deltas) == {1},
                       'continuity byte steps once per field')
+
+    # The same counter, read across frames, says whether the capture itself is
+    # complete. It advances twice per output frame, once per field, so
+    # consecutive captured frames should differ by 2. Anything larger means the
+    # capture tool dropped frames, and every cross-frame conclusion drawn from
+    # the file -- burst lengths, caption cadence, which rows a caption got -- is
+    # measuring the sampling rate rather than the inserter.
+    across = collections.Counter()
+    previous = None
+    for frame in frames:
+        data = frame['lines'].get((21, 1))
+        if not data or not data['sliced'] or row_address(data['sliced']['bytes']) != 31:
+            previous = None
+            continue
+        if previous is not None:
+            across[(data['sliced']['bytes'][13] - previous) % 256] += 1
+        previous = data['sliced']['bytes'][13]
+    if across:
+        common = across.most_common(1)[0][0]
+        rep.line('IDL continuity across captured frames: %s'
+                 % ', '.join('+%d x%d' % kv for kv in across.most_common(4)))
+        rep.check(common == 2,
+                  'capture is complete (step of 2 per frame; saw %d, about 1 frame '
+                  'in %d captured)' % (common, max(common // 2, 1)))
     if ascending or descending:
         rep.line('Two-row frames: %d ascending (20 then 22), %d descending'
                  % (ascending, descending))

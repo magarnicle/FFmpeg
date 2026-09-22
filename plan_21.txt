@@ -586,3 +586,56 @@ fix 1 should close the rest. teletext_vbi_check.py now reports this and takes
 
 Still open: -teletext_burst_frames does not behave as documented (item 4 of
 the previous list), and the IDL filler payload cannot be reproduced.
+
+
+==========================================================================
+deck23.txt + ff.log - 2026-09-22, and two corrections
+==========================================================================
+
+THE CAPTURES HAVE BEEN DROPPING FRAMES ALL ALONG.
+
+The IDL filler continuity byte advances twice per output frame, once per
+field. Between consecutive CAPTURED frames it should therefore step by 2. It
+steps by 16 in deck23.txt, and by 10 to 12 in deck_halfworking.txt and
+poli_halfworking.txt. The AJA dump is sampling roughly one frame in 8, and one
+in 5, while numbering what it keeps consecutively, so nothing in the file
+reveals the loss.
+
+Everything I concluded from captures about behaviour ACROSS frames is
+therefore unreliable, including "captions are only on air for 1 or 2 frames",
+which is what an 8-frame burst looks like through a 1-in-8 sampler. Per-line
+and within-frame measurements are unaffected and still stand: bit period,
+h-timing, edge shape, levels, parity and Hamming, character set, row order
+within a frame, the field-1/field-2 continuity step, and P8FF placement in the
+spare field.
+
+teletext_vbi_check.py now tests for this and fails the capture, so it cannot
+mislead again.
+
+CORRECTION: construct_teletext_vbi_sd runs exactly once per output frame. The
+burst lines in ff.log carry pts=9678, 9679, 9680 ... one per line, 40 ms
+apart. The "about four calls per frame" theory was wrong, and it was built on
+the same dropped-frame artefact.
+
+WHAT ff.log ACTUALLY SHOWS - a clean pipeline:
+  169 pages stored, every one at base 0 (no same-frame collisions)
+  166 bursts of exactly 8 frames, plus a 9, a 10 and a 5
+  20 cleardowns of 5 frames each
+  0 "carrying unsent rows" events
+  2 packets discarded as too old, both during the pre-render fill before the
+    first caption
+  page spacing: minimum 20 frames, median 72
+  durations: 20 to 125 frames, median 69 - every one longer than the burst
+  no page whose end time falls after the next page starts
+
+The encoder laid out 513 pages for the whole file; the muxer played 169 in its
+8.6-minute window, which is proportionate. Nothing is lost between them.
+
+So on this build I cannot find a fault in the log. Either the remaining
+failures are in something the log does not cover, or the 70% figure predates
+bee0ee386e, c17f97d708, 8569592afc and 8b36628c41, which this run is the first
+to include.
+
+NEXT: fix the capture tool so it keeps every frame, then capture and log the
+same run again. Without a complete capture there is no way to check on-air
+scheduling against the log.
