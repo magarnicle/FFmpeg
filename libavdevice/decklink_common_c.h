@@ -104,7 +104,8 @@ struct decklink_cctx {
     int teletext_filler;
     int teletext_filler_ctrl;
     int teletext_filler_subcode;
-    int teletext_filler_mix;
+    int teletext_spare_p8ff;
+    int teletext_header_attr;
     int teletext_defer_erase;
 
     /* Socket server options */

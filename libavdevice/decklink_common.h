@@ -161,8 +161,8 @@ struct decklink_ctx {
     int teletext_filler;             /* idle filler packet type: 0=8FF dummy header, 1=8/31 IDL */
     int teletext_filler_ctrl;        /* 1 = dummy filler carries C6/C7/C8/C9=1 (like Polistream) */
     int teletext_filler_subcode;     /* dummy filler page subcode (0x3F7E default, Polistream=0) */
-    int teletext_filler_mix;         /* with filler=idl: every Nth filler is a P8FF header (0 = never) */
-    unsigned teletext_filler_seq;    /* runtime: filler packets built, for the filler_mix cadence */
+    int teletext_spare_p8ff;         /* 1 = spare dual-field slot carries a P8FF time-filling header */
+    int teletext_header_attr;        /* spacing attribute in a header's first display cell (-1 = as sent) */
     uint8_t teletext_filler_buf[42]; /* scratch: the built idle filler packet */
     unsigned teletext_idl_ci;        /* IDL continuity counter (increments per filler packet) */
     int teletext_defer_erase;        /* 1 = no erase/cleardown at caption end (next caption clears) */

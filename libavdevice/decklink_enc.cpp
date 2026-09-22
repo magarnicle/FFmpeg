@@ -2566,19 +2566,12 @@ static const uint8_t teletext_filler_packet[42] = {
  *     (MRAG mag 8 / row 31, a format+address template, and a per-packet continuity
  *     counter). The payload is a fixed template, NOT Polistream's live datacast
  *     content, which is a running data service we do not have the source for. */
+static const uint8_t *teletext_build_dummy(struct decklink_ctx *ctx);
+
 static const uint8_t *teletext_build_filler(struct decklink_ctx *ctx)
 {
     uint8_t *p = ctx->teletext_filler_buf;
-    /* -teletext_filler_mix N: with filler=idl, every Nth filler packet goes out
-     * as the P8FF time-filling header instead of an IDL packet, so an idle line
-     * still carries page context. Polistream mixes them -- 6 P8FF headers among
-     * 959 fillers in poli_21, 2 among 974 in poli_22 -- while filler=idl alone
-     * sends none. Off by default. The IDL continuity counter only advances on
-     * packets actually built as IDL, so substituting one leaves no gap in its
-     * numbering. */
-    int mix_now = ctx->teletext_filler_mix > 0
-                  && (ctx->teletext_filler_seq++ % ctx->teletext_filler_mix) == 0;
-    if (ctx->teletext_filler == TELETEXT_FILLER_IDL && !mix_now) {
+    if (ctx->teletext_filler == TELETEXT_FILLER_IDL) {
         p[0] = ham84_encode[8];            /* MRAG: mag 8 (0), row bit0=1 (row 31) */
         p[1] = ham84_encode[15];           /* row bits 1-4 = 1111 -> row 31 */
         p[2] = ham84_encode[4];            /* format/designation (matches poli 0x64) */
@@ -2590,8 +2583,16 @@ static const uint8_t *teletext_build_filler(struct decklink_ctx *ctx)
             p[i] = 0x20;                   /* fixed payload (not poli's live data) */
         return p;
     }
-    /* DUMMY: page 8FF header with configurable subcode + control bits. Also the
-     * substitute emitted by -teletext_filler_mix while filler=idl. */
+    return teletext_build_dummy(ctx);
+}
+
+/* Build the OP-42 s8 page-8FF time-filling header, whatever -teletext_filler is
+ * set to. This is both the DUMMY filler and what -teletext_spare_p8ff puts in a
+ * spare field. */
+static const uint8_t *teletext_build_dummy(struct decklink_ctx *ctx)
+{
+    uint8_t *p = ctx->teletext_filler_buf;
+    /* Page 8FF header with configurable subcode + control bits. */
     int sc = ctx->teletext_filler_subcode;
     int S1 = sc & 0xF, S2 = (sc >> 4) & 0x7, S3 = (sc >> 8) & 0xF, S4 = (sc >> 12) & 0x3;
     int c = ctx->teletext_filler_ctrl ? 1 : 0;
@@ -2781,6 +2782,23 @@ static void insert_teletext_vbi_line(AVFormatContext *avctx, struct decklink_ctx
                                       int line_num, const uint8_t *teletext_data)
 {
     void *line_buf;
+    uint8_t attr_row[42];
+
+    /* -teletext_header_attr: write a spacing attribute as the first of a page
+     * header's 32 display characters. Polistream sends 0x06 (Alpha Cyan) on
+     * every header it transmits, P801 and P8FF alike; we send a space. The row
+     * is not rendered by a conformant decoder anyway -- C7 (suppress header) is
+     * 1 in both -- so this only closes a difference against the reference.
+     * Applied on a copy so the stored caption rows are left untouched. */
+    if (ctx->teletext_header_attr >= 0 && teletext_row_address(teletext_data) == 0) {
+        memcpy(attr_row, teletext_data, 42);
+        uint8_t attr = (uint8_t)(ctx->teletext_header_attr & 0x1F);
+        int ones = 0;
+        for (int i = 0; i < 8; i++)
+            ones += (attr >> i) & 1;
+        attr_row[10] = (ones & 1) ? attr : (uint8_t)(attr | 0x80);  /* odd parity */
+        teletext_data = attr_row;
+    }
     HRESULT result = vanc->GetBufferForVerticalBlankingLine(line_num, &line_buf);
     if (result == S_OK) {
         generate_teletext_vbi_waveform((uint8_t *)line_buf, ctx->bmd_width,
@@ -2995,7 +3013,18 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
          * bit, so the header still erases correctly whichever field it lands on. */
         if (ctx->teletext_dual_field && ctx->teletext_row_count > 1
             && ctx->teletext_fields == TELETEXT_FIELDS_BOTH) {
-            data_f2 = teletext_next_row(ctx);
+            /* -teletext_spare_p8ff: when the carousel has just wrapped, field 2
+             * has no further row of this caption to carry. Sending the wrapped
+             * row again re-sends the page header; Polistream instead drops an
+             * OP-42 s8 P8FF time-filling header into that slot. Measured, 7 of
+             * its 8 P8FF packets across poli_21 and poli_22 sit exactly there,
+             * in the second field of a frame whose first field carried row 22.
+             * Leaving the carousel index alone keeps the next frame starting at
+             * the top of the page. */
+            if (ctx->teletext_spare_p8ff && ctx->teletext_row_index == 0)
+                data_f2 = teletext_build_dummy(ctx);
+            else
+                data_f2 = teletext_next_row(ctx);
             /* Send the pair in ascending row order within the frame. The carousel
              * hands rows over in stored order, which put the bottom line of a
              * two-line caption on field 1 and the top line on field 2, so a
@@ -3003,7 +3032,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
              * Only swap two display rows: a page header (row 0) carries the C4
              * erase and has to stay ahead of the text it erases for. */
             int r_f1 = teletext_row_address(data_to_send);
-            int r_f2 = teletext_row_address(data_f2);
+            int r_f2 = teletext_row_address(data_f2);   /* 0 for a header, never swapped */
             if (r_f1 > 0 && r_f2 > 0 && r_f1 > r_f2) {
                 const uint8_t *swap = data_to_send;
                 data_to_send = data_f2;
@@ -3761,7 +3790,8 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_filler = cctx->teletext_filler;
     ctx->teletext_filler_ctrl = cctx->teletext_filler_ctrl;
     ctx->teletext_filler_subcode = cctx->teletext_filler_subcode;
-    ctx->teletext_filler_mix = cctx->teletext_filler_mix;
+    ctx->teletext_spare_p8ff = cctx->teletext_spare_p8ff;
+    ctx->teletext_header_attr = cctx->teletext_header_attr;
     ctx->teletext_vbi_offset_frac = cctx->teletext_vbi_offset_frac;
     ctx->teletext_rise_ns = cctx->teletext_rise_ns;
     ctx->teletext_defer_erase = cctx->teletext_defer_erase;

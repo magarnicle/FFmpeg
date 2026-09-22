@@ -391,6 +391,9 @@ def main():
                     help='tolerance on the fitted edge, in ns (default 15)')
     ap.add_argument('--monotonic', action='store_true',
                     help='require that no sample leaves %d..%d' % (LEVEL_LOW, LEVEL_HIGH))
+    ap.add_argument('--expect-header-attr', type=int, default=None,
+                    help='spacing attribute every page header should lead with '
+                         '(6 = Alpha Cyan, as Polistream)')
     ap.add_argument('--expect-dual-field', action='store_true',
                     help='require ascending row order across the two fields')
     ap.add_argument('--expect-idl', action='store_true',
@@ -521,6 +524,49 @@ def main():
             rep.check(abs(fitted - args.expect_rise_ns) <= args.rise_tol_ns,
                       'fitted edge matches the requested %.0f ns (measured %.0f)'
                       % (args.expect_rise_ns, fitted))
+
+    # --- page headers ----------------------------------------------------
+    leads = collections.Counter()
+    pages = collections.Counter()
+    p8ff_total = 0
+    p8ff_spare = 0
+    for frame in frames:
+        f1 = frame['lines'].get((21, 1))
+        f2 = frame['lines'].get((334, 2))
+        for data in frame['lines'].values():
+            if not data['sliced']:
+                continue
+            packet = data['sliced']['bytes']
+            if row_address(packet) != 0:
+                continue
+            leads[packet[13]] += 1
+            units = HAM_DECODE.get(packet[5])
+            tens = HAM_DECODE.get(packet[6])
+            if units is None or tens is None:
+                continue
+            pages['%X%X' % (tens, units)] += 1
+        if f1 and f2 and f1['sliced'] and f2['sliced']:
+            a, b = f1['sliced']['bytes'], f2['sliced']['bytes']
+            if row_address(b) == 0 and HAM_DECODE.get(b[5]) == 15 \
+                    and HAM_DECODE.get(b[6]) == 15:
+                p8ff_total += 1
+                if row_address(a) in (20, 22):
+                    p8ff_spare += 1
+    if leads:
+        rep.line('')
+        rep.line('Headers: %s' % ', '.join('P8%s x%d' % kv for kv in sorted(pages.items())))
+        rep.line('Header display row leads with: %s'
+                 % ', '.join('%02x x%d' % kv for kv in sorted(leads.items())))
+        if p8ff_total:
+            rep.line('P8FF in field 2: %d, of which %d follow a caption row on '
+                     'field 1' % (p8ff_total, p8ff_spare))
+        if args.expect_header_attr is not None:
+            want = args.expect_header_attr & 0x1F
+            if bin(want).count('1') % 2 == 0:
+                want |= 0x80
+            rep.check(set(leads) == {want},
+                      'every header leads with attribute %02x (saw %s)'
+                      % (want, ' '.join('%02x' % b for b in sorted(leads))))
 
     # --- per-field behaviour ---------------------------------------------
     rep.line('')
