@@ -430,3 +430,97 @@ NOT done, still open in order: item 1 (the regression checker), item 5
 None of this has been on air. The bit-period and row-order changes alter what
 the inserter transmits and want a capture before they go anywhere near a
 service.
+
+
+==========================================================================
+VERIFIED AGAINST deck_22.txt / poli_22.txt - 2026-09-22
+==========================================================================
+
+New captures, 500 frames each. deck_22 was taken with the production command
+line (-teletext_shape 45, -teletext_vbi_offset 6, -teletext_dual_field 1,
+-teletext_filler idl, -teletext_defer_erase 1) on a build carrying the three
+fixes. Both captures: 1000 packets, 0 Hamming errors, 0 parity errors, same
+IDL envelope, same caption control codes, no character outside 0x20-0x7E.
+
+CONFIRMED FIXED (deck_21 -> deck_22):
+
+  Section 1  bit period   6939.9 -> 6937.5 kbit/s. Fitted 1.94596 samples
+                          against poli_22's 1.94595 and a nominal 1.945946.
+  Section 11 IDL continuity  F2-F1 delta was 0 in 430/430 frames, now 1 in
+                          471/471, matching poli_22's 484/484.
+  Section 13 row order    deck_21 had (F1 22, F2 20) x39 and no (20, 22).
+                          deck_22 has (20, 22) x4 and no (22, 20) at all.
+                          poli_22 shows (20, 22) x4.
+
+UNCHANGED, AS EXPECTED (not yet worked):
+
+  Section 2  h-timing     bit 0 centre 6.969 vs poli's 6.594 - the same
+                          0.375 sample / 27.8 ns gap. Code default still 26.
+  Section 3  edge shape   rise 170 ns, excursions to 14/15 and 161, against
+                          poli's 115 ns and an exact 16...160.
+  Section 9  header row   deck 32 spaces, poli 0x86 + 31 spaces.
+  Section 10 IDL payload  deck 31 x 0x20 in 942/942 packets; poli varying.
+
+SECTION 8 HAS LARGELY CLOSED ITSELF:
+
+deck_21 sent 8 headers, every one with C4=1. deck_22 sends 24: 19 with C4=0
+and 5 with C4=1, against poli_22's 12 (5 C4=0, 5 C4=1, 2 page 8FF). So the
+non-erase page-context header that -teletext_header_refresh was meant to add
+is already going out, and at twice poli's rate. Drop that proposal. What
+remains of section 8 is only the page 8FF time-filling header, which poli
+sends and we do not.
+
+The likely reason deck_21 looked so different here: 62 of its 68 caption
+events carried no header at all and it never repeated a header, which is what
+-teletext_header_once did. Inferred from the capture, not confirmed.
+
+SECTION 12 / ITEM 7 - THE PREMISE WAS WRONG, CLOSE IT:
+
+Grouping caption packets into events (runs of frames separated by more than
+one frame of filler):
+
+  deck_22   25 events   21 of 1 frame, 4 of 2 frames
+  poli_22   16 events   all 16 of 1 frame
+  poli_21   24 events   all 24 of 1 frame
+
+Event shapes are now close:
+
+  deck_22   [22,0] x9   [0,20] x8   [20,22] x4   [0,20,22,0] x3   [0,20,20,22] x1
+  poli_22   [0] x6      [0,20] x5   [20,22] x4   [22,0] x1
+  poli_21   [22,0] x10  [0] x7      [0,20] x5    [20,22] x2
+
+One frame per caption event is what the reference does, so it is not a defect
+and not worth chasing. 17 of deck_22's 25 events carry a single text row; so
+do 6 of poli_22's 16 and 15 of poli_21's 24. That is a rolling caption sending
+the row that changed, in both.
+
+What is left of section 12 is smaller than it looked:
+  - -teletext_burst_frames is documented as retransmitting for 8 frames and
+    is observed doing 1 or 2. Its behaviour does not match its description.
+    Worth a -loglevel debug run on the "Teletext: burst row" lines; it is a
+    documentation/behaviour mismatch, not a delivery bug, now that the
+    reference is known to behave the same way.
+  - deck runs 25 events per 500 frames against poli's 16, and sends 24 header
+    packets against poli's 12.
+  - poli emits header-only events (6 in poli_22, 7 in poli_21); deck emits
+    none.
+
+ONE THING TO WATCH, NOT YET EXPLAINED:
+
+Read as continuous prose, the transmitted caption text has gaps in BOTH
+captures - lines of dialogue that never appear on air. A capture cannot
+distinguish a line that was never generated from one that was generated and
+dropped, and poli shows the same pattern, so this is not evidence against the
+deck. It is the one thing worth resolving with the debug log rather than
+another capture.
+
+REVISED ORDER OF REMAINING WORK:
+
+  1. Regression checker (still item 1, still first - it would have produced
+     this whole section automatically).
+  2. Section 2: set the -teletext_vbi_offset default to 6 and correct the
+     comment. Production, the service provider's eyeballed value and poli all
+     agree on ~6; only the code default of 26 does not.
+  3. Section 3: sine-squared edge mode, -teletext_rise_ns, fractional offset.
+  4. -teletext_burst_frames: reconcile behaviour with its documentation.
+  5. Sections 9 and 10, and the page 8FF filler header left over from 8.
