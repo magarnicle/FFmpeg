@@ -171,6 +171,9 @@ struct decklink_ctx {
     int teletext_row_index;          /* Current row index for cycling */
     int teletext_rows_sent;          /* Row transmissions since this page was stored */
     uint8_t teletext_last_header[42];/* Most recent page header, for the cleardown */
+    uint8_t teletext_cleardown_rows[5][42]; /* OP-42 s7 blank page: erase header + blanked rows */
+    int teletext_cleardown_count;    /* Rows in the built cleardown page */
+    int teletext_cleardown_index;    /* Carousel position within the cleardown page */
     int teletext_have_header;        /* teletext_last_header holds a real header */
     int has_teletext_data;           /* Whether we have valid teletext data */
     int teletext_erase_pending;      /* Header still carries C4=1; clear it after first transmission */

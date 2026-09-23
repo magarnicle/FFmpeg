@@ -2611,6 +2611,42 @@ static const uint8_t *teletext_build_dummy(struct decklink_ctx *ctx)
     return p;
 }
 
+/* Build the OP-42 s7 cleardown as a real page rather than a bare header: the
+ * page header with C4 (erase page) set, followed by an emptied copy of every
+ * display row the current page used -- same row address, forty spaces, no Start
+ * Box. Returns the number of rows built.
+ *
+ * Sending the header on its own, which is what this used to do, gives a strict
+ * receiver an empty page reception: page opened, erased, terminated with no
+ * rows. A receiver that treats an empty reception as nothing to commit keeps
+ * the last good version of page 801 and puts the caption straight back up,
+ * where it then sits until the next caption or the ten-second repeat of this
+ * cleardown. Blanking the rows makes the reception non-empty, so the page that
+ * gets committed is the blank one.
+ */
+static int teletext_build_cleardown(struct decklink_ctx *ctx)
+{
+    int n = 0;
+
+    if (!ctx->teletext_have_header)
+        return 0;
+    memcpy(ctx->teletext_cleardown_rows[n], ctx->teletext_last_header, 42);
+    uint8_t nib = ham84_decode[ctx->teletext_cleardown_rows[n][5]];
+    if (nib != 0xFF)
+        ctx->teletext_cleardown_rows[n][5] = ham84_encode[(nib & 0x07) | 0x08];
+    n++;
+
+    for (int i = 0; i < ctx->teletext_row_count && n < 5; i++) {
+        int row = teletext_row_address(ctx->teletext_rows[i]);
+        if (row < 1 || row > 24)
+            continue;                       /* header, or not a display row */
+        memcpy(ctx->teletext_cleardown_rows[n], ctx->teletext_rows[i], 2);  /* MRAG */
+        memset(ctx->teletext_cleardown_rows[n] + 2, 0x20, 40);              /* spaces */
+        n++;
+    }
+    return n;
+}
+
 /* Filler teletext data unit for HD VANC (OP-47 SDP format)
  * Contains dummy header per OP-42 Section 8 (page 8FF)
  * Structure: data_unit_id (0x02=non-subtitle), length (0x2C=44),
@@ -3033,7 +3069,6 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
     const uint8_t *data_to_send;
     const uint8_t *data_f2 = NULL;   /* field-2 override for dual-field; NULL = copy field 1 */
     int data_is_filler = 0;          /* set when data_to_send came from the filler builder */
-    uint8_t cleardown[42];
     if (!ctx->has_teletext_data) {
         /* Lead-in, before any caption has arrived: filler so the line is never
          * dead and the decoder clock stays locked (or blank if blank_idle). */
@@ -3046,19 +3081,32 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
          * P801 with C4=1, no StartBox) and drop to continuous filler,
          * repeating the cleardown every 10s. */
         if (ctx->teletext_idle_frames % frames_10s < 5 && ctx->teletext_have_header) {
-            /* Build the erase from the last page header we saw, not from
-             * teletext_rows[0]. Index 0 is not always the header -- the encoder
-             * stores pages as [r22, header] and [r20, r22] too -- and setting
-             * "C4" on byte 5 of a text row rewrites a display character into a
-             * Hamming codeword and re-sends the caption instead of erasing it. */
-            memcpy(cleardown, ctx->teletext_last_header, 42);
-            uint8_t nib = ham84_decode[cleardown[5]];
-            if (nib != 0xFF)
-                cleardown[5] = ham84_encode[(nib & 0x07) | 0x08];  /* set C4=1 */
-            data_to_send = cleardown;   /* erase command -- always sent, never blanked */
+            /* Built once at the start of each five-frame cleardown, then cycled
+             * through with the same two-slot rule as a caption so the header
+             * always leads and the page is terminated after its rows. */
+            if (ctx->teletext_idle_frames % frames_10s == 0) {
+                ctx->teletext_cleardown_count = teletext_build_cleardown(ctx);
+                ctx->teletext_cleardown_index = 0;
+            }
+            if (ctx->teletext_cleardown_count > 0) {
+                int *idx = &ctx->teletext_cleardown_index;
+                data_to_send = ctx->teletext_cleardown_rows[*idx];
+                *idx = (*idx + 1) % ctx->teletext_cleardown_count;
+                if (ctx->teletext_fields == TELETEXT_FIELDS_BOTH
+                    && ctx->teletext_cleardown_count > 1) {
+                    if (*idx == 0) {
+                        data_f2 = ctx->teletext_spare_p8ff
+                                      ? teletext_build_dummy(ctx) : data_to_send;
+                    } else {
+                        data_f2 = ctx->teletext_cleardown_rows[*idx];
+                        *idx = (*idx + 1) % ctx->teletext_cleardown_count;
+                    }
+                }
+            }
             av_log(avctx, AV_LOG_DEBUG,
-                   "Teletext: idle cleardown (pts=%"PRId64" idle=%d)\n",
-                   ctx->last_pts, ctx->teletext_idle_frames);
+                   "Teletext: idle cleardown (pts=%"PRId64" idle=%d rows=%d)\n",
+                   ctx->last_pts, ctx->teletext_idle_frames,
+                   ctx->teletext_cleardown_count);
         } else {
             data_to_send = ctx->teletext_blank_idle ? NULL : teletext_build_filler(ctx);
             data_is_filler = data_to_send != NULL;
