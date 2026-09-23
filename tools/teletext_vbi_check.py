@@ -660,10 +660,15 @@ def main():
         packets = [d['sliced']['bytes'] for k, d in
                    sorted(frame['lines'].items(), key=lambda kv: kv[0][1])
                    if d['sliced']]
-        has_text = any(row_address(p) in (18, 20, 22) for p in packets)
+        has_text = any(row_address(p) in (18, 20, 22)
+                       and bytes(p[5:45]).strip(b' ') for p in packets)
         for packet in packets:
             row = row_address(packet)
             if row in (18, 20, 22):
+                # A row blanked to spaces is the OP-42 cleardown, not a caption.
+                if not bytes(packet[5:45]).strip(b' '):
+                    timeline.append((frame['frame'], 'erase', None))
+                    continue
                 timeline.append((frame['frame'], 'text', bytes(packet[5:45])))
             elif row == 0 and not has_text:
                 units = HAM_DECODE.get(packet[8])   # S2 + C4 (erase page)

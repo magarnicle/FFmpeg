@@ -1,0 +1,288 @@
+Captions decoded from deck23_new.txt
+commit 07d3f68bfb, -teletext_page 801 -double_height 1 -teletext_dual_field 1
+  -teletext_filler idl -teletext_spare_p8ff 1 -teletext_header_attr 6
+
+HOW TO READ THIS, AND WHAT IT CANNOT TELL YOU
+---------------------------------------------
+This capture dropped frames. The AJA dump kept about 1 frame in 8, measured
+from the IDL filler continuity byte, which advances twice per output frame.
+The capture tool has since been fixed (commit 8b48d7af02) but was not rebuilt
+for this run.
+
+Reliable here:
+  - the text of every line listed; each captured packet is intact and error
+    free (zero parity and zero Hamming errors across the whole file)
+  - the times, which are reconstructed from the filler counter and so track
+    real output frames rather than captured ones
+
+NOT reliable here:
+  - completeness. A caption goes out over 8 frames, so roughly one frame of
+    each was captured, carrying 2 of its packets. A line missing below may
+    well have reached air; only the fixed capture tool can tell us.
+  - which lines belong together as one caption. The blank lines below group
+    by a gap of half a second or more, which is a guess, not the page
+    structure.
+
+Row 18 is the top line of a three-line caption, 20 the middle, 22 the bottom.
+An empty text is a blanked row from the OP-42 cleardown, i.e. an erase.
+
+Times are relative to the first captured frame.
+
+time           row  text
+------------------------------------------------------------------------------
+00:00:00.15    r20  >> Ginger: You can share
+00:00:00.16    r22  what you have by financially
+
+00:00:04.13    r20  (blank - erase)
+00:00:04.20    r22  supporting Hand of Hope.
+
+00:00:06.01    r20  And it is just the same
+
+00:00:09.14    r22  to someone you love.
+
+00:00:11.07    r22  You're welcome.
+
+00:00:12.21    r22  (blank - erase)
+00:00:13.04    r22  you can pass a plate
+
+00:00:15.16    r22  (blank - erase)
+00:00:15.24    r22  halfway around the world,
+
+00:00:20.00    r20  (blank - erase)
+00:00:20.08    r20  to feed those little
+
+00:00:24.16    r22  Would you help us?
+
+00:00:25.19    r20  Would you go to our website
+
+00:00:28.19    r20  give a gift that
+
+00:00:31.06    r20  in the name of Jesus,
+
+00:00:34.01    r20  (blank - erase)
+00:00:34.09    r20  >> Ginger to child:
+
+00:00:40.14    r22  there's so little waste
+
+00:00:43.01    r22  (blank - erase)
+00:00:43.09    r22  in this whole project.
+
+00:00:44.23    r20  We have the food that
+
+00:00:47.23    r20  to feed the children here
+
+00:00:51.01    r22  (blank - erase)
+00:00:51.09    r20  Then we take the bags
+
+00:00:57.22    r22  That's astounding.
+
+00:00:59.08    r20  >> Brad: It's just incredible
+00:00:59.16    r22  to see initially a small
+
+00:01:03.13    r20  (blank - erase)
+00:01:03.21    r22  becomes something much bigger.
+
+00:01:08.02    r20  We've had thousands of bags
+
+00:01:12.06    r20  (blank - erase)
+00:01:12.14    r22  in that food.
+
+00:01:14.08    r20  (blank - erase)
+00:01:14.16    r22  taken the bags in partnership
+
+00:01:16.09    r20  (blank - erase)
+00:01:16.17    r22  cut those bags up and made
+
+00:01:19.06    r20  (blank - erase)
+00:01:19.14    r20  them into the building
+00:01:19.22    r22  blocks of this facility.
+
+00:01:22.18    r20  (blank - erase)
+
+00:01:25.07    r22  (blank - erase)
+00:01:25.15    r22  incredibly well insulated
+
+00:01:30.08    r22  and long-lasting facility.
+
+00:01:33.01    r22  Now, it's becoming a preschool.
+
+00:01:35.00    r22  they'll feed the kids,
+
+00:01:36.23    r22  (blank - erase)
+00:01:37.06    r20  they'll share about
+
+00:01:38.16    r20  (blank - erase)
+00:01:38.24    r20  they'll sing praise
+
+00:01:41.13    r22  it becomes also a church.
+
+00:01:44.02    r22  really taken it in.
+
+00:01:45.20    r22  (blank - erase)
+00:01:46.03    r22  a local church that's helped
+
+00:01:48.08    r20  (blank - erase)
+
+00:01:50.13    r22  into this facility.
+
+00:01:51.09    r22  And it's just beautiful to see.
+
+00:02:02.03    r22  (blank - erase)
+
+00:02:06.21    r22  >> Sibomiso:
+
+00:02:12.23    r22  >> (Singing foreign language)
+
+00:02:18.20    r22  (blank - erase)
+
+00:02:19.20    r22  was a dream.
+
+00:02:21.00    r20  (blank - erase)
+00:02:21.08    r22  "What if we could?"
+
+00:02:24.05    r20  And now, we're seeing God say,
+
+00:02:28.05    r22  the impact that this factory
+
+00:02:31.14    r22  (blank - erase)
+
+00:02:34.08    r20  >> Brad: Oh, I mean,
+
+00:02:36.01    r20  (blank - erase)
+
+00:02:37.06    r22  employment in this area where
+
+00:02:40.00    r22  people are coming in and work.
+
+00:02:42.23    r20  (blank - erase)
+
+00:02:44.10    r22  it's going to be running
+
+00:02:46.02    r22  (blank - erase)
+00:02:46.10    r20  as a business which
+
+00:02:50.03    r22  the community.
+
+00:02:53.07    r20  (blank - erase)
+
+00:02:55.18    r22  (blank - erase)
+00:02:56.01    r20  in this
+
+00:02:59.04    r22  (blank - erase)
+00:02:59.12    r22  the bare minimum,
+
+00:03:02.01    r20  (blank - erase)
+00:03:02.09    r22  Jesus provides more than enough.
+
+00:03:04.01    r22  place is about.
+
+00:03:05.10    r20  (blank - erase)
+00:03:05.18    r20  It's a miracle of more
+
+00:03:08.00    r20  (blank - erase)
+00:03:08.08    r20  And we are seeing God do what
+
+00:03:11.18    r22  (blank - erase)
+00:03:12.01    r22  He's leading the way.
+
+00:03:13.03    r22  >> (Bags being loaded)
+
+00:03:16.11    r20  >> Ginger: You know,
+00:03:16.19    r22  I am still just amazed being
+
+00:03:18.21    r20  (blank - erase)
+
+00:03:21.17    r20  which is providing food,
+
+00:03:25.22    r22  all over Zimbabwe.
+
+00:03:29.18    r22  the children are
+
+00:03:32.15    r22  getting a good meal.
+
+00:03:34.00    r20  But now, because of this place,
+
+00:03:37.13    r22  (blank - erase)
+00:03:37.21    r20  this food at higher levels
+
+00:03:41.08    r22  (blank - erase)
+00:03:41.16    r22  even more kids.
+
+00:03:42.18    r22  It really is mind blowing.
+
+00:03:44.03    r22  (blank - erase)
+
+00:03:45.23    r20  (blank - erase)
+
+00:03:49.13    r22  full of bags of food.
+
+00:03:51.12    r22  individual children
+
+00:03:53.17    r22  (blank - erase)
+00:03:54.00    r22  whose lives are enriched.
+
+00:03:55.16    r22  (blank - erase)
+00:03:55.24    r20  A meal that goes into
+
+00:03:58.05    r20  (blank - erase)
+00:03:58.13    r22  and it provides them hope,
+
+00:04:00.21    r20  (blank - erase)
+00:04:01.04    r22  and the stamina to learn,
+
+00:04:04.15    r22  important and valued
+
+00:04:08.00    r22  they are in God's eyes.
+
+00:04:09.19    r22  (blank - erase)
+00:04:10.02    r22  to all of you for making
+
+00:04:13.02    r20  this place a reality,
+00:04:13.10    r22  a possibility because
+
+00:04:16.12    r20  (blank - erase)
+00:04:16.20    r22  love God and love other
+
+00:04:20.08    r22  "Yes, I will give, I will pray.
+
+00:04:23.20    r20  (blank - erase)
+00:04:24.03    r22  happening through Hand of Hope."
+
+00:04:27.09    r20  (blank - erase)
+00:04:27.17    r20  If you would like to do that,
+
+00:04:30.20    r20  (blank - erase)
+00:04:31.03    r22  screen, go to our website
+
+00:04:33.23    r22  (blank - erase)
+00:04:34.06    r22  things like this happening
+
+00:04:38.21    r20  (blank - erase)
+00:04:39.04    r22  every single day.
+
+00:04:40.10    r22  (blank - erase)
+
+00:04:41.06    r22  >> (Singing foreign language)
+
+00:04:48.14    r22  (blank - erase)
+
+00:04:53.23    r22  to our Joyce Meyer
+
+00:04:56.01    r22  who make this
+
+00:04:57.12    r20  and all we do possible,
+
+00:04:59.21    r20  God's Word
+
+00:05:01.22    r22  (blank - erase)
+00:05:02.05    r20  to people in
+
+00:05:04.22    r20  (blank - erase)
+
+00:05:05.23    r20  This program
+
+00:05:07.20    r22  our viewers and our partners.
+
+00:05:20.13    r22  (blank - erase)
+
+149 rows captured, of which 53 are cleardown blanks
