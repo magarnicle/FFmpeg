@@ -361,7 +361,8 @@ def analyse(path, max_edge_lines):
     frames = []
     edge_lines = []
     for index, frame in enumerate(parse_dump(path)):
-        entry = {'frame': int(frame.get('Frame', -1)), 'lines': {}}
+        entry = {'frame': int(frame.get('Frame', -1)),
+                 'dropped': frame.get('Dropped'), 'lines': {}}
         for key, data in frame['lines'].items():
             if not data['luma']:
                 continue
@@ -673,6 +674,14 @@ def main():
         if previous is not None:
             across[(data['sliced']['bytes'][13] - previous) % 256] += 1
         previous = data['sliced']['bytes'][13]
+    # The capture tool records AutoCirculate's running drop total per frame when
+    # it is new enough to do so; that is direct evidence and beats the inference
+    # from the continuity byte below.
+    drops = [int(f['dropped']) for f in frames if f.get('dropped') is not None]
+    if drops:
+        lost = drops[-1] - drops[0]
+        rep.line('Capture tool reported %d dropped frame(s) across the file' % lost)
+        rep.check(lost == 0, 'capture tool dropped no frames')
     if across:
         common = across.most_common(1)[0][0]
         rep.line('IDL continuity across captured frames: %s'
