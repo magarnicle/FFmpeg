@@ -673,13 +673,17 @@ def main():
     if shown:
         cleared = sum(1 for c in shown if c[3] == 'cleared')
         replaced = sum(1 for c in shown if c[3] == 'replaced')
-        spans = [c[1] - c[0] for c in shown]
+        # The last caption is usually still on screen when the capture stops, so
+        # its span is however much of it we caught, not how long it was up.
+        spans = [c[1] - c[0] for c in shown if c[3] in ('cleared', 'replaced')]
         rep.line('')
         rep.line('Captions: %d   cleared by a cleardown: %d   replaced by the next: %d'
                  % (len(shown), cleared, replaced))
-        rep.line('On screen for %.1f-%.1f seconds (median %.1f)'
-                 % (min(spans) / 25.0, max(spans) / 25.0,
-                    statistics.median(spans) / 25.0))
+        if spans:
+            rep.line('On screen for %.1f-%.1f seconds (median %.1f), '
+                     'excluding %d still up when the capture ended'
+                     % (min(spans) / 25.0, max(spans) / 25.0,
+                        statistics.median(spans) / 25.0, len(shown) - len(spans)))
         if args.min_cleared_pct is not None:
             pct = 100.0 * cleared / len(shown)
             rep.check(pct >= args.min_cleared_pct,
