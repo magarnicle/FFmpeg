@@ -451,6 +451,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('capture', nargs='?', help='AJA frame dump to check')
+    ap.add_argument('--captions', metavar='FILE',
+                    help='write the decoded captions, with times, to FILE')
     ap.add_argument('--strict', action='store_true',
                     help='model a strict receiver and report what it would drop')
     ap.add_argument('--self-test', action='store_true',
@@ -646,69 +648,69 @@ def main():
                       % (want, ' '.join('%02x' % b for b in sorted(leads))))
 
     # --- caption lifetime -------------------------------------------------
-    # A caption that is never erased stays on screen until the next one
-    # overwrites it, so it has no end time. Walk the packets in transmission
-    # order and ask, for each run of text rows, whether an erase header (C4=1)
-    # arrives before the next text row does.
-    # An erase that shares its frame with a caption row belongs to the caption
-    # arriving, not the one leaving: it clears the page so the new text can be
-    # written. Only a standalone erase, in a frame carrying no text at all, ends
-    # a caption at its own end time. Counting the attached ones would score a
-    # caption that lingered until it was overwritten as correctly cleared.
-    timeline = []
-    for frame in frames:
-        packets = [d['sliced']['bytes'] for k, d in
-                   sorted(frame['lines'].items(), key=lambda kv: kv[0][1])
-                   if d['sliced']]
-        has_text = any(row_address(p) in (18, 20, 22)
-                       and bytes(p[5:45]).strip(b' ') for p in packets)
-        for packet in packets:
-            row = row_address(packet)
-            if row in (18, 20, 22):
-                # A row blanked to spaces is the OP-42 cleardown, not a caption.
-                if not bytes(packet[5:45]).strip(b' '):
-                    timeline.append((frame['frame'], 'erase', None))
-                    continue
-                timeline.append((frame['frame'], 'text', bytes(packet[5:45])))
-            elif row == 0 and not has_text:
-                units = HAM_DECODE.get(packet[8])   # S2 + C4 (erase page)
-                if units is not None and units & 0x08:
-                    timeline.append((frame['frame'], 'erase', None))
-    captions = 0
-    cleared = 0
-    gaps = []
-    last_text = None
-    pending = False
-    for frame_no, kind, payload in timeline:
-        if kind == 'text':
-            if payload != last_text:
-                if pending:
-                    captions += 1        # replaced without an erase
-                if last_text is not None:
-                    gaps.append(frame_no - last_seen)
-                pending = True
-                last_text = payload
-            last_seen = frame_no
-        elif kind == 'erase' and pending:
-            captions += 1
-            cleared += 1
-            pending = False
-            last_text = None
-    if pending:
-        captions += 1
-    if captions:
+    # Built from the strict receiver model. A caption is on screen from the
+    # first frame its page is committed until something clears it -- either the
+    # blank page of an OP-42 cleardown, or the erase that comes with the next
+    # caption. Retransmissions within a burst are the same caption, not new
+    # ones, and a committed page whose rows are all blank is a cleardown.
+    events, _, _ = strict_receive(frames)
+    shown = []
+    for frame_no, kind, page, rows in events:
+        content = tuple(sorted((r, t) for r, t in rows.items() if t))
+        if kind == 'show':
+            if not content:                      # blank page: a cleardown
+                if shown and shown[-1][3] is None:
+                    shown[-1][1], shown[-1][3] = frame_no, 'cleared'
+                continue
+            if shown and shown[-1][2] == content and shown[-1][3] is None:
+                continue                         # same caption still bursting
+            if shown and shown[-1][3] is None:
+                shown[-1][1], shown[-1][3] = frame_no, 'replaced'
+            shown.append([frame_no, None, content, None])
+    if shown and shown[-1][1] is None:
+        shown[-1][1] = frames[-1]['frame']
+        shown[-1][3] = 'still up at end of capture'
+    if shown:
+        cleared = sum(1 for c in shown if c[3] == 'cleared')
+        replaced = sum(1 for c in shown if c[3] == 'replaced')
+        spans = [c[1] - c[0] for c in shown]
         rep.line('')
-        pct = 100.0 * cleared / captions
-        rep.line('Captions: %d   ended by a standalone erase: %d (%.0f%%)'
-                 % (captions, cleared, pct))
-        if gaps:
-            rep.line('Frames between captions: median %.0f, %d of %d closer than '
-                     '8 frames' % (statistics.median(gaps),
-                                   sum(1 for g in gaps if g < 8), len(gaps)))
+        rep.line('Captions: %d   cleared by a cleardown: %d   replaced by the next: %d'
+                 % (len(shown), cleared, replaced))
+        rep.line('On screen for %.1f-%.1f seconds (median %.1f)'
+                 % (min(spans) / 25.0, max(spans) / 25.0,
+                    statistics.median(spans) / 25.0))
         if args.min_cleared_pct is not None:
+            pct = 100.0 * cleared / len(shown)
             rep.check(pct >= args.min_cleared_pct,
-                      'at least %.0f%% of captions end with an erase (got %.0f%%)'
+                      'at least %.0f%% of captions end with a cleardown (got %.0f%%)'
                       % (args.min_cleared_pct, pct))
+        if args.captions:
+            def timecode(f):
+                sec = f / 25.0
+                return '%02d:%02d:%02d.%02d' % (int(sec // 3600), int(sec // 60) % 60,
+                                                int(sec) % 60,
+                                                int(round((sec - int(sec)) * 25)))
+            with open(args.captions, 'w') as out:
+                out.write('Captions decoded from %s\n\n' % args.capture)
+                out.write('Reconstructed with the strict receiver model. A caption is on\n'
+                          'screen from the frame its page is committed until something\n'
+                          'clears it: "cleared" is the blank page of an OP-42 cleardown,\n'
+                          '"replaced" is the erase that arrives with the next caption.\n'
+                          'Times are 25fps from the first captured frame.\n\n')
+                out.write('%-13s %-13s %-6s %-9s %s\n'
+                          % ('on', 'off', 'secs', 'ended by', 'caption'))
+                out.write('%s\n' % ('-' * 78))
+                for first, last, content, how in shown:
+                    lines = [t for _, t in content]
+                    out.write('%-13s %-13s %-6.1f %-9s %s\n'
+                              % (timecode(first), timecode(last),
+                                 (last - first) / 25.0, how, lines[0]))
+                    for extra in lines[1:]:
+                        out.write('%-13s %-13s %-6s %-9s %s\n' % ('', '', '', '', extra))
+                out.write('\n%d captions: %d cleared, %d replaced\n'
+                          % (len(shown), cleared, replaced))
+            rep.line('Caption list written to %s' % args.captions)
 
     # --- per-field behaviour ---------------------------------------------
     rep.line('')
