@@ -257,6 +257,77 @@ def ten_ninety(profile_x, profile_y, rising):
     return (second - first) * NS_PER_SAMPLE
 
 
+def strict_receive(frames):
+    """Model a strict WST receiver and report what it would and would not show.
+
+    ETS 300 706 s9.3.1: with the magazine-serial flag clear, a page being
+    received is terminated by the next header in the SAME magazine. Rows that
+    arrive while no page of their magazine is open are discarded -- that is the
+    difference between a lenient decoder, which tends to keep a row buffer and
+    paint whatever arrives, and a strict one, which drops them.
+
+    Returns a list of events and a tally of the ways a page can fail to land.
+    """
+    events = []
+    tally = collections.Counter()
+    open_page = None          # (magazine, page) currently being received
+    open_rows = {}            # row -> text, for the page being received
+    displayed = None          # what the viewer is looking at
+
+    for frame in frames:
+        for key in sorted(frame['lines'], key=lambda k: k[1]):
+            data = frame['lines'][key]
+            if not data['sliced']:
+                continue
+            packet = data['sliced']['bytes']
+            a0, a1 = HAM_DECODE.get(packet[3]), HAM_DECODE.get(packet[4])
+            if a0 is None or a1 is None:
+                tally['unreadable address'] += 1
+                continue
+            address = a0 | (a1 << 4)
+            magazine = address & 7 or 8
+            row = address >> 3
+            frame_no = frame['frame']
+
+            if row == 31:
+                continue                      # IDL, not part of page reception
+
+            if row == 0:
+                units, tens = HAM_DECODE.get(packet[5]), HAM_DECODE.get(packet[6])
+                ctrl = HAM_DECODE.get(packet[8])
+                if units is None or tens is None or ctrl is None:
+                    tally['unreadable header'] += 1
+                    continue
+                page = '%X%X' % (tens, units)
+                # This header terminates whatever was open in this magazine.
+                if open_page and open_page[0] == magazine:
+                    if open_rows:
+                        displayed = dict(open_rows)
+                        events.append((frame_no, 'show', open_page[1], dict(open_rows)))
+                        tally['pages delivered'] += 1
+                    elif open_page[1] != 'FF':
+                        events.append((frame_no, 'blank', open_page[1], {}))
+                        tally['pages that carried no rows'] += 1
+                open_page = (magazine, page)
+                open_rows = {}
+                if ctrl & 0x08:               # C4, erase page
+                    displayed = {}
+                    events.append((frame_no, 'erase', page, {}))
+                    tally['erases'] += 1
+                continue
+
+            # A display row.
+            text = ''.join(chr(b & 0x7F) if 0x20 <= (b & 0x7F) < 0x7F else ' '
+                           for b in packet[5:45]).strip()
+            if not open_page or open_page[0] != magazine:
+                tally['rows discarded, no page open'] += 1
+                events.append((frame_no, 'orphan', None, {row: text}))
+                continue
+            open_rows[row] = text
+
+    return events, tally, displayed
+
+
 def row_address(packet):
     a0 = HAM_DECODE.get(packet[3])
     a1 = HAM_DECODE.get(packet[4])
@@ -380,6 +451,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('capture', nargs='?', help='AJA frame dump to check')
+    ap.add_argument('--strict', action='store_true',
+                    help='model a strict receiver and report what it would drop')
     ap.add_argument('--self-test', action='store_true',
                     help='check the measurement code against synthetic waveforms')
     ap.add_argument('--expect-offset', type=float, default=None,
@@ -694,6 +767,26 @@ def main():
                  % (ascending, descending))
         if args.expect_dual_field:
             rep.check(descending == 0, 'rows go out in ascending order')
+
+    if args.strict:
+        events, tally, _ = strict_receive(frames)
+        rep.line('')
+        rep.line('Strict receiver model:')
+        for name, count in tally.most_common():
+            rep.line('  %-34s %d' % (name, count))
+        orphans = tally['rows discarded, no page open']
+        rep.check(orphans == 0,
+                  'no display row arrives with its page unopened (%d did)' % orphans)
+        empty = tally['pages that carried no rows']
+        if empty:
+            rep.line('  (a page delivered with no rows blanks the display on a '
+                     'strict receiver)')
+        shown = [e for e in events if e[1] == 'show']
+        if shown:
+            rep.line('  first few deliveries:')
+            for frame_no, _, page, rows in shown[:6]:
+                rep.line('    f%-5d P8%s  %s' % (frame_no, page,
+                         ' | '.join('r%d "%s"' % (r, t) for r, t in sorted(rows.items()))))
 
     rep.line('')
     if rep.failures:
