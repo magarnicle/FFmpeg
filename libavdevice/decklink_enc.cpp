@@ -2874,7 +2874,15 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
             break;
 
         if (teletext_pkt.pts + 1 < ctx->last_pts) {
-            av_log(avctx, AV_LOG_WARNING, "Teletext packet too old, discarding\n");
+            /* A caption discarded here never reaches air, and the one before it
+             * stays on screen in its place. Log how far behind it was: a steady
+             * drift means the subtitle stream is running behind the video clock,
+             * which shows up on air as captions going missing and an earlier one
+             * lingering over them. */
+            av_log(avctx, AV_LOG_WARNING,
+                   "Teletext packet too old, discarding (pts=%"PRId64" last_pts=%"PRId64
+                   " behind by %"PRId64" frames)\n",
+                   teletext_pkt.pts, ctx->last_pts, ctx->last_pts - teletext_pkt.pts);
             av_packet_unref(&teletext_pkt);
             continue;
         }
@@ -3088,16 +3096,27 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
          * bit, so the header still erases correctly whichever field it lands on. */
         if (ctx->teletext_dual_field && ctx->teletext_row_count > 1
             && ctx->teletext_fields == TELETEXT_FIELDS_BOTH) {
-            /* -teletext_spare_p8ff: when the carousel has just wrapped, field 2
-             * has no further row of this caption to carry. Sending the wrapped
-             * row again re-sends the page header; Polistream instead drops an
-             * OP-42 s8 P8FF time-filling header into that slot. Measured, 7 of
-             * its 8 P8FF packets across poli_21 and poli_22 sit exactly there,
-             * in the second field of a frame whose first field carried row 22.
-             * Leaving the carousel index alone keeps the next frame starting at
-             * the top of the page. */
-            if (ctx->teletext_spare_p8ff && ctx->teletext_row_index == 0)
-                data_f2 = teletext_build_dummy(ctx);
+            /* Never start a new page cycle in field 2. If the carousel has just
+             * wrapped, this field has no further row of the caption to carry,
+             * and taking the next entry would put the page header in field 2 --
+             * after the rows it belongs with. The cycle then free-runs out of
+             * phase: a three-row page goes out as (header, r20) (r22, header)
+             * (r20, r22), so every third frame carries rows with no header
+             * ahead of them at all. A decoder that only accepts rows while a
+             * page is open discards those, and strict receivers showed no
+             * captions whatsoever until this was pinned.
+             *
+             * Filling the spare slot instead keeps the cycle aligned as
+             * (header, r20) (r22, filler), header first, every time.
+             * -teletext_spare_p8ff picks what goes in the slot: an OP-42 s8
+             * P8FF time-filling header, which is what Polistream sends there --
+             * 7 of its 8 P8FF packets across poli_21 and poli_22 sit in exactly
+             * this position -- or, with the option off, a repeat of the packet
+             * field 1 just carried, which is inert. Either way the carousel
+             * index is left alone so the next frame restarts at the header. */
+            if (ctx->teletext_row_index == 0)
+                data_f2 = ctx->teletext_spare_p8ff ? teletext_build_dummy(ctx)
+                                                   : data_to_send;
             else
                 data_f2 = teletext_next_row(ctx);
             /* Send the pair in ascending row order within the frame. The carousel
