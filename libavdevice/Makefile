@@ -20,6 +20,7 @@ OBJS-$(CONFIG_AUDIOTOOLBOX_OUTDEV)       += audiotoolbox.o
 OBJS-$(CONFIG_AVFOUNDATION_INDEV)        += avfoundation.o
 OBJS-$(CONFIG_CACA_OUTDEV)               += caca.o
 OBJS-$(CONFIG_DECKLINK_OUTDEV)           += decklink_enc.o decklink_enc_c.o decklink_common.o decklink_shm.o vbi_teletext.o
+OBJS-$(CONFIG_AJANTV2_OUTDEV)            += ajantv2_enc.o ajantv2_enc_c.o vbi_teletext.o
 OBJS-$(CONFIG_DECKLINK_INDEV)            += decklink_dec.o decklink_dec_c.o decklink_common.o
 OBJS-$(CONFIG_DSHOW_INDEV)               += dshow_crossbar.o dshow.o dshow_enummediatypes.o \
                                             dshow_enumpins.o dshow_filter.o \
@@ -60,6 +61,7 @@ SHLIBOBJS-$(CONFIG_DECKLINK_OUTDEV)      += ccfifo.o
 SHLIBOBJS-$(HAVE_GNU_WINDRES)            += avdeviceres.o
 
 SKIPHEADERS                              += decklink_common.h vbi_teletext.h
+SKIPHEADERS-$(CONFIG_AJANTV2)            += ajantv2_enc.h ajantv2_common_c.h
 SKIPHEADERS-$(CONFIG_DECKLINK)           += decklink_enc.h decklink_dec.h \
                                             decklink_common_c.h decklink_shm.h
 SKIPHEADERS-$(CONFIG_DSHOW_INDEV)        += dshow_capture.h

@@ -321,6 +321,7 @@ External library support:
   --enable-libzvbi         enable teletext support via libzvbi [no]
   --enable-lv2             enable LV2 audio filtering [no]
   --disable-lzma           disable lzma [autodetect]
+  --enable-ajantv2         enable AJA NTV2 output support [no]
   --enable-decklink        enable Blackmagic DeckLink I/O support [no]
   --enable-mbedtls         enable mbedTLS, needed for https support
                            if openssl, gnutls or libtls is not used [no]
@@ -1966,6 +1967,7 @@ EXTERNAL_LIBRARY_GPL_LIST="
 "
 
 EXTERNAL_LIBRARY_NONFREE_LIST="
+    ajantv2
     decklink
     libfdk_aac
     libmpeghdec
@@ -3917,6 +3919,9 @@ avfoundation_indev_extralibs="-framework Foundation"
 audiotoolbox_outdev_deps="audiotoolbox pthreads AudioObjectPropertyAddress"
 audiotoolbox_outdev_extralibs="-framework AudioToolbox -framework CoreAudio"
 caca_outdev_deps="libcaca"
+ajantv2_deps_any="libdl LoadLibrary"
+ajantv2_outdev_deps="ajantv2 threads"
+ajantv2_outdev_extralibs="-lstdc++ -lajantv2"
 decklink_deps_any="libdl LoadLibrary"
 decklink_indev_deps="decklink threads"
 decklink_indev_extralibs="-lstdc++"
@@ -7165,6 +7170,9 @@ enabled cairo             && require_pkg_config cairo cairo "cairo.h" cairo_crea
 enabled cuda_nvcc         && { check_nvcc cuda_nvcc || die "ERROR: failed checking for nvcc."; }
 enabled chromaprint       && { check_pkg_config chromaprint libchromaprint "chromaprint.h" chromaprint_get_version ||
                                require chromaprint chromaprint.h chromaprint_get_version -lchromaprint; }
+enabled ajantv2           && { require_headers ntv2card.h &&
+                               { check_cpp_condition ntv2enums.h "1" ||
+                                 die "ERROR: AJA NTV2 SDK headers not found; pass --extra-cxxflags=-I/path/to/libajantv2/ajantv2/includes"; } }
 enabled decklink          && { require_headers DeckLinkAPI.h &&
                                { test_cpp_condition DeckLinkAPIVersion.h "BLACKMAGIC_DECKLINK_API_VERSION >= 0x0a0b0000" || die "ERROR: Decklink API version must be >= 10.11"; } }
 enabled frei0r            && require_headers "frei0r.h"
