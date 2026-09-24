@@ -51,6 +51,12 @@
 
 #include <stdint.h>
 
+/* Compiled as C, but included from the C++ output devices, so the declarations
+ * need C linkage or the callers look for mangled names and the link fails. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define FF_VBI_TT_PACKET_SIZE  42   /* MRAG plus 40 data bytes */
 #define FF_VBI_TT_MAX_ROWS      5   /* rows held for one page */
 
@@ -174,5 +180,9 @@ int ff_vbi_teletext_row_address(const uint8_t *packet);
  * make a receiver clear and redraw the page it is already showing.
  */
 void ff_vbi_teletext_clear_erase_bit(uint8_t *header_row);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* AVDEVICE_VBI_TELETEXT_H */
