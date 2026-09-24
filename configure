@@ -7179,8 +7179,9 @@ enabled ajantv2           && { test_cxxflags_cc "" ntv2card.h "1" ||
 several include directories, all in --extra-cxxflags, for example:
   --extra-cxxflags='-DAJALinux -I\$AJA/ajantv2/includes -I\$AJA -I\$AJA/ajabase
                     -I\$AJA/ajantv2/src/lin -I\$AJA/build/ajantv2'
-where \$AJA is a built libajantv2 tree. build/ajantv2 holds the generated
-ntv2version.h, so the library must have been built at least once."; }
+where \$AJA is a libajantv2 tree. Linking also needs -lajantv2 from
+\$AJA/build/ajantv2, and the mbedtls that libajantv2 references for signed
+plugin loading unless it was built with -DAJANTV2_DISABLE_PLUGIN_LOAD=ON."; }
 enabled decklink          && { require_headers DeckLinkAPI.h &&
                                { test_cpp_condition DeckLinkAPIVersion.h "BLACKMAGIC_DECKLINK_API_VERSION >= 0x0a0b0000" || die "ERROR: Decklink API version must be >= 10.11"; } }
 enabled frei0r            && require_headers "frei0r.h"

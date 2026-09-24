@@ -11,7 +11,23 @@ set -e
 
 AJA=${AJA:-$PWD/libajantv2}
 [ -r "$AJA/ajantv2/includes/ntv2card.h" ] || { echo "No NTV2 SDK at $AJA" >&2; exit 1; }
-[ -r "$AJA/build/ajantv2/ntv2version.h" ] || echo "WARNING: $AJA/build/ajantv2/ntv2version.h missing; build libajantv2 first" >&2
+[ -r "$AJA/build/ajantv2/libajantv2.a" ] || echo "WARNING: $AJA/build/ajantv2/libajantv2.a missing; build libajantv2 first" >&2
+
+# libajantv2 pulls in mbedtls for signed third-party plugin loading, which this
+# device does not use, and its static library still references those symbols. If
+# the SDK's bundled mbedtls is there, link it; the alternative is to rebuild
+# libajantv2 with -DAJANTV2_DISABLE_PLUGIN_LOAD=ON, which compiles the loader
+# out and needs none of this.
+AJA_LDFLAGS="-L$AJA/build/ajantv2"
+AJA_LIBS="-lajantv2"
+MBED="$AJA/build/ajantv2/mbedtls-install/lib"
+if [ -r "$MBED/libmbedtls.a" ]; then
+    AJA_LDFLAGS="$AJA_LDFLAGS -L$MBED"
+    AJA_LIBS="$AJA_LIBS -lmbedtls -lmbedx509 -lmbedcrypto"
+    for extra in everest p256m; do
+        [ -r "$MBED/lib$extra.a" ] && AJA_LIBS="$AJA_LIBS -l$extra"
+    done
+fi
 
 AJA_CXXFLAGS="-DAJALinux -DAJA_LINUX -DAJASTATIC -DAJA_USE_CPLUSPLUS11 -DNTV2_USE_CPLUSPLUS11"
 AJA_CXXFLAGS="$AJA_CXXFLAGS -I$AJA/ajantv2/includes -I$AJA -I$AJA/ajabase"
@@ -23,8 +39,8 @@ PATH="$HOME/bin:$PATH" PKG_CONFIG_PATH="$HOME/ffmpeg_build/lib/pkgconfig:/usr/bi
 --pkg-config-flags="--static" \
 --extra-cflags="-I$HOME/ffmpeg_build/include -I$HOME/ffmpeg_sources/Blackmagic_DeckLink_SDK_15.0/Linux/include" \
 --extra-cxxflags="-I$HOME/ffmpeg_build/include -I$HOME/ffmpeg_sources/Blackmagic_DeckLink_SDK_15.0/Linux/include $AJA_CXXFLAGS" \
---extra-ldflags="-L$HOME/ffmpeg_build/lib -L$AJA/build/ajantv2" \
---extra-libs="-lpthread -lstdc++exp -lm" \
+--extra-ldflags="-L$HOME/ffmpeg_build/lib $AJA_LDFLAGS" \
+--extra-libs="-lpthread -lstdc++exp -lm $AJA_LIBS" \
 --bindir="$HOME/bin" \
 --enable-debug=3 \
 --disable-stripping \
