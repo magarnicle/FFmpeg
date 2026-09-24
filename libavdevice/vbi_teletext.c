@@ -716,6 +716,12 @@ void ff_vbi_teletext_frame(FFVbiTeletextContext *s, int stored_new,
      * caption a second past its end time, which is a caption clearing late.
      * Eight frames is what the dwell was when burst_frames defaulted to 8.
      *
+     * row_index == 0 holds the erase to a page-cycle boundary. The cleardown's
+     * header terminates whatever page is open, so firing it halfway through a
+     * cycle commits a partial page: the caption appears with a line missing for
+     * one frame, then blanks. Waiting for the cycle to finish means the page
+     * committed is complete, and identical to what is already on screen.
+     *
      * An earlier revision dropped the burst_frames half, on the reading that
      * captions arriving closer together than burst_frames could never reach the
      * erase. On-air logs show caption bursts running their full eight frames
@@ -727,6 +733,7 @@ void ff_vbi_teletext_frame(FFVbiTeletextContext *s, int stored_new,
         && now_pts >= s->caption_end_pts
         && s->idle_frames >= FFMIN(s->cfg.burst_frames, 8)
         && s->rows_sent >= s->row_count
+        && s->row_index == 0
         && s->idle_frames < frames_10s) {
         /* teletext_defer_erase off (default): promptly clear the caption at its end
          * time via the OP-42 s7 cleardown. On: skip this, so no standalone erase
@@ -796,14 +803,19 @@ void ff_vbi_teletext_frame(FFVbiTeletextContext *s, int stored_new,
     } else if (s->row_count > 0
                && (s->cfg.continuous
                    || s->idle_frames < s->cfg.burst_frames
-                   || s->rows_sent < s->row_count)) {
+                   || s->rows_sent < s->row_count
+                   || s->row_index != 0)) {
         /* The teletext_rows_sent test is a floor under teletext_burst_frames:
          * keep transmitting until every row of the page has gone out at least
          * once, however short the burst is set. Dual-field sends two rows per
          * frame, so a three- or four-row page needs two frames, and a burst of
          * one would have left the last row -- usually the bottom line of the
          * caption -- never transmitted at all. On-air logs show 3- and 4-row
-         * pages making up over half the captions. */
+         * pages making up over half the captions.
+         *
+         * row_index keeps it going to the end of the page cycle, for the same
+         * reason the erase waits for one: a burst that stops mid-cycle leaves a
+         * partial page for the next header to commit. */
         /* Active or recently-updated caption. Two modes:
          *   Burst (default): retransmit the stored page only for the first
          *     teletext_burst_frames after each update, then stop and drop to
