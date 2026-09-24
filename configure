@@ -7170,9 +7170,17 @@ enabled cairo             && require_pkg_config cairo cairo "cairo.h" cairo_crea
 enabled cuda_nvcc         && { check_nvcc cuda_nvcc || die "ERROR: failed checking for nvcc."; }
 enabled chromaprint       && { check_pkg_config chromaprint libchromaprint "chromaprint.h" chromaprint_get_version ||
                                require chromaprint chromaprint.h chromaprint_get_version -lchromaprint; }
-enabled ajantv2           && { require_headers ntv2card.h &&
-                               { check_cpp_condition ntv2enums.h "1" ||
-                                 die "ERROR: AJA NTV2 SDK headers not found; pass --extra-cxxflags=-I/path/to/libajantv2/ajantv2/includes"; } }
+# The NTV2 SDK is C++ and spreads its headers over several directories, so this
+# has to be a C++ compile against CXXFLAGS rather than a preprocessor check on
+# one header: nothing in the SDK, ajatypes.h included, parses with a single -I
+# or without the platform define.
+enabled ajantv2           && { test_cxxflags_cc "" ntv2card.h "1" ||
+                               die "ERROR: AJA NTV2 SDK not usable. It needs the platform define and
+several include directories, all in --extra-cxxflags, for example:
+  --extra-cxxflags='-DAJALinux -I\$AJA/ajantv2/includes -I\$AJA -I\$AJA/ajabase
+                    -I\$AJA/ajantv2/src/lin -I\$AJA/build/ajantv2'
+where \$AJA is a built libajantv2 tree. build/ajantv2 holds the generated
+ntv2version.h, so the library must have been built at least once."; }
 enabled decklink          && { require_headers DeckLinkAPI.h &&
                                { test_cpp_condition DeckLinkAPIVersion.h "BLACKMAGIC_DECKLINK_API_VERSION >= 0x0a0b0000" || die "ERROR: Decklink API version must be >= 10.11"; } }
 enabled frei0r            && require_headers "frei0r.h"
