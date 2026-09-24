@@ -70,7 +70,8 @@ extern "C" {
 
 struct ajantv2_ctx {
     CNTV2Card           device;
-    NTV2Channel         channel;
+    NTV2Channel         channel;              /* framestore */
+    std::vector<NTV2Channel> outputs;          /* SDI connectors fed from it */
     NTV2VideoFormat     video_format;
     NTV2PixelFormat     pixel_format;
     NTV2VANCMode        vanc_mode;
@@ -203,13 +204,33 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                ctx->tt_row_f1, ctx->tt_row_f2);
     }
 
-    /* Route the framestore to the matching SDI output. */
-    const NTV2OutputCrosspointID fsOut(::GetFrameBufferOutputXptFromChannel(ctx->channel));
-    const NTV2InputCrosspointID  sdiIn (::GetSDIOutputInputXpt(ctx->channel));
-    ctx->device.Connect(sdiIn, fsOut);
-    ctx->device.SetSDITransmitEnable(ctx->channel, true);
-    ctx->device.SetSDIOutputStandard(ctx->channel,
-                                     ::GetNTV2StandardFromVideoFormat(ctx->video_format));
+    /* Route the framestore to every requested SDI connector. One framestore can
+     * feed several, which is how a card with two outputs mirrors the same
+     * picture, so this is a list rather than a single choice. */
+    {
+        const NTV2OutputCrosspointID fsOut(::GetFrameBufferOutputXptFromChannel(ctx->channel));
+        const NTV2Standard std(::GetNTV2StandardFromVideoFormat(ctx->video_format));
+        const UWord num_outputs(ctx->device.features().GetNumVideoOutputs());
+        std::string listed;
+
+        for (size_t n = 0; n < ctx->outputs.size(); n++) {
+            const NTV2Channel out(ctx->outputs[n]);
+            if (num_outputs && UWord(out) >= num_outputs) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "SDI output %d requested but this device has %u\n",
+                       int(out) + 1, num_outputs);
+                return AVERROR(EINVAL);
+            }
+            ctx->device.Connect(::GetSDIOutputInputXpt(out), fsOut);
+            ctx->device.SetSDITransmitEnable(out, true);
+            ctx->device.SetSDIOutputStandard(out, std);
+            listed += (n ? ", " : "");
+            listed += std::to_string(int(out) + 1);
+        }
+        av_log(avctx, AV_LOG_INFO, "Framestore %d -> SDI output%s %s\n",
+               int(ctx->channel) + 1, ctx->outputs.size() > 1 ? "s" : "",
+               listed.c_str());
+    }
 
     if (!ctx->host_buffer.Allocate(ctx->frame_size, true)) {
         av_log(avctx, AV_LOG_ERROR, "Cannot allocate a %u-byte frame buffer\n",
@@ -326,6 +347,32 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
     cctx->ctx = ctx;
     ctx->last_pts = AV_NOPTS_VALUE;
     ctx->channel = (NTV2Channel)(cctx->channel > 0 ? cctx->channel - 1 : 0);
+
+    /* -output takes a comma-separated list of 1-based SDI connectors. Empty
+     * means the connector matching the framestore, which is the usual case. */
+    if (cctx->output && *cctx->output) {
+        const char *p = cctx->output;
+        while (*p) {
+            char *end = NULL;
+            long v = strtol(p, &end, 10);
+            if (end == p) {
+                av_log(avctx, AV_LOG_ERROR, "Cannot parse -output '%s'\n", cctx->output);
+                ret = AVERROR(EINVAL);
+                goto fail;
+            }
+            if (v < 1 || v > 8) {
+                av_log(avctx, AV_LOG_ERROR, "SDI output %ld out of range 1-8\n", v);
+                ret = AVERROR(EINVAL);
+                goto fail;
+            }
+            ctx->outputs.push_back((NTV2Channel)(v - 1));
+            p = end;
+            while (*p == ',' || *p == ' ')
+                p++;
+        }
+    }
+    if (ctx->outputs.empty())
+        ctx->outputs.push_back(ctx->channel);
 
     for (i = 0; i < avctx->nb_streams; i++) {
         AVStream *st = avctx->streams[i];

@@ -33,7 +33,8 @@
  * A playout command line should move between the two cards by changing only the
  * format and the device name. */
 static const AVOption options[] = {
-    { "channel", "NTV2 channel to output on (1-based)", OFFSET(channel), AV_OPT_TYPE_INT, { .i64 = 1 }, 1, 8, ENC },
+    { "channel", "framestore to play from (1-based)", OFFSET(channel), AV_OPT_TYPE_INT, { .i64 = 1 }, 1, 8, ENC },
+    { "output", "SDI connector(s) to feed, 1-based, comma-separated for more than one (e.g. \"2\" or \"1,2\"); default is the connector matching the framestore", OFFSET(output), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "ring_frames", "AutoCirculate output ring depth in frames", OFFSET(ring_frames), AV_OPT_TYPE_INT, { .i64 = 8 }, 2, 64, ENC },
 
     { "teletext_fields", "teletext field insertion mode", OFFSET(teletext_fields), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, ENC, .unit = "teletext_fields" },

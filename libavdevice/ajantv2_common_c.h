@@ -31,7 +31,9 @@ struct ajantv2_cctx {
     void *ctx;                  /* struct ajantv2_ctx, C++ side */
 
     /* Device */
-    int      channel;           /* NTV2 channel, 1-based on the command line */
+    int      channel;           /* framestore to play from, 1-based */
+    char    *output;            /* SDI connectors to feed, e.g. "2" or "1,2";
+                                   NULL means the one matching the framestore */
     int      ring_frames;       /* AutoCirculate frame ring depth */
 
     /* Teletext. These mirror the DeckLink output's names so a playout command
