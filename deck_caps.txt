@@ -1,22 +1,30 @@
-Captions decoded from test.txt
+Captions decoded from deck_1_in_2.txt
 
-Reconstructed with the strict receiver model. A caption is on
-screen from the frame its page is committed until something
-clears it: "cleared" is the blank page of an OP-42 cleardown,
-"replaced" is the erase that arrives with the next caption.
-Times are 25fps from the first captured frame.
+CAVEAT: this capture kept about 1 frame in 2.7 (measured from the IDL
+continuity byte; the tool reported 873 dropped). A caption's page goes out
+four times over its eight-frame burst, so its text is recovered from
+whichever of those deliveries were captured, and the union of rows seen
+across a caption is shown. Text should be right. A row that is genuinely
+missing on air and one that fell in a dropped frame look the same here,
+and the times are good to about +/-3 frames.
 
-on            off           secs   ended by  caption
-------------------------------------------------------------------------------
-00:00:02.05   00:00:04.21   2.6    replaced  and thousands of people crammed
-                                             together.
-00:00:04.21   00:00:08.05   3.4    replaced  And they have no schools, no
-                                             sanitation.
-00:00:08.05   00:00:11.16   3.4    replaced  They would have running water
-                                             and sewage right through
-00:00:11.16   00:00:14.00   2.4    cleared   the middle of their pavements and
-                                             whatnot.
-00:00:16.00   00:00:20.01   4.0    still up at end of capture Her and just a group of
-                                             12 women began to take on
+on        off       rows caption
+--------------------------------------------------------------------------
+00:01.11  00:03.02  20,22 How can it impact those,
+                         Sarah, relationships?
+00:03.20  00:03.21  20,22 Obviously these guys have learned
+                         it well.
+00:04.13  00:07.04  20,22 not even aware of what our
+                         - Yeah.
+00:07.05  00:07.18  20   So I think, when we talk
+00:07.19  00:08.12  20   really what we're talking
+00:08.13  00:12.09  20,22 not intentionally, but it's
+                         just through not investing
+00:14.06  00:15.07  20,22 into each other the way that maybe
+                         when we were dating.
+00:15.08  00:18.06  20,22 and each other's love
+                         languages is a really great way
+00:18.07  00:19.20  20,22 And Dr. Gary Chapman
+                         talks about love tanks.
 
-5 captions: 1 cleared, 3 replaced
+9 captions
