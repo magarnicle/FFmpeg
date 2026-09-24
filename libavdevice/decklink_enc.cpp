@@ -3028,13 +3028,19 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
      * caption's end_pts is already <= last_pts on arrival, from a short display
      * duration or captions delivered at or behind the video clock.
      *
-     * Two conditions, and both are needed. teletext_idle_frames >=
-     * teletext_burst_frames keeps a caption on air for its burst even when its
-     * end time had already passed when it arrived, which is what a short display
-     * duration or delivery behind the video clock looks like; without it the
-     * caption is cut to a single frame. teletext_rows_sent >= teletext_row_count
-     * additionally requires that the page has actually been transmitted, so a
-     * page whose rows have not all gone out is never erased from under itself.
+     * Two conditions, and both are needed. A minimum dwell keeps a caption on
+     * air even when its end time had already passed when it arrived, which is
+     * what a short display duration or delivery behind the video clock looks
+     * like; without it the caption is cut to a single frame. teletext_rows_sent
+     * >= teletext_row_count additionally requires that the page has actually
+     * been transmitted, so a page whose rows have not all gone out is never
+     * erased from under itself.
+     *
+     * The dwell is capped at 8 frames rather than being teletext_burst_frames
+     * itself. The burst is redundancy and can be set long -- 25 frames helps a
+     * receiver that misses packets -- but tying the erase to it held every
+     * caption a second past its end time, which is a caption clearing late.
+     * Eight frames is what the dwell was when burst_frames defaulted to 8.
      *
      * An earlier revision dropped the burst_frames half, on the reading that
      * captions arriving closer together than burst_frames could never reach the
@@ -3045,7 +3051,7 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
         && ctx->has_teletext_data && !stored_new
         && ctx->teletext_caption_end_pts != AV_NOPTS_VALUE
         && ctx->last_pts >= ctx->teletext_caption_end_pts
-        && ctx->teletext_idle_frames >= ctx->teletext_burst_frames
+        && ctx->teletext_idle_frames >= FFMIN(ctx->teletext_burst_frames, 8)
         && ctx->teletext_rows_sent >= ctx->teletext_row_count
         && ctx->teletext_idle_frames < frames_10s) {
         /* teletext_defer_erase off (default): promptly clear the caption at its end
@@ -3162,10 +3168,24 @@ static void construct_teletext_vbi_sd(AVFormatContext *avctx, struct decklink_ct
              * this position -- or, with the option off, a repeat of the packet
              * field 1 just carried, which is inert. Either way the carousel
              * index is left alone so the next frame restarts at the header. */
-            if (ctx->teletext_row_index == 0)
-                data_f2 = ctx->teletext_spare_p8ff ? teletext_build_dummy(ctx)
-                                                   : data_to_send;
-            else
+            if (ctx->teletext_row_index == 0) {
+                /* The P8FF terminates page 801 so a receiver commits it, which
+                 * is why it cannot simply be dropped. But it also opens page
+                 * 8FF, and a receiver that blanks while acquiring a new page in
+                 * the magazine shows that as the caption dipping and coming
+                 * back. Once per caption is enough: the page is committed on
+                 * the first pass and every later pass is redundancy, which
+                 * needs no further commit. Raising -teletext_burst_frames made
+                 * this visible, because twelve dips are noticeable where three
+                 * were not.
+                 *
+                 * teletext_rows_sent has just passed row_count on the first
+                 * wrap, so this is true exactly once per stored page. Later
+                 * wraps repeat what field 1 carried, which is inert. */
+                data_f2 = (ctx->teletext_spare_p8ff
+                           && ctx->teletext_rows_sent <= ctx->teletext_row_count)
+                              ? teletext_build_dummy(ctx) : data_to_send;
+            } else
                 data_f2 = teletext_next_row(ctx);
             /* Send the pair in ascending row order within the frame. The carousel
              * hands rows over in stored order, which put the bottom line of a
