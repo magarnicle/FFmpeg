@@ -24,6 +24,8 @@
 #define AVDEVICE_DECKLINK_COMMON_H
 
 #include <DeckLinkAPIVersion.h>
+
+#include "vbi_teletext.h"
 #if BLACKMAGIC_DECKLINK_API_VERSION < 0x0b000000
 #define IID_IDeckLinkProfileAttributes IID_IDeckLinkAttributes
 #define IDeckLinkProfileAttributes IDeckLinkAttributes
@@ -163,22 +165,10 @@ struct decklink_ctx {
     int teletext_filler_subcode;     /* dummy filler page subcode (0x3F7E default, Polistream=0) */
     int teletext_spare_p8ff;         /* 1 = spare dual-field slot carries a P8FF time-filling header */
     int teletext_header_attr;        /* spacing attribute in a header's first display cell (-1 = as sent) */
-    uint8_t teletext_filler_buf[42]; /* scratch: the built idle filler packet */
-    unsigned teletext_idl_ci;        /* IDL continuity counter (increments per filler packet) */
-    int teletext_defer_erase;        /* 1 = no erase/cleardown at caption end (next caption clears) */
-    uint8_t teletext_rows[5][42];    /* Stored teletext rows (up to 5 data units, 42 bytes each) */
-    int teletext_row_count;          /* Number of stored rows */
-    int teletext_row_index;          /* Current row index for cycling */
-    int teletext_rows_sent;          /* Row transmissions since this page was stored */
-    uint8_t teletext_last_header[42];/* Most recent page header, for the cleardown */
-    uint8_t teletext_cleardown_rows[5][42]; /* OP-42 s7 blank page: erase header + blanked rows */
-    int teletext_cleardown_count;    /* Rows in the built cleardown page */
-    int teletext_cleardown_index;    /* Carousel position within the cleardown page */
-    int teletext_have_header;        /* teletext_last_header holds a real header */
-    int has_teletext_data;           /* Whether we have valid teletext data */
-    int teletext_erase_pending;      /* Header still carries C4=1; clear it after first transmission */
-    int teletext_idle_frames;        /* Frames since the last caption update (for the OP-42 s7 cleardown) */
-    int64_t teletext_caption_end_pts;/* End PTS (pts+duration) of the current caption; AV_NOPTS_VALUE if unknown */
+    /* All teletext generation state lives in the device-independent module; see
+     * libavdevice/vbi_teletext.h. The option fields above are copied into
+     * tt.cfg at write_header. */
+    FFVbiTeletextContext tt;
 
     /* Streams present */
     int audio;
