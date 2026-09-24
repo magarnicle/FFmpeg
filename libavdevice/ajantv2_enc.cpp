@@ -93,21 +93,30 @@ struct ajantv2_ctx {
     ULWord               tt_row_f2;
 };
 
-/* Map the video stream's pixel format onto an NTV2 frame buffer format. v210 is
- * what the DeckLink output uses and what SD teletext wants, since the waveform
- * is rendered as 10-bit luma. */
-static bool aja_pixel_format(enum AVPixelFormat pix_fmt, NTV2PixelFormat *out)
+/* Pick the frame buffer format from the codec, the way the DeckLink output does.
+ * The pixel format of an encoded stream is not reliable at write_header time --
+ * a v210 stream has been seen reporting yuv422p there -- so the codec is what
+ * decides, and v210 is the one that can carry teletext.
+ */
+static bool aja_frame_format(AVFormatContext *avctx, AVCodecParameters *c,
+                            NTV2PixelFormat *out)
 {
-    switch (pix_fmt) {
-    case AV_PIX_FMT_YUV422P10:
-        *out = NTV2_FBF_10BIT_YCBCR;
-        return true;
-    case AV_PIX_FMT_UYVY422:
+    if (c->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+        if (c->format != AV_PIX_FMT_UYVY422) {
+            av_log(avctx, AV_LOG_ERROR, "Unsupported pixel format!"
+                   " Only AV_PIX_FMT_UYVY422 is supported for wrapped frames.\n");
+            return false;
+        }
         *out = NTV2_FBF_8BIT_YCBCR;
         return true;
-    default:
-        return false;
     }
+    if (c->codec_id == AV_CODEC_ID_V210) {
+        *out = NTV2_FBF_10BIT_YCBCR;
+        return true;
+    }
+    av_log(avctx, AV_LOG_ERROR, "Unsupported codec type!"
+           " Only V210 and wrapped frames with AV_PIX_FMT_UYVY422 are supported.\n");
+    return false;
 }
 
 static bool aja_video_format(int width, int height, AVRational fr,
@@ -136,14 +145,8 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                "and 720x486 (525i5994)\n", par->width, par->height);
         return AVERROR(EINVAL);
     }
-    if (!aja_pixel_format(static_cast<enum AVPixelFormat>(par->format),
-                          &ctx->pixel_format)) {
-        av_log(avctx, AV_LOG_ERROR,
-               "Unsupported pixel format %s; use v210 (recommended, and required "
-               "for teletext) or uyvy422\n",
-               av_get_pix_fmt_name(static_cast<enum AVPixelFormat>(par->format)));
+    if (!aja_frame_format(avctx, par, &ctx->pixel_format))
         return AVERROR(EINVAL);
-    }
 
     if (!ctx->device.features().CanDoVideoFormat(ctx->video_format)) {
         av_log(avctx, AV_LOG_ERROR, "Device cannot do %s\n",
