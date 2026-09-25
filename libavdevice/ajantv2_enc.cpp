@@ -242,20 +242,36 @@ static bool aja_video_format(AVFormatContext *avctx, struct ajantv2_cctx *cctx,
         return false;
     }
 
-    *out = ::GetFirstMatchingVideoFormat(rate, (UWord)par->height, (UWord)par->width,
-                                         interlaced, false, false);
-    if (*out == NTV2_FORMAT_UNKNOWN && interlaced) {
-        /* Some 1080 sources are segmented-frame rather than true interlace, and
-         * the two are different formats to the SDK even though the raster and
-         * rate match. Try PSF before giving up. */
+    /* Ask for what the stream says it is, then fall back. Some 1080 sources are
+     * segmented-frame rather than true interlace, and those are different
+     * formats to the SDK even though the raster and rate match. And a raster
+     * can have only one scan: there is exactly one 720x576 format and one
+     * 720x486 one, so refusing an SD stream because it calls itself
+     * progressive helps nobody. Take the scan the stream claims as a
+     * preference, not a requirement. */
+    *out = ::GetFirstMatchingVideoFormat(rate, (UWord)par->height,
+                                         (UWord)par->width, interlaced, false, false);
+    if (*out == NTV2_FORMAT_UNKNOWN && interlaced)
         *out = ::GetFirstMatchingVideoFormat(rate, (UWord)par->height,
                                             (UWord)par->width, true, false, true);
+    if (*out == NTV2_FORMAT_UNKNOWN) {
+        *out = ::GetFirstMatchingVideoFormat(rate, (UWord)par->height,
+                                            (UWord)par->width, !interlaced, false, false);
+        if (*out != NTV2_FORMAT_UNKNOWN)
+            av_log(avctx, AV_LOG_WARNING,
+                   "The stream says %s, and there is no %s format at %dx%d and "
+                   "%d/%d, so %s it is. Pass -format_code to say outright.\n",
+                   interlaced ? "interlaced" : "progressive",
+                   interlaced ? "interlaced" : "progressive",
+                   par->width, par->height, fr.num, fr.den,
+                   ::NTV2VideoFormatToString(*out).c_str());
     }
     if (*out == NTV2_FORMAT_UNKNOWN) {
         av_log(avctx, AV_LOG_ERROR,
                "No NTV2 video format for %dx%d %s at %d/%d\n",
                par->width, par->height, interlaced ? "interlaced" : "progressive",
                fr.num, fr.den);
+        aja_log_formats(avctx);
         return false;
     }
     av_log(avctx, AV_LOG_INFO, "%dx%d %s %d/%d -> %s\n",
