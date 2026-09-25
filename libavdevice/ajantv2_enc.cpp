@@ -416,11 +416,22 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 #if CONFIG_LIBKLVANC
     /* Captions arriving as A53 side data are written into HD VANC, which needs
      * the region present in the frame buffer and 10-bit pixels to hold it. */
-    ctx->cc_enabled = !NTV2_IS_625_FORMAT(ctx->video_format) &&
+    ctx->cc_enabled = cctx->cc && !NTV2_IS_625_FORMAT(ctx->video_format) &&
                       ctx->pixel_format == NTV2_FBF_10BIT_YCBCR;
 #endif
-    ctx->vanc_mode = (ctx->teletext_enabled || AJA_CC_ENABLED(ctx))
-                         ? NTV2_VANCMODE_TALLER : NTV2_VANCMODE_OFF;
+
+    /* How much of the blanking the frame buffer has to hold. TALLER reaches SD
+     * line 21, which is the only reason to ask for it; HD captions sit on line
+     * 11, which TALL already covers (its first row is SMPTE line 10). TALL is
+     * the ordinary HD VANC geometry, so prefer it: it is the one an old card is
+     * likelier to have firmware for. Without either, the frame buffer is the
+     * picture and nothing else, which is the plainest path the card has. */
+    if (ctx->teletext_enabled)
+        ctx->vanc_mode = NTV2_VANCMODE_TALLER;
+    else if (AJA_CC_ENABLED(ctx))
+        ctx->vanc_mode = NTV2_VANCMODE_TALL;
+    else
+        ctx->vanc_mode = NTV2_VANCMODE_OFF;
 
     /* Every framestore on a card that cannot do multi-format shares one video
      * format register, so another one left enabled -- by a capture run, or by
@@ -499,7 +510,15 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         const NTV2OutputCrosspointID fsOut(::GetFrameBufferOutputXptFromChannel(ctx->channel));
         const NTV2Standard std(::GetNTV2StandardFromVideoFormat(ctx->video_format));
         const UWord num_outputs(ctx->device.features().GetNumVideoOutputs());
+        const bool verify(ctx->device.features().HasCrosspointConnectROM());
         std::string listed;
+
+        /* Start from nothing. A crosspoint left over from another run -- a
+         * capture, or the AJA control panel's own routing -- can still be
+         * driving the connector we are about to connect, and on a card with a
+         * video processor in the path the leftovers decide what comes out. The
+         * SDK's player clears the routing for the same reason. */
+        ctx->device.ClearRouting();
 
         for (size_t n = 0; n < ctx->outputs.size(); n++) {
             const NTV2Channel out(ctx->outputs[n]);
@@ -509,8 +528,12 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                        int(out) + 1, num_outputs);
                 return AVERROR(EINVAL);
             }
-            ctx->device.Connect(::GetSDIOutputInputXpt(out), fsOut);
-            ctx->device.SetSDITransmitEnable(out, true);
+            if (!ctx->device.Connect(::GetSDIOutputInputXpt(out), fsOut, verify))
+                av_log(avctx, AV_LOG_WARNING,
+                       "Cannot route framestore %d to SDI output %d\n",
+                       int(ctx->channel) + 1, int(out) + 1);
+            if (ctx->device.features().HasBiDirectionalSDI())
+                ctx->device.SetSDITransmitEnable(out, true);
             ctx->device.SetSDIOutputStandard(out, std);
             listed += (n ? ", " : "");
             listed += std::to_string(int(out) + 1);

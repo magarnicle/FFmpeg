@@ -38,6 +38,8 @@ struct ajantv2_cctx {
     int      audio_depth;       /* bits per sample handed to the card: 16 or 32 */
     char    *format_code;       /* NTV2 video format by name, e.g. "1080i50";
                                    NULL infers it from the stream */
+    int      cc;                /* embed CEA-708 in HD VANC; 0 keeps VANC out of
+                                   the frame buffer entirely */
 
     /* Teletext. These mirror the DeckLink output's names so a playout command
      * line moves between the two by changing only -f, and they are handed
