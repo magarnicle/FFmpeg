@@ -758,6 +758,20 @@ static void aja_insert_teletext(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     }
 }
 
+/* A cheap fingerprint of the frame buffer, for telling "the picture never got
+ * into the buffer" apart from "the buffer never got to the card". Both look the
+ * same on a monitor. */
+static uint32_t aja_buffer_hash(const void *buf, size_t bytes)
+{
+    const uint32_t *p = (const uint32_t *)buf;
+    size_t n = bytes / 4;
+    uint32_t h = 2166136261u;
+
+    for (size_t i = 0; i < n; i += 97)       /* every 97th word is plenty */
+        h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
 static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                            AVPacket *pkt, int stored_new)
 {
@@ -825,6 +839,20 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     ctx->xfer.SetVideoBuffer((ULWord *)ctx->host_buffer.GetHostPointer(),
                              ctx->frame_size);
 
+    if (ctx->frames_out < 5) {
+        const uint32_t *w = (const uint32_t *)ctx->host_buffer.GetHostPointer();
+        av_log(avctx, AV_LOG_INFO,
+               "Frame %d: buffer %u bytes, hash %08x, first words %08x %08x, "
+               "row %u words %08x %08x\n",
+               ctx->frames_out, ctx->frame_size,
+               aja_buffer_hash(w, ctx->frame_size), w[0], w[1],
+               ctx->fd.GetVisibleRasterHeight() / 2,
+               w[(ctx->fd.GetVisibleRasterHeight() / 2) *
+                 (ctx->fd.GetBytesPerRow() / 4)],
+               w[(ctx->fd.GetVisibleRasterHeight() / 2) *
+                 (ctx->fd.GetBytesPerRow() / 4) + 1]);
+    }
+
     /* One frame's worth of audio goes with the frame. Short of that -- the
      * stream has not caught up, or has ended -- the rest is silence, which
      * keeps the embedder fed and the two in step rather than letting audio slip
@@ -859,6 +887,16 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
             return AVERROR(EIO);
         }
         ctx->started = 1;
+        {
+            AUTOCIRCULATE_STATUS st;
+            if (ctx->device.AutoCirculateGetStatus(ctx->channel, st))
+                av_log(avctx, AV_LOG_INFO,
+                       "AutoCirculate started: state %s, frames %u to %u, "
+                       "active frame %d\n",
+                       ::NTV2AutoCirculateStateToString(st.acState).c_str(),
+                       st.GetStartFrame(), st.GetEndFrame(),
+                       (int)st.GetActiveFrame());
+        }
     }
     return 0;
 }
@@ -1087,8 +1125,9 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
             av_log(avctx,
                    st.GetDroppedFrameCount() ? AV_LOG_WARNING : AV_LOG_INFO,
                    "AJA output: %u frames processed, %u dropped, %u still on "
-                   "the card\n", st.GetProcessedFrameCount(),
-                   st.GetDroppedFrameCount(), st.GetBufferLevel());
+                   "the card, state %s\n", st.GetProcessedFrameCount(),
+                   st.GetDroppedFrameCount(), st.GetBufferLevel(),
+                   ::NTV2AutoCirculateStateToString(st.acState).c_str());
     }
     if (ctx->audio_underruns)
         av_log(avctx, AV_LOG_WARNING, "AJA output: %"PRId64" audio underruns\n",
