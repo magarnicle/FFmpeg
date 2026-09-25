@@ -6,7 +6,10 @@
 #
 #   -f ajantv2 and a device index instead of a DeckLink device name. The AJA
 #   device takes the index as the output argument; "0" is the first card.
-#   -channel picks the framestore and -output the SDI connector.
+#   -channel picks the framestore. No -output, so the picture goes to every SDI
+#   connector the card has. Naming one is only worth it when something else
+#   needs the other connector: the monitor on this machine is on SDI Out 2, and
+#   feeding SDI 1 alone looks exactly like a dead card.
 #
 #   -format_code 1080p25 states the video format. It has to be said rather than
 #   inferred: 1080i50 and 1080p25 are both 1920x1080 at 25 frames, and which one
@@ -43,4 +46,4 @@
     [videobug][2:s]cea608embed=continuous=1:keepalive=1[videoout]" \
     -map [videoout] -map [audio0] \
     -t 60 -metadata name='2026-09-25 10:52:52.040000+10:00 AU112301-M.mov' \
-    -c:v v210 -f ajantv2 -format_code 1080p25 -cc 0 -channel 1 -output 1 0
+    -c:v v210 -f ajantv2 -format_code 1080p25 -cc 0 -channel 1 0
