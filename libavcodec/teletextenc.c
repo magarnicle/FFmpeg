@@ -254,6 +254,20 @@ static int strip_tags_and_format(TeletextEncContext *ctx, const char *input,
     *out_color = current_color;
 
     while (*p && pos < max_len - 1) {
+        /* ASS override blocks. The EIA-608 decoder emits alignment and
+         * positioning tags -- {\an7}{\pos(38,228)} -- which teletext cannot
+         * honour in any case, since the row a caption lands on is chosen by the
+         * bottom-anchored layout below. Without this they reach the page as
+         * literal text and a converted 608 caption goes to air reading
+         * "{\an7}{\pos(38,228)}HD source with". */
+        if (*p == '{') {
+            while (*p && *p != '}')
+                p++;
+            if (*p)
+                p++;
+            continue;
+        }
+
         if (*p == '<') {
             in_tag = 1;
             tag_pos = 0;
