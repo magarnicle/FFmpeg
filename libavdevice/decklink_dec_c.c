@@ -47,6 +47,7 @@ static const AVOption options[] = {
     { "all",          NULL,                                           0,  AV_OPT_TYPE_CONST, { .i64 = 0x7ffffffffLL}, 0, 0,    DEC, .unit = "teletext_lines"},
     { "channels",     "number of audio channels", OFFSET(audio_channels), AV_OPT_TYPE_INT , { .i64 = 2   }, 2, 16, DEC },
 #if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0b000000
+    { "eia608",       "expose captions extracted from HD VANC as an EIA-608 subtitle stream", OFFSET(eia608), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
     { "duplex_mode",  "duplex mode",              OFFSET(duplex_mode),    AV_OPT_TYPE_INT,   { .i64 = 0}, 0, 5,    DEC, .unit = "duplex_mode"},
 #else
     { "duplex_mode",  "duplex mode",              OFFSET(duplex_mode),    AV_OPT_TYPE_INT,   { .i64 = 0}, 0, 2,    DEC, .unit = "duplex_mode"},

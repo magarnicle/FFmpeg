@@ -476,6 +476,23 @@ static uint8_t *get_metadata(AVFormatContext *avctx, uint16_t *buf, size_t width
             clear_parity_bits(buf, len);
             data = vanc_to_cc(avctx, buf, width, data_len);
             if (data) {
+                struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+                struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+
+                /* The triplets vanc_to_cc returns are what an EIA-608 packet
+                 * carries, so they go to the stream unchanged. Queued before the
+                 * side data is attached, because that hands ownership of `data`
+                 * to the video packet. */
+                if (ctx->cc_st) {
+                    AVPacket cc_pkt = { 0 };
+                    cc_pkt.pts = pkt->pts;
+                    cc_pkt.dts = pkt->dts;
+                    cc_pkt.stream_index = ctx->cc_st->index;
+                    cc_pkt.data = data;
+                    cc_pkt.size = data_len;
+                    if (ff_decklink_packet_queue_put(&ctx->queue, &cc_pkt) < 0)
+                        ++ctx->dropped;
+                }
                 if (av_packet_add_side_data(pkt, AV_PKT_DATA_A53_CC, data, data_len) < 0)
                     av_free(data);
             }
@@ -1112,6 +1129,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     ctx->list_formats = cctx->list_formats;
     ctx->enable_klv = cctx->enable_klv;
     ctx->teletext_lines = cctx->teletext_lines;
+    ctx->eia608 = cctx->eia608;
     ctx->preroll      = cctx->preroll;
     ctx->duplex_mode  = cctx->duplex_mode;
     if (cctx->tc_format > 0 && (unsigned int)cctx->tc_format < FF_ARRAY_ELEMS(decklink_timecode_format_map))
@@ -1338,6 +1356,28 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
         st->codecpar->codec_id    = AV_CODEC_ID_DVB_TELETEXT;
         avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
         ctx->teletext_st = st;
+    }
+
+    /* Captions extracted from HD VANC are attached to the video packets as A53
+     * side data, which is right for re-embedding them but leaves nothing to
+     * -map. Exposing them as a stream as well is what lets them be transcoded:
+     * cc_dec turns EIA-608 into text and, for instance, the teletext encoder
+     * turns text into WST, so an HD feed with 608 can go out as SD PAL with
+     * teletext in one pass. The side data is still attached, so the two uses do
+     * not exclude each other. */
+    if (ctx->eia608) {
+        st = avformat_new_stream(avctx, NULL);
+        if (!st) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot add stream\n");
+            ret = AVERROR(ENOMEM);
+            goto error;
+        }
+        st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+        st->time_base.den        = ctx->bmd_tb_den;
+        st->time_base.num        = ctx->bmd_tb_num;
+        st->codecpar->codec_id   = AV_CODEC_ID_EIA_608;
+        avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
+        ctx->cc_st = st;
     }
 
     av_log(avctx, AV_LOG_VERBOSE, "Using %d input audio channels\n", ctx->audio_st->codecpar->ch_layout.nb_channels);

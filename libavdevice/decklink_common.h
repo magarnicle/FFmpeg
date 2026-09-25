@@ -186,12 +186,14 @@ struct decklink_ctx {
     AVStream *video_st;
     AVStream *klv_st;
     AVStream *teletext_st;
+    AVStream *cc_st;          /* extracted CEA-608/708, when -eia608 is set */
     uint16_t cdp_sequence_num;
     /* Options */
     int list_devices;
     int list_formats;
     int enable_klv;
     int64_t teletext_lines;
+    int eia608;               /* 1 = expose extracted captions as an EIA-608 stream */
     double preroll;
     int duplex_mode;
     BMDLinkConfiguration link;
