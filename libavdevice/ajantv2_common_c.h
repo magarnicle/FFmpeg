@@ -35,6 +35,7 @@ struct ajantv2_cctx {
     char    *output;            /* SDI connectors to feed, e.g. "2" or "1,2";
                                    NULL means the one matching the framestore */
     int      ring_frames;       /* AutoCirculate frame ring depth */
+    int      audio_depth;       /* bits per sample handed to the card: 16 or 32 */
     char    *format_code;       /* NTV2 video format by name, e.g. "1080i50";
                                    NULL infers it from the stream */
 

@@ -54,6 +54,7 @@ extern "C" {
 #include "libavformat/avformat.h"
 #include "libavformat/internal.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/fifo.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/avstring.h"
@@ -83,6 +84,17 @@ struct ajantv2_ctx {
 
     NTV2Buffer          host_buffer;
     AUTOCIRCULATE_TRANSFER xfer;
+
+    /* Audio. The card takes one frame's worth with each video frame, so packets
+     * are accumulated here and drawn down a frame at a time. */
+    AVStream           *audio_st;
+    NTV2AudioSystem     audio_system;
+    int                 audio_channels;
+    int                 audio_bytes_per_sample;   /* on the card: always 4 */
+    int                 audio_frame_bytes;        /* one video frame's worth */
+    AVFifo             *audio_fifo;
+    NTV2Buffer          audio_buffer;
+    int64_t             audio_underruns;
 
     int64_t             last_pts;
     int                 frames_out;
@@ -229,6 +241,74 @@ static bool aja_video_format(AVFormatContext *avctx, struct ajantv2_cctx *cctx,
     return true;
 }
 
+/* Bring up the audio system and work out how much of it goes with each frame.
+ *
+ * The card embeds 32-bit samples, so 16-bit input is widened on the way through
+ * rather than refused. The per-frame sample count comes from the video format's
+ * rate, and for rates that are not a whole number of samples per frame -- 29.97
+ * and friends -- it is the rounded value, with the FIFO absorbing the remainder
+ * over time.
+ */
+static int aja_setup_audio(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
+                           struct ajantv2_cctx *cctx)
+{
+    AVCodecParameters *par = ctx->audio_st->codecpar;
+    const NTV2FrameRate fr = ::GetNTV2FrameRateFromVideoFormat(ctx->video_format);
+    const double fps = ::GetFramesPerSecond(fr);
+    int samples_per_frame;
+
+    ctx->audio_channels = par->ch_layout.nb_channels;
+    if (ctx->audio_channels < 2 || ctx->audio_channels > 16 ||
+        (ctx->audio_channels & 1)) {
+        av_log(avctx, AV_LOG_ERROR,
+               "%d audio channels is not something the card embeds; use an even "
+               "count from 2 to 16\n", ctx->audio_channels);
+        return AVERROR(EINVAL);
+    }
+    if (par->sample_rate != 48000) {
+        av_log(avctx, AV_LOG_ERROR, "Audio must be 48kHz, not %d\n", par->sample_rate);
+        return AVERROR(EINVAL);
+    }
+    if (fps < 1.0) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot determine the output frame rate\n");
+        return AVERROR(EINVAL);
+    }
+
+    ctx->audio_system = ::NTV2ChannelToAudioSystem(ctx->channel);
+    /* A few older boards have one audio system but several framestores. */
+    if (!ctx->device.features().CanDoFrameStore1Display())
+        ctx->audio_system = NTV2_AUDIOSYSTEM_1;
+
+    ctx->device.SetNumberAudioChannels(ctx->audio_channels, ctx->audio_system);
+    ctx->device.SetAudioRate(NTV2_AUDIO_48K, ctx->audio_system);
+    ctx->device.SetAudioBufferSize(NTV2_AUDIO_BUFFER_BIG, ctx->audio_system);
+    for (size_t n = 0; n < ctx->outputs.size(); n++) {
+        ctx->device.SetSDIOutputAudioSystem(ctx->outputs[n], ctx->audio_system);
+        ctx->device.SetSDIOutputDS2AudioSystem(ctx->outputs[n], ctx->audio_system);
+    }
+    /* If the previous user left the board in E-E mode, loopback would embed the
+     * SDI input's audio over ours. */
+    ctx->device.SetAudioLoopBack(NTV2_AUDIO_LOOPBACK_OFF, ctx->audio_system);
+
+    ctx->audio_bytes_per_sample = 4;
+    samples_per_frame = (int)(48000.0 / fps + 0.5);
+    ctx->audio_frame_bytes = samples_per_frame * ctx->audio_channels *
+                             ctx->audio_bytes_per_sample;
+
+    /* Room for a second or so, so a burst of packets does not spill. */
+    ctx->audio_fifo = av_fifo_alloc2(ctx->audio_frame_bytes * 64, 1,
+                                     AV_FIFO_FLAG_AUTO_GROW);
+    if (!ctx->audio_fifo)
+        return AVERROR(ENOMEM);
+    if (!ctx->audio_buffer.Allocate(ctx->audio_frame_bytes, true))
+        return AVERROR(ENOMEM);
+
+    av_log(avctx, AV_LOG_INFO,
+           "Audio: %d channels, 48kHz, %d samples and %d bytes a frame\n",
+           ctx->audio_channels, samples_per_frame, ctx->audio_frame_bytes);
+    return 0;
+}
+
 static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                            struct ajantv2_cctx *cctx, AVStream *st)
 {
@@ -335,9 +415,21 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         return AVERROR(ENOMEM);
     }
 
+    return 0;
+}
+
+/* Start AutoCirculate. Separate from the video setup because the audio system
+ * has to be known here: it is passed to AutoCirculateInitForOutput, and the
+ * transfer carries video and audio together from then on. */
+static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
+                           struct ajantv2_cctx *cctx)
+{
     const ULWord ring = cctx->ring_frames > 1 ? (ULWord)cctx->ring_frames : 8;
+    const NTV2AudioSystem asys = ctx->audio_st ? ctx->audio_system
+                                               : NTV2_AUDIOSYSTEM_INVALID;
+
     ctx->device.AutoCirculateStop(ctx->channel);
-    if (!ctx->device.AutoCirculateInitForOutput(ctx->channel, ring)) {
+    if (!ctx->device.AutoCirculateInitForOutput(ctx->channel, ring, asys)) {
         av_log(avctx, AV_LOG_ERROR, "AutoCirculateInitForOutput failed\n");
         return AVERROR(EIO);
     }
@@ -345,10 +437,11 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         av_log(avctx, AV_LOG_ERROR, "AutoCirculateStart failed\n");
         return AVERROR(EIO);
     }
-    av_log(avctx, AV_LOG_INFO, "AJA output: %s %s, %u-frame ring, buffer %u bytes\n",
+    av_log(avctx, AV_LOG_INFO,
+           "AJA output: %s %s, %u-frame ring, buffer %u bytes, audio %s\n",
            ::NTV2VideoFormatToString(ctx->video_format).c_str(),
            ::NTV2FrameBufferFormatToString(ctx->pixel_format).c_str(),
-           ring, ctx->frame_size);
+           ring, ctx->frame_size, ctx->audio_st ? "on" : "off");
     return 0;
 }
 
@@ -420,6 +513,29 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 
     ctx->xfer.SetVideoBuffer((ULWord *)ctx->host_buffer.GetHostPointer(),
                              ctx->frame_size);
+
+    /* One frame's worth of audio goes with the frame. Short of that -- the
+     * stream has not caught up, or has ended -- the rest is silence, which
+     * keeps the embedder fed and the two in step rather than letting audio slip
+     * a frame behind for the rest of the run. */
+    if (ctx->audio_fifo) {
+        const size_t have = av_fifo_can_read(ctx->audio_fifo);
+        const size_t want = (size_t)ctx->audio_frame_bytes;
+        uint8_t *dst = (uint8_t *)ctx->audio_buffer.GetHostPointer();
+
+        if (have >= want) {
+            av_fifo_read(ctx->audio_fifo, dst, want);
+        } else {
+            if (have)
+                av_fifo_read(ctx->audio_fifo, dst, have);
+            memset(dst + have, 0, want - have);
+            if (ctx->frames_out > 2 && ++ctx->audio_underruns % 25 == 1)
+                av_log(avctx, AV_LOG_WARNING,
+                       "Audio underrun: %zu of %zu bytes, padding with silence "
+                       "(%"PRId64" so far)\n", have, want, ctx->audio_underruns);
+        }
+        ctx->xfer.SetAudioBuffer((ULWord *)dst, ctx->audio_frame_bytes);
+    }
     if (!ctx->device.AutoCirculateTransfer(ctx->channel, ctx->xfer)) {
         av_log(avctx, AV_LOG_ERROR, "AutoCirculateTransfer failed\n");
         return AVERROR(EIO);
@@ -487,8 +603,19 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
             }
             break;
         case AVMEDIA_TYPE_AUDIO:
-            av_log(avctx, AV_LOG_WARNING,
-                   "Ignoring audio stream %u: audio output is not implemented yet\n", i);
+            if (ctx->audio_st) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "Ignoring audio stream %u: only one is embedded\n", i);
+                break;
+            }
+            if (st->codecpar->codec_id != AV_CODEC_ID_PCM_S32LE &&
+                st->codecpar->codec_id != AV_CODEC_ID_PCM_S16LE) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "Audio must be pcm_s32le or pcm_s16le\n");
+                ret = AVERROR(EINVAL);
+                goto fail;
+            }
+            ctx->audio_st = st;
             break;
         default:
             break;
@@ -516,6 +643,10 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
                                             (int32_t)getpid());
 
     if ((ret = aja_setup_video(avctx, ctx, cctx, video_st)) < 0)
+        goto fail;
+    if (ctx->audio_st && (ret = aja_setup_audio(avctx, ctx, cctx)) < 0)
+        goto fail;
+    if ((ret = aja_start_output(avctx, ctx, cctx)) < 0)
         goto fail;
 
     if (ctx->teletext_enabled) {
@@ -571,6 +702,24 @@ int ff_ajantv2_write_packet(AVFormatContext *avctx, AVPacket *pkt)
                                   pkt->pts, pkt->duration, 1, avctx);
         return 0;
     }
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        if (!ctx->audio_fifo)
+            return 0;
+        if (st->codecpar->codec_id == AV_CODEC_ID_PCM_S16LE) {
+            /* The card embeds 32-bit samples, so widen on the way in rather
+             * than make the caller do it. */
+            const int16_t *src = (const int16_t *)pkt->data;
+            const int n = pkt->size / 2;
+            for (int i = 0; i < n; i++) {
+                const int32_t v = (int32_t)src[i] << 16;
+                if (av_fifo_write(ctx->audio_fifo, &v, 4) < 0)
+                    break;
+            }
+        } else if (av_fifo_write(ctx->audio_fifo, pkt->data, pkt->size) < 0) {
+            av_log(avctx, AV_LOG_WARNING, "Audio FIFO full, dropping a packet\n");
+        }
+        return 0;
+    }
     if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
         return 0;
 
@@ -587,6 +736,10 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     if (!ctx)
         return 0;
     av_log(avctx, AV_LOG_INFO, "AJA output: %d frames sent\n", ctx->frames_out);
+    if (ctx->audio_underruns)
+        av_log(avctx, AV_LOG_WARNING, "AJA output: %"PRId64" audio underruns\n",
+               ctx->audio_underruns);
+    av_fifo_freep2(&ctx->audio_fifo);
     ctx->device.AutoCirculateStop(ctx->channel);
     ctx->device.ReleaseStreamForApplication(AJA_FOURCC('f','f','m','p'),
                                             (int32_t)getpid());
