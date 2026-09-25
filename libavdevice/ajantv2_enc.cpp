@@ -116,7 +116,7 @@ struct ajantv2_ctx {
 
     int64_t             last_pts;
     int                 frames_out;
-    int                 fd_num, fd_den;      /* output frame rate, for the CDP */
+    int                 cdp_tb_num, cdp_tb_den;  /* frame duration, for the CDP */
 
     /* Teletext, all of it device-independent. */
 #if CONFIG_LIBKLVANC
@@ -274,6 +274,48 @@ static bool aja_video_format(AVFormatContext *avctx, struct ajantv2_cctx *cctx,
  * and friends -- it is the rounded value, with the FIFO absorbing the remainder
  * over time.
  */
+/* Fill a span of frame buffer with legal blanking: black luma and neutral
+ * chroma. NTV2Buffer::Allocate zeroes what it hands back, and zero is not black
+ * -- in 10-bit YCbCr, Y=0 Cb=0 Cr=0 is both a reserved SDI code word and, to
+ * anything that renders it, bright green. That matters because the rows this
+ * device does not write are the VANC rows, and the card does not clamp the VANC
+ * region: it cannot, since a limiter would destroy the ancillary payload. So
+ * whatever is in those rows reaches the wire as-is.
+ *
+ * Also used per frame on the VANC rows, so a VANC packet written for one frame
+ * does not sit in the buffer and go out again on the next. */
+static void aja_fill_blanking(void *buf, size_t bytes, NTV2PixelFormat pf)
+{
+    if (pf == NTV2_FBF_10BIT_YCBCR) {
+        /* V210, packed exactly as the VBI renderer packs it: three 10-bit words
+         * to a little-endian 32-bit word, Cb Y Cr / Y Cb Y repeating. Black is
+         * 64 and neutral chroma is 512, which makes the pattern two words long. */
+        uint32_t *p = (uint32_t *)buf;
+        size_t n = bytes / 4;
+        for (size_t i = 0; i < n; i++)
+            p[i] = (i & 1) ? (64u | (512u << 10) | (64u << 20))
+                           : (512u | (64u << 10) | (512u << 20));
+    } else {
+        /* 8-bit UYVY: Cb Y Cr Y, black 16 and neutral chroma 128. */
+        uint8_t *p = (uint8_t *)buf;
+        for (size_t i = 0; i < bytes; i++)
+            p[i] = (i & 1) ? 0x10 : 0x80;
+    }
+}
+
+/* Put legal blanking back in the VANC rows, ahead of writing this frame's VANC
+ * into them. */
+static void aja_blank_vanc(struct ajantv2_ctx *ctx)
+{
+    const ULWord first = ctx->fd.GetFirstActiveLine();
+
+    if (!first)
+        return;
+    aja_fill_blanking(ctx->host_buffer.GetHostPointer(),
+                      (size_t)first * ctx->fd.GetBytesPerRow(),
+                      ctx->pixel_format);
+}
+
 static int aja_setup_audio(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                            struct ajantv2_cctx *cctx)
 {
@@ -380,11 +422,39 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     ctx->vanc_mode = (ctx->teletext_enabled || AJA_CC_ENABLED(ctx))
                          ? NTV2_VANCMODE_TALLER : NTV2_VANCMODE_OFF;
 
-    ctx->device.SetVideoFormat(ctx->video_format, false, false, ctx->channel);
-    ctx->device.SetFrameBufferFormat(ctx->channel, ctx->pixel_format);
-    ctx->device.SetVANCMode(ctx->vanc_mode, ctx->channel);
+    /* Every framestore on a card that cannot do multi-format shares one video
+     * format register, so another one left enabled -- by a capture run, or by
+     * the AJA control panel -- fights this setup. We hold the whole device, so
+     * shut them all down first, as the SDK's own player does. */
+    if (!ctx->device.features().CanDoMultiFormat()) {
+        NTV2ChannelSet enabled;
+        ctx->device.GetEnabledChannels(enabled);
+        if (!enabled.empty())
+            ctx->device.DisableChannels(enabled);
+    }
+
+    if (!ctx->device.SetVideoFormat(ctx->video_format, false, false, ctx->channel))
+        av_log(avctx, AV_LOG_WARNING, "SetVideoFormat(%s) failed\n",
+               ::NTV2VideoFormatToString(ctx->video_format).c_str());
+    if (!ctx->device.SetFrameBufferFormat(ctx->channel, ctx->pixel_format))
+        av_log(avctx, AV_LOG_WARNING, "SetFrameBufferFormat(%s) failed\n",
+               ::NTV2FrameBufferFormatToString(ctx->pixel_format).c_str());
+    if (!ctx->device.SetVANCMode(ctx->vanc_mode, ctx->channel))
+        av_log(avctx, AV_LOG_WARNING, "SetVANCMode(%s) failed\n",
+               ::NTV2VANCModeToString(ctx->vanc_mode).c_str());
     ctx->device.SetMode(ctx->channel, NTV2_MODE_DISPLAY);
     ctx->device.EnableChannel(ctx->channel);
+
+    /* Where the output gets its clock. Left alone it keeps whatever it was last
+     * set to, and if that is an SDI input with nothing on it the output has no
+     * timing reference at all. Playout has nothing to genlock to, so free-run.
+     */
+    ctx->device.SetReference(NTV2_REFERENCE_FREERUN);
+
+    /* WaitForOutputVerticalInterrupt cannot block on a channel whose interrupt
+     * has not been subscribed; without this the wait returns immediately and the
+     * flow-control loop in aja_write_video spins on the CPU. */
+    ctx->device.SubscribeOutputVerticalEvent(ctx->channel);
 
     /* 8-bit VANC is shifted by the hardware unless told otherwise; 10-bit is
      * not. Match what the VBI renderer writes. */
@@ -395,12 +465,15 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 
     ctx->fd = NTV2FormatDescriptor(ctx->video_format, ctx->pixel_format,
                                    ctx->vanc_mode);
-    {   /* The CDP carries the frame rate, so keep it as a fraction. */
+    {   /* The CDP carries the frame rate. klvanc names its arguments num and
+         * den but wants the frame *duration* -- 1/25, not 25/1 -- so the
+         * fraction GetFramesPerSecond returns goes in inverted. The DeckLink
+         * output passes its time base here for the same reason. */
         const NTV2FrameRate fr = ::GetNTV2FrameRateFromVideoFormat(ctx->video_format);
         ULWord num = 0, den = 0;
         ::GetFramesPerSecond(fr, num, den);
-        ctx->fd_num = (int)num;
-        ctx->fd_den = (int)den;
+        ctx->cdp_tb_num = (int)den;
+        ctx->cdp_tb_den = (int)num;
     }
     ctx->frame_size = ::GetVideoWriteSize(ctx->video_format, ctx->pixel_format,
                                          ctx->vanc_mode);
@@ -451,6 +524,44 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         av_log(avctx, AV_LOG_ERROR, "Cannot allocate a %u-byte frame buffer\n",
                ctx->frame_size);
         return AVERROR(ENOMEM);
+    }
+    aja_fill_blanking(ctx->host_buffer.GetHostPointer(), ctx->frame_size,
+                      ctx->pixel_format);
+
+    /* Read the registers back and say what the card really has. Nearly every
+     * setter here is advisory -- the driver can refuse a combination and leave
+     * the previous value in place -- and a framestore whose geometry disagrees
+     * with the frame buffer this device writes produces a picture that is wrong
+     * without anything reporting an error. */
+    {
+        NTV2VideoFormat vf(NTV2_FORMAT_UNKNOWN);
+        NTV2FrameBufferFormat fbf(NTV2_FBF_INVALID);
+        NTV2VANCMode vm(NTV2_VANCMODE_INVALID);
+        NTV2FrameGeometry fg(NTV2_FG_INVALID);
+        NTV2ReferenceSource ref(NTV2_REFERENCE_INVALID);
+
+        ctx->device.GetVideoFormat(vf, ctx->channel);
+        ctx->device.GetFrameBufferFormat(ctx->channel, fbf);
+        ctx->device.GetVANCMode(vm, ctx->channel);
+        ctx->device.GetFrameGeometry(fg, ctx->channel);
+        ctx->device.GetReference(ref);
+
+        av_log(avctx, AV_LOG_INFO,
+               "Card reports: %s %s %s %s, reference %s\n",
+               ::NTV2VideoFormatToString(vf).c_str(),
+               ::NTV2FrameBufferFormatToString(fbf).c_str(),
+               ::NTV2FrameGeometryToString(fg).c_str(),
+               ::NTV2VANCModeToString(vm).c_str(),
+               ::NTV2ReferenceSourceToString(ref).c_str());
+
+        if (vf != ctx->video_format || fbf != ctx->pixel_format ||
+            vm != ctx->vanc_mode)
+            av_log(avctx, AV_LOG_ERROR,
+                   "The card did not take the requested setup (asked for %s %s "
+                   "%s). The picture will be wrong.\n",
+                   ::NTV2VideoFormatToString(ctx->video_format).c_str(),
+                   ::NTV2FrameBufferFormatToString(ctx->pixel_format).c_str(),
+                   ::NTV2VANCModeToString(ctx->vanc_mode).c_str());
     }
 
     return 0;
@@ -511,9 +622,9 @@ static void aja_insert_cc(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     cc_count = size / 3;
     if (klvanc_create_eia708_cdp(&cdp))
         return;
-    if (klvanc_set_framerate_EIA_708B(cdp, ctx->fd_num, ctx->fd_den)) {
+    if (klvanc_set_framerate_EIA_708B(cdp, ctx->cdp_tb_num, ctx->cdp_tb_den)) {
         av_log(avctx, AV_LOG_ERROR, "Invalid frame rate for CEA-708: %d/%d\n",
-               ctx->fd_num, ctx->fd_den);
+               ctx->cdp_tb_den, ctx->cdp_tb_num);
         klvanc_destroy_eia708_cdp(cdp);
         return;
     }
@@ -625,6 +736,8 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         memcpy(dst + i * ctx->fd.GetBytesPerRow(),
                src + (size_t)i * src_stride, ctx->fd.GetBytesPerRow());
 
+    if (NTV2_IS_VANCMODE_ON(ctx->vanc_mode))
+        aja_blank_vanc(ctx);
     if (ctx->teletext_enabled)
         aja_insert_teletext(avctx, ctx, stored_new);
 #if CONFIG_LIBKLVANC
@@ -772,6 +885,8 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
     }
     ctx->device.AcquireStreamForApplication(AJA_FOURCC('f','f','m','p'),
                                             (int32_t)getpid());
+    av_log(avctx, AV_LOG_INFO, "AJA device: %s\n",
+           ctx->device.GetDisplayName().c_str());
 
     if ((ret = aja_setup_video(avctx, ctx, cctx, video_st)) < 0)
         goto fail;
@@ -888,6 +1003,7 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
         klvanc_context_destroy(ctx->vanc_ctx);
 #endif
     ctx->device.AutoCirculateStop(ctx->channel);
+    ctx->device.UnsubscribeOutputVerticalEvent(ctx->channel);
     ctx->device.ReleaseStreamForApplication(AJA_FOURCC('f','f','m','p'),
                                             (int32_t)getpid());
     delete ctx;
