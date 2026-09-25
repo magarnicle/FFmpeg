@@ -119,6 +119,7 @@ struct ajantv2_ctx {
     /* Frame-flipping playout, for cards whose AutoCirculate output does not
      * run: the frames of card memory this device owns, and the next to fill. */
     int                 flip;
+    UWord               vbi_per_frame;    /* the interrupt is per field */
     ULWord              flip_first;
     ULWord              flip_count;
     ULWord              flip_next;
@@ -540,6 +541,15 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         const bool verify(ctx->device.features().HasCrosspointConnectROM());
         std::string listed;
 
+        /* No -output: feed every SDI connector the card has, which is what the
+         * SDK's test pattern demo does and the only setup on this card that has
+         * ever put a picture on a monitor. Feeding one connector and guessing
+         * which is not worth the hour it costs when the guess is wrong. */
+        if (ctx->outputs.empty()) {
+            for (UWord n = 0; n < (num_outputs ? num_outputs : 1); n++)
+                ctx->outputs.push_back((NTV2Channel)n);
+        }
+
         /* Start from nothing. A crosspoint left over from another run -- a
          * capture, or the AJA control panel's own routing -- can still be
          * driving the connector we are about to connect, and on a card with a
@@ -562,6 +572,8 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
             if (ctx->device.features().HasBiDirectionalSDI())
                 ctx->device.SetSDITransmitEnable(out, true);
             ctx->device.SetSDIOutputStandard(out, std);
+            ctx->device.SetSDIOutLevelAtoLevelBConversion(out, false);
+            ctx->device.SetSDIOutRGBLevelAConversion(out, false);
             listed += (n ? ", " : "");
             listed += std::to_string(int(out) + 1);
 
@@ -666,6 +678,11 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                                       ctx->frame_size);
         ctx->device.SetOutputFrame(ctx->channel, ctx->flip_first);
         ctx->started = 1;
+        /* The last run went at 50fps for 625i50, so the output vertical
+         * interrupt comes once a field. Wait for both on an interlaced
+         * format, or the frames go out at twice the rate. */
+        ctx->vbi_per_frame =
+            ::IsProgressivePicture(ctx->video_format) ? 1 : 2;
         av_log(avctx, AV_LOG_INFO,
                "AJA output: %s %s, frame flipping over card frames %u to %u, "
                "buffer %u bytes%s\n",
@@ -908,7 +925,7 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
             av_log(avctx, AV_LOG_ERROR, "DMAWriteFrame to frame %u failed\n", frame);
             return AVERROR(EIO);
         }
-        ctx->device.WaitForOutputVerticalInterrupt(ctx->channel);
+        ctx->device.WaitForOutputVerticalInterrupt(ctx->channel, ctx->vbi_per_frame);
         ctx->device.SetOutputFrame(ctx->channel, frame);
         ctx->flip_next = (ctx->flip_next + 1) % ctx->flip_count;
 
@@ -1049,8 +1066,8 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
                 p++;
         }
     }
-    if (ctx->outputs.empty())
-        ctx->outputs.push_back(ctx->channel);
+    /* An empty list is filled in once the device is open and can say how many
+     * connectors it has. */
 
     for (i = 0; i < avctx->nb_streams; i++) {
         AVStream *st = avctx->streams[i];
