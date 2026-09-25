@@ -65,10 +65,28 @@ extern "C" {
 #include "vbi_teletext.h"
 }
 
+/* After the block above, because CONFIG_LIBKLVANC comes from config.h and is
+ * not defined until one of those headers has pulled it in. */
+#if CONFIG_LIBKLVANC
+#include "libklvanc/vanc.h"
+#include "libklvanc/vanc-lines.h"
+#include "libklvanc/pixels.h"
+#endif
+
 /* SD teletext lives on line 21 of field 1 and the line 313 further on in
  * field 2, per OP-42 and Australian practice. */
 #define AJA_SD_LINE_FIELD1  21
 #define AJA_SD_LINE_FIELD2  334
+
+/* SMPTE 334 puts CEA-708 in HD VANC on line 9 or 11; the DeckLink output uses
+ * 11, so the two cards agree. */
+#define AJA_HD_LINE_CC      11
+
+#if CONFIG_LIBKLVANC
+#define AJA_CC_ENABLED(c) ((c)->cc_enabled)
+#else
+#define AJA_CC_ENABLED(c) 0
+#endif
 
 struct ajantv2_ctx {
     CNTV2Card           device;
@@ -98,8 +116,15 @@ struct ajantv2_ctx {
 
     int64_t             last_pts;
     int                 frames_out;
+    int                 fd_num, fd_den;      /* output frame rate, for the CDP */
 
     /* Teletext, all of it device-independent. */
+#if CONFIG_LIBKLVANC
+    struct klvanc_context_s *vanc_ctx;
+    uint16_t             cdp_sequence_num;
+    int                  cc_enabled;
+#endif
+
     FFVbiTeletextContext tt;
     AVStream            *teletext_st;
     int                  teletext_enabled;
@@ -346,8 +371,14 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                ::NTV2VideoFormatToString(ctx->video_format).c_str());
         ctx->teletext_enabled = 0;
     }
-    ctx->vanc_mode = ctx->teletext_enabled ? NTV2_VANCMODE_TALLER
-                                           : NTV2_VANCMODE_OFF;
+#if CONFIG_LIBKLVANC
+    /* Captions arriving as A53 side data are written into HD VANC, which needs
+     * the region present in the frame buffer and 10-bit pixels to hold it. */
+    ctx->cc_enabled = !NTV2_IS_625_FORMAT(ctx->video_format) &&
+                      ctx->pixel_format == NTV2_FBF_10BIT_YCBCR;
+#endif
+    ctx->vanc_mode = (ctx->teletext_enabled || AJA_CC_ENABLED(ctx))
+                         ? NTV2_VANCMODE_TALLER : NTV2_VANCMODE_OFF;
 
     ctx->device.SetVideoFormat(ctx->video_format, false, false, ctx->channel);
     ctx->device.SetFrameBufferFormat(ctx->channel, ctx->pixel_format);
@@ -364,6 +395,13 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 
     ctx->fd = NTV2FormatDescriptor(ctx->video_format, ctx->pixel_format,
                                    ctx->vanc_mode);
+    {   /* The CDP carries the frame rate, so keep it as a fraction. */
+        const NTV2FrameRate fr = ::GetNTV2FrameRateFromVideoFormat(ctx->video_format);
+        ULWord num = 0, den = 0;
+        ::GetFramesPerSecond(fr, num, den);
+        ctx->fd_num = (int)num;
+        ctx->fd_den = (int)den;
+    }
     ctx->frame_size = ::GetVideoWriteSize(ctx->video_format, ctx->pixel_format,
                                          ctx->vanc_mode);
 
@@ -445,6 +483,95 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     return 0;
 }
 
+#if CONFIG_LIBKLVANC
+/* Turn the frame's A53 caption side data into a CEA-708 CDP and write it as a
+ * VANC line of the frame buffer.
+ *
+ * The CDP is built exactly as the DeckLink output builds it, through the same
+ * klvanc calls, so a receiver cannot tell which card a feed came from. The only
+ * difference is where the rendered line goes: DeckLink asks the API for a
+ * blanking line, and here the line is a row of the frame buffer, found the same
+ * way the teletext row is.
+ */
+static void aja_insert_cc(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
+                          AVPacket *pkt)
+{
+    struct klvanc_line_set_s vanc_lines = {0};
+    struct klvanc_packet_eia_708b_s *cdp = NULL;
+    uint16_t *cdp_words = NULL;
+    uint16_t len = 0;
+    uint8_t cc_count;
+    size_t size;
+    int ret, i;
+
+    const uint8_t *data = av_packet_get_side_data(pkt, AV_PKT_DATA_A53_CC, &size);
+    if (!data || !size)
+        return;
+
+    cc_count = size / 3;
+    if (klvanc_create_eia708_cdp(&cdp))
+        return;
+    if (klvanc_set_framerate_EIA_708B(cdp, ctx->fd_num, ctx->fd_den)) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid frame rate for CEA-708: %d/%d\n",
+               ctx->fd_num, ctx->fd_den);
+        klvanc_destroy_eia708_cdp(cdp);
+        return;
+    }
+    if (cc_count > KLVANC_MAX_CC_COUNT) {
+        av_log(avctx, AV_LOG_ERROR, "Illegal cc_count %d\n", cc_count);
+        cc_count = KLVANC_MAX_CC_COUNT;
+    }
+
+    cdp->header.ccdata_present = 1;
+    cdp->header.caption_service_active = 1;
+    cdp->ccdata.cc_count = cc_count;
+    for (i = 0; i < cc_count; i++) {
+        if (data[3 * i] & 0x04)
+            cdp->ccdata.cc[i].cc_valid = 1;
+        cdp->ccdata.cc[i].cc_type = data[3 * i] & 0x03;
+        cdp->ccdata.cc[i].cc_data[0] = data[3 * i + 1];
+        cdp->ccdata.cc[i].cc_data[1] = data[3 * i + 2];
+    }
+
+    klvanc_finalize_EIA_708B(cdp, ctx->cdp_sequence_num++);
+    ret = klvanc_convert_EIA_708B_to_words(cdp, &cdp_words, &len);
+    klvanc_destroy_eia708_cdp(cdp);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed converting the 708 packet to words\n");
+        return;
+    }
+
+    ret = klvanc_line_insert(ctx->vanc_ctx, &vanc_lines, cdp_words, len,
+                             AJA_HD_LINE_CC, 0);
+    free(cdp_words);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed inserting the VANC line\n");
+        return;
+    }
+
+    for (i = 0; i < vanc_lines.num_lines; i++) {
+        struct klvanc_line_s *line = vanc_lines.lines[i];
+        ULWord row;
+        void *buf;
+
+        if (!line)
+            break;
+        if (!ctx->fd.GetLineOffsetFromSMPTELine((ULWord)line->line_number, row)) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "SMPTE line %d is outside the frame buffer's VANC region\n",
+                   line->line_number);
+            continue;
+        }
+        buf = ctx->fd.GetWriteableRowAddress(ctx->host_buffer.GetHostPointer(), row);
+        if (buf)
+            klvanc_generate_vanc_line_v210(ctx->vanc_ctx, line, (uint8_t *)buf,
+                                           ctx->fd.GetRasterWidth());
+    }
+    for (i = 0; i < vanc_lines.num_lines; i++)
+        klvanc_line_free(vanc_lines.lines[i]);
+}
+#endif /* CONFIG_LIBKLVANC */
+
 /* Render whatever the teletext generator says goes out this frame into the two
  * VBI rows of the frame buffer. */
 static void aja_insert_teletext(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
@@ -500,6 +627,10 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 
     if (ctx->teletext_enabled)
         aja_insert_teletext(avctx, ctx, stored_new);
+#if CONFIG_LIBKLVANC
+    if (ctx->cc_enabled)
+        aja_insert_cc(avctx, ctx, pkt);
+#endif
 
     /* Wait for room in the ring, then hand the frame over. */
     for (;;) {
@@ -649,6 +780,18 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
     if ((ret = aja_start_output(avctx, ctx, cctx)) < 0)
         goto fail;
 
+#if CONFIG_LIBKLVANC
+    if (ctx->cc_enabled && klvanc_context_create(&ctx->vanc_ctx) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot create a klvanc context\n");
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    if (ctx->cc_enabled)
+        av_log(avctx, AV_LOG_INFO,
+               "CEA-708 captions from A53 side data go out on VANC line %d\n",
+               AJA_HD_LINE_CC);
+#endif
+
     if (ctx->teletext_enabled) {
         FFVbiTeletextConfig tcfg;
         memset(&tcfg, 0, sizeof(tcfg));
@@ -740,6 +883,10 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
         av_log(avctx, AV_LOG_WARNING, "AJA output: %"PRId64" audio underruns\n",
                ctx->audio_underruns);
     av_fifo_freep2(&ctx->audio_fifo);
+#if CONFIG_LIBKLVANC
+    if (ctx->vanc_ctx)
+        klvanc_context_destroy(ctx->vanc_ctx);
+#endif
     ctx->device.AutoCirculateStop(ctx->channel);
     ctx->device.ReleaseStreamForApplication(AJA_FOURCC('f','f','m','p'),
                                             (int32_t)getpid());
