@@ -35,6 +35,8 @@ struct ajantv2_cctx {
     char    *output;            /* SDI connectors to feed, e.g. "2" or "1,2";
                                    NULL means the one matching the framestore */
     int      ring_frames;       /* AutoCirculate frame ring depth */
+    char    *format_code;       /* NTV2 video format by name, e.g. "1080i50";
+                                   NULL infers it from the stream */
 
     /* Teletext. These mirror the DeckLink output's names so a playout command
      * line moves between the two by changing only -f, and they are handed

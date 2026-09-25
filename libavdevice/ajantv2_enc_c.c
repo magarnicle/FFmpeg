@@ -36,6 +36,7 @@ static const AVOption options[] = {
     { "channel", "framestore to play from (1-based)", OFFSET(channel), AV_OPT_TYPE_INT, { .i64 = 1 }, 1, 8, ENC },
     { "output", "SDI connector(s) to feed, 1-based, comma-separated for more than one (e.g. \"2\" or \"1,2\"); default is the connector matching the framestore", OFFSET(output), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "ring_frames", "AutoCirculate output ring depth in frames", OFFSET(ring_frames), AV_OPT_TYPE_INT, { .i64 = 8 }, 2, 64, ENC },
+    { "format_code", "NTV2 video format by name, e.g. \"1080i50\", \"1080p25\", \"625i50\"; needed when the raster and rate alone are ambiguous, as 1080i50 and 1080p25 are", OFFSET(format_code), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
 
     { "teletext_fields", "teletext field insertion mode", OFFSET(teletext_fields), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, ENC, .unit = "teletext_fields" },
     { "both", "insert on both fields (default, per OP-47)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, ENC, .unit = "teletext_fields" },

@@ -56,6 +56,7 @@ extern "C" {
 #include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/avstring.h"
 #include "libavutil/frame.h"
 
 #include "ajantv2_common_c.h"
@@ -120,18 +121,112 @@ static bool aja_frame_format(AVFormatContext *avctx, AVCodecParameters *c,
     return false;
 }
 
-static bool aja_video_format(int width, int height, AVRational fr,
-                             NTV2VideoFormat *out)
+/* Find a video format by the name the SDK gives it -- "1080i50", "1080p25",
+ * "625i50". Matched against NTV2VideoFormatToString over every format rather
+ * than a table here, so the accepted spellings are the SDK's own and cannot
+ * drift from it. */
+static NTV2VideoFormat aja_format_by_name(const char *name)
 {
-    if (width == 720 && height == 576) {
-        *out = NTV2_FORMAT_625_5000;
+    for (int f = NTV2_FORMAT_FIRST_HIGH_DEF_FORMAT; f < NTV2_FORMAT_END_STANDARD_DEF_FORMATS; f++) {
+        const NTV2VideoFormat vf = NTV2VideoFormat(f);
+        const std::string s = ::NTV2VideoFormatToString(vf);
+        if (!s.empty() && !av_strcasecmp(s.c_str(), name))
+            return vf;
+    }
+    return NTV2_FORMAT_UNKNOWN;
+}
+
+static void aja_log_formats(AVFormatContext *avctx)
+{
+    std::string line;
+    av_log(avctx, AV_LOG_INFO, "Video formats this build knows:\n");
+    for (int f = NTV2_FORMAT_FIRST_HIGH_DEF_FORMAT; f < NTV2_FORMAT_END_STANDARD_DEF_FORMATS; f++) {
+        const std::string s = ::NTV2VideoFormatToString(NTV2VideoFormat(f));
+        if (s.empty() || s.find('?') != std::string::npos)
+            continue;
+        line += "  " + s;
+        if (line.size() > 64) {
+            av_log(avctx, AV_LOG_INFO, "%s\n", line.c_str());
+            line.clear();
+        }
+    }
+    if (!line.empty())
+        av_log(avctx, AV_LOG_INFO, "%s\n", line.c_str());
+}
+
+/* Map the stream's raster and rate onto an NTV2 video format.
+ *
+ * The SDK will do the matching, so this does not carry a table: the rate comes
+ * from the stream's frame rate as a fraction, and interlaced-versus-progressive
+ * from the stream's field order. An interlaced stream carries fields at twice
+ * the frame rate in ffmpeg's reckoning, which is not what
+ * GetFirstMatchingVideoFormat wants, so the rate handed to it is the frame rate.
+ */
+static bool aja_video_format(AVFormatContext *avctx, struct ajantv2_cctx *cctx,
+                            AVStream *st, NTV2VideoFormat *out)
+{
+    AVCodecParameters *par = st->codecpar;
+    AVRational fr = st->avg_frame_rate;
+    const bool interlaced = par->field_order != AV_FIELD_PROGRESSIVE &&
+                            par->field_order != AV_FIELD_UNKNOWN;
+    NTV2FrameRate rate;
+
+    /* An explicit name wins. It has to be available, because a raster and a
+     * frame rate do not always identify a format: 1080i50 and 1080p25 are both
+     * 1920x1080 at 25, and which one goes down the wire is a different SDI
+     * standard. ffmpeg often reaches a muxer with the field order unset, so
+     * there is nothing to tell them apart by. */
+    if (cctx->format_code && *cctx->format_code) {
+        *out = aja_format_by_name(cctx->format_code);
+        if (*out == NTV2_FORMAT_UNKNOWN) {
+            av_log(avctx, AV_LOG_ERROR, "Unknown format_code '%s'\n", cctx->format_code);
+            aja_log_formats(avctx);
+            return false;
+        }
+        av_log(avctx, AV_LOG_INFO, "Video format %s (from format_code)\n",
+               ::NTV2VideoFormatToString(*out).c_str());
         return true;
     }
-    if (width == 720 && height == 486) {
-        *out = NTV2_FORMAT_525_5994;
-        return true;
+
+    if (!fr.num || !fr.den)
+        fr = st->r_frame_rate;
+    if (!fr.num || !fr.den) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot determine the stream frame rate\n");
+        return false;
     }
-    return false;
+
+    rate = ::GetNTV2FrameRateFromNumeratorDenominator(fr.num, fr.den);
+    if (rate == NTV2_FRAMERATE_UNKNOWN) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported frame rate %d/%d\n", fr.num, fr.den);
+        return false;
+    }
+
+    *out = ::GetFirstMatchingVideoFormat(rate, (UWord)par->height, (UWord)par->width,
+                                         interlaced, false, false);
+    if (*out == NTV2_FORMAT_UNKNOWN && interlaced) {
+        /* Some 1080 sources are segmented-frame rather than true interlace, and
+         * the two are different formats to the SDK even though the raster and
+         * rate match. Try PSF before giving up. */
+        *out = ::GetFirstMatchingVideoFormat(rate, (UWord)par->height,
+                                            (UWord)par->width, true, false, true);
+    }
+    if (*out == NTV2_FORMAT_UNKNOWN) {
+        av_log(avctx, AV_LOG_ERROR,
+               "No NTV2 video format for %dx%d %s at %d/%d\n",
+               par->width, par->height, interlaced ? "interlaced" : "progressive",
+               fr.num, fr.den);
+        return false;
+    }
+    av_log(avctx, AV_LOG_INFO, "%dx%d %s %d/%d -> %s\n",
+           par->width, par->height, interlaced ? "interlaced" : "progressive",
+           fr.num, fr.den, ::NTV2VideoFormatToString(*out).c_str());
+    if (par->field_order == AV_FIELD_UNKNOWN && par->height >= 1080)
+        av_log(avctx, AV_LOG_WARNING,
+               "The stream does not say whether it is interlaced, so %s was "
+               "guessed. Pass -format_code to be certain: 1080i50 and 1080p25 "
+               "share this raster and rate.\n",
+               ::NTV2VideoFormatToString(*out).c_str());
+    return true;
 }
 
 static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
@@ -139,13 +234,8 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 {
     AVCodecParameters *par = st->codecpar;
 
-    if (!aja_video_format(par->width, par->height, st->avg_frame_rate,
-                          &ctx->video_format)) {
-        av_log(avctx, AV_LOG_ERROR,
-               "Unsupported video size %dx%d; this device does 720x576 (625i50) "
-               "and 720x486 (525i5994)\n", par->width, par->height);
+    if (!aja_video_format(avctx, cctx, st, &ctx->video_format))
         return AVERROR(EINVAL);
-    }
     if (!aja_frame_format(avctx, par, &ctx->pixel_format))
         return AVERROR(EINVAL);
 
@@ -169,6 +259,13 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
      * which is what makes writing line 21 a matter of writing into the buffer.
      * Only asked for when teletext is actually wanted, since it changes the
      * buffer geometry. */
+    if (ctx->teletext_enabled && !NTV2_IS_625_FORMAT(ctx->video_format)) {
+        av_log(avctx, AV_LOG_WARNING,
+               "Teletext output only applies to 625-line SD; ignoring the "
+               "subtitle stream for %s\n",
+               ::NTV2VideoFormatToString(ctx->video_format).c_str());
+        ctx->teletext_enabled = 0;
+    }
     ctx->vanc_mode = ctx->teletext_enabled ? NTV2_VANCMODE_TALLER
                                            : NTV2_VANCMODE_OFF;
 
