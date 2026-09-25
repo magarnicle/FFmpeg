@@ -114,6 +114,8 @@ struct ajantv2_ctx {
     NTV2Buffer          audio_buffer;
     int64_t             audio_underruns;
 
+    NTV2TaskMode        saved_task_mode;  /* to hand the card back as found */
+
     int64_t             last_pts;
     int                 frames_out;
     int                 preroll_frames;   /* transfers to do before starting */
@@ -876,6 +878,7 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
         return AVERROR(ENOMEM);
     cctx->ctx = ctx;
     ctx->last_pts = AV_NOPTS_VALUE;
+    ctx->saved_task_mode = NTV2_TASK_MODE_INVALID;
     ctx->channel = (NTV2Channel)(cctx->channel > 0 ? cctx->channel - 1 : 0);
 
     /* -output takes a comma-separated list of 1-based SDI connectors. Empty
@@ -956,10 +959,21 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
         ret = AVERROR(EIO);
         goto fail;
     }
+    /* Take the card away from the AJA retail service before touching a single
+     * register. Left in standard task mode, that service keeps reprogramming
+     * the card from the control panel's settings while we run: our writes land,
+     * and it puts them back. Reading a register straight after writing it still
+     * agrees, which is why the card could report the format we asked for while
+     * sending something else down the wire. Every SDK demo does this, and the
+     * capture tool this card has been used with restores the old mode when it
+     * exits, so the service is back in charge by the time ffmpeg starts. */
+    ctx->device.GetTaskMode(ctx->saved_task_mode);
     ctx->device.AcquireStreamForApplication(AJA_FOURCC('f','f','m','p'),
                                             (int32_t)getpid());
-    av_log(avctx, AV_LOG_INFO, "AJA device: %s\n",
-           ctx->device.GetDisplayName().c_str());
+    ctx->device.SetTaskMode(NTV2_OEM_TASKS);
+    av_log(avctx, AV_LOG_INFO, "AJA device: %s (was in %s)\n",
+           ctx->device.GetDisplayName().c_str(),
+           ::NTV2TaskModeToString(ctx->saved_task_mode).c_str());
 
     if ((ret = aja_setup_video(avctx, ctx, cctx, video_st)) < 0)
         goto fail;
@@ -1088,6 +1102,8 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     ctx->device.UnsubscribeOutputVerticalEvent(ctx->channel);
     ctx->device.ReleaseStreamForApplication(AJA_FOURCC('f','f','m','p'),
                                             (int32_t)getpid());
+    if (NTV2_IS_VALID_TASK_MODE(ctx->saved_task_mode))
+        ctx->device.SetTaskMode(ctx->saved_task_mode);
     delete ctx;
     cctx->ctx = NULL;
     return 0;
