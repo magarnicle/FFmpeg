@@ -46,5 +46,5 @@
     [video0][graphic0.0.time] overlay=x=1400: y=20: alpha=straight:format=yuv422p10: repeatlast=0[videobug];
     [videobug][2:s]cea608embed=continuous=1:keepalive=1[videoout]" \
     -map [videoout] -map [audio0] \
-    -t 60 -metadata name='2026-09-25 10:52:52.040000+10:00 AU112301-M.mov' \
+    -metadata name='2026-09-25 10:52:52.040000+10:00 AU112301-M.mov' \
     -c:v v210 -f ajantv2 -format_code 1080p25 -channel 1 0
