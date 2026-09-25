@@ -780,6 +780,21 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     } else {
         src = pkt->data;
         src_stride = (int)ctx->fd.GetBytesPerRow();
+
+        /* A packet that is not the size of the raster means the encoder and the
+         * frame buffer disagree about the picture, and copying row by row out
+         * of it would read past the end and put whatever follows on air. Say so
+         * rather than sending it. */
+        if (pkt->size != (int)ctx->fd.GetVisibleRasterBytes()) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Packet is %d bytes, but %s %s wants %u (%u rows of %u). "
+                   "Refusing to send it.\n",
+                   pkt->size, ::NTV2VideoFormatToString(ctx->video_format).c_str(),
+                   ::NTV2FrameBufferFormatToString(ctx->pixel_format).c_str(),
+                   ctx->fd.GetVisibleRasterBytes(),
+                   ctx->fd.GetVisibleRasterHeight(), ctx->fd.GetBytesPerRow());
+            return AVERROR(EINVAL);
+        }
     }
     for (i = 0; i < (int)ctx->fd.GetVisibleRasterHeight(); i++)
         memcpy(dst + i * ctx->fd.GetBytesPerRow(),
