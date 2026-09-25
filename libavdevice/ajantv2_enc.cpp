@@ -657,7 +657,7 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                            struct ajantv2_cctx *cctx)
 {
-    const ULWord ring = cctx->ring_frames > 1 ? (ULWord)cctx->ring_frames : 8;
+    ULWord ring = cctx->ring_frames > 1 ? (ULWord)cctx->ring_frames : 8;
     const NTV2AudioSystem asys = ctx->audio_st ? ctx->audio_system
                                                : NTV2_AUDIOSYSTEM_INVALID;
 
@@ -694,9 +694,38 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         return 0;
     }
 
-    if (!ctx->device.AutoCirculateInitForOutput(ctx->channel, ring, asys)) {
-        av_log(avctx, AV_LOG_ERROR, "AutoCirculateInitForOutput failed\n");
-        return AVERROR(EIO);
+    /* How many frames the card has at this geometry. It is not a constant: on
+     * the KonaLHe+, 1920x1112 costs a 16MB slot and leaves 8 frames in the
+     * card's 128MB, while 1920x1080 and 1920x1114 cost 8MB and leave 16. Ask
+     * for more than exist and AutoCirculateInitForOutput fails outright, and
+     * the audio buffer takes its share on top, so come down until it takes. */
+    {
+        const NTV2FrameGeometry fg(::GetNTV2FrameGeometryFromVideoFormat(ctx->video_format));
+        const ULWord have = ::NTV2DeviceGetNumberFrameBuffers(ctx->device.GetDeviceID(),
+                                                              ctx->vanc_mode == NTV2_VANCMODE_OFF
+                                                                  ? fg : ::GetVANCFrameGeometry(fg, ctx->vanc_mode),
+                                                              ctx->pixel_format);
+        ULWord want = ring;
+        bool ok = false;
+
+        if (have && want > have)
+            want = have;
+        for (; want >= 2; want--)
+            if ((ok = ctx->device.AutoCirculateInitForOutput(ctx->channel, want, asys)))
+                break;
+        if (!ok) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "AutoCirculateInitForOutput failed for every ring depth from "
+                   "%u down to 2; this geometry leaves the card %u frames\n",
+                   ring, have);
+            return AVERROR(EIO);
+        }
+        if (want != ring)
+            av_log(avctx, AV_LOG_WARNING,
+                   "Ring of %u frames, not %u: this geometry leaves the card "
+                   "%u and the audio buffer takes its share\n",
+                   want, ring, have);
+        ring = want;
     }
     if (!ctx->device.AutoCirculateGetStatus(ctx->channel, st)) {
         av_log(avctx, AV_LOG_ERROR, "AutoCirculateGetStatus failed\n");
