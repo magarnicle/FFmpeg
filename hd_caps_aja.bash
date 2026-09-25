@@ -29,10 +29,11 @@
 #   attaches, so the subtitle goes into the filter and nowhere else, and ssplit
 #   is not needed.
 #
-#   -cc 0 while the picture itself is still being proven. It turns caption
-#   embedding off, and with it the VANC region of the frame buffer, so the buffer
-#   holds the picture and nothing else. That is the plainest path the card has,
-#   and it separates a VANC fault from a video one. Drop it once video is good.
+#   Captions are on, which is the point of this script. They come from the A53
+#   side data cea608embed attaches, go out as a CEA-708 CDP on VANC line 11, and
+#   need the VANC region present in the frame buffer -- so the frame geometry is
+#   1920x1112 here and 1920x1080 without them. If the picture is good with
+#   -cc 0 and wrong without it, that geometry is where to look.
 
 /home/matt/ffmpeg_sources/FFmpeg/ffmpeg -loglevel debug -nostdin -hide_banner -noautorotate -fflags +discardcorrupt \
     -i $HOME/Videos/AU111999-M-Preview.mov -an \
@@ -46,4 +47,4 @@
     [videobug][2:s]cea608embed=continuous=1:keepalive=1[videoout]" \
     -map [videoout] -map [audio0] \
     -t 60 -metadata name='2026-09-25 10:52:52.040000+10:00 AU112301-M.mov' \
-    -c:v v210 -f ajantv2 -format_code 1080p25 -cc 0 -channel 1 0
+    -c:v v210 -f ajantv2 -format_code 1080p25 -channel 1 0

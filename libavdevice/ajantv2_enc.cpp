@@ -930,7 +930,7 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         ctx->flip_next = (ctx->flip_next + 1) % ctx->flip_count;
 
         if (ctx->frames_out < 5)
-            av_log(avctx, AV_LOG_INFO, "Frame %d flipped to card frame %u\n",
+            av_log(avctx, AV_LOG_DEBUG, "Frame %d flipped to card frame %u\n",
                    ctx->frames_out, frame);
         ctx->frames_out++;
         return 0;
@@ -952,7 +952,7 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 
     if (ctx->frames_out < 5) {
         const uint32_t *w = (const uint32_t *)ctx->host_buffer.GetHostPointer();
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_DEBUG,
                "Frame %d: buffer %u bytes, hash %08x, first words %08x %08x, "
                "row %u words %08x %08x\n",
                ctx->frames_out, ctx->frame_size,
@@ -996,7 +996,7 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         NTV2Mode mode = NTV2_MODE_INVALID;
         ctx->device.GetOutputFrame(ctx->channel, shown);
         ctx->device.GetMode(ctx->channel, mode);
-        av_log(avctx, AV_LOG_INFO,
+        av_log(avctx, AV_LOG_DEBUG,
                "Frame %d went to card frame %d; framestore is showing %u, "
                "mode %s\n", ctx->frames_out,
                (int)ctx->xfer.GetTransferFrameNumber(), shown,
