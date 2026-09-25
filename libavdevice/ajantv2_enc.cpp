@@ -879,6 +879,18 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         av_log(avctx, AV_LOG_ERROR, "AutoCirculateTransfer failed\n");
         return AVERROR(EIO);
     }
+
+    if (ctx->frames_out < 5) {
+        ULWord shown = 0;
+        NTV2Mode mode = NTV2_MODE_INVALID;
+        ctx->device.GetOutputFrame(ctx->channel, shown);
+        ctx->device.GetMode(ctx->channel, mode);
+        av_log(avctx, AV_LOG_INFO,
+               "Frame %d went to card frame %d; framestore is showing %u, "
+               "mode %s\n", ctx->frames_out,
+               (int)ctx->xfer.GetTransferFrameNumber(), shown,
+               ::NTV2ModeToString(mode).c_str());
+    }
     ctx->frames_out++;
 
     if (!ctx->started && ctx->frames_out >= ctx->preroll_frames) {
