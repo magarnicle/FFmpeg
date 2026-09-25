@@ -25,8 +25,13 @@
 #   The AJA device reads only the first, from the A53 side data cea608embed
 #   attaches, so the subtitle goes into the filter and nowhere else, and ssplit
 #   is not needed.
+#
+#   -cc 0 while the picture itself is still being proven. It turns caption
+#   embedding off, and with it the VANC region of the frame buffer, so the buffer
+#   holds the picture and nothing else. That is the plainest path the card has,
+#   and it separates a VANC fault from a video one. Drop it once video is good.
 
-/home/matt/ffmpeg_sources/FFmpeg/ffmpeg -nostdin -hide_banner -noautorotate -fflags +discardcorrupt \
+/home/matt/ffmpeg_sources/FFmpeg/ffmpeg -loglevel debug -nostdin -hide_banner -noautorotate -fflags +discardcorrupt \
     -i $HOME/Videos/AU111999-M-Preview.mov -an \
     -i $HOME/Pictures/good.mov \
     -i /Volumes/sydneyplayout/captions/1/1/1/9/9/9/AU111999-M.srt -filter_complex \
@@ -37,5 +42,5 @@
     [video0][graphic0.0.time] overlay=x=1400: y=20: alpha=straight:format=yuv422p10: repeatlast=0[videobug];
     [videobug][2:s]cea608embed=continuous=1:keepalive=1[videoout]" \
     -map [videoout] -map [audio0] \
-    -metadata name='2026-09-25 10:52:52.040000+10:00 AU112301-M.mov' \
-    -c:v v210 -f ajantv2 -format_code 1080p25 -channel 1 -output 1 0
+    -t 60 -metadata name='2026-09-25 10:52:52.040000+10:00 AU112301-M.mov' \
+    -c:v v210 -f ajantv2 -format_code 1080p25 -cc 0 -channel 1 -output 1 0

@@ -116,6 +116,8 @@ struct ajantv2_ctx {
 
     int64_t             last_pts;
     int                 frames_out;
+    int                 preroll_frames;   /* transfers to do before starting */
+    int                 started;          /* AutoCirculate is running */
     int                 cdp_tb_num, cdp_tb_den;  /* frame duration, for the CDP */
 
     /* Teletext, all of it device-independent. */
@@ -600,20 +602,44 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     const NTV2AudioSystem asys = ctx->audio_st ? ctx->audio_system
                                                : NTV2_AUDIOSYSTEM_INVALID;
 
+    AUTOCIRCULATE_STATUS st;
+
     ctx->device.AutoCirculateStop(ctx->channel);
     if (!ctx->device.AutoCirculateInitForOutput(ctx->channel, ring, asys)) {
         av_log(avctx, AV_LOG_ERROR, "AutoCirculateInitForOutput failed\n");
         return AVERROR(EIO);
     }
-    if (!ctx->device.AutoCirculateStart(ctx->channel)) {
-        av_log(avctx, AV_LOG_ERROR, "AutoCirculateStart failed\n");
+    if (!ctx->device.AutoCirculateGetStatus(ctx->channel, st)) {
+        av_log(avctx, AV_LOG_ERROR, "AutoCirculateGetStatus failed\n");
         return AVERROR(EIO);
     }
+
+    /* Put black in every frame the card will play from. These are slots in the
+     * card's own memory, holding whatever the last thing to use the card left
+     * there, and the frames it plays before the first transfer lands come
+     * straight from them. The SDK's player does the same, in its own words, to
+     * "prevent garbage output frames". */
+    for (UWord f = st.GetStartFrame(); f <= st.GetEndFrame(); f++)
+        ctx->device.DMAWriteFrame((ULWord)f,
+                                  (ULWord *)ctx->host_buffer.GetHostPointer(),
+                                  ctx->frame_size);
+
+    /* Hold off starting. AutoCirculate started on an empty ring plays frames
+     * that have nothing in them yet, so fill a few first and start from
+     * aja_write_video once they are there, which is how the player does it. */
+    ctx->preroll_frames = st.GetFrameCount() > 1 ? st.GetFrameCount() - 1 : 1;
+    if (ctx->preroll_frames > 3)
+        ctx->preroll_frames = 3;
+
     av_log(avctx, AV_LOG_INFO,
            "AJA output: %s %s, %u-frame ring, buffer %u bytes, audio %s\n",
            ::NTV2VideoFormatToString(ctx->video_format).c_str(),
            ::NTV2FrameBufferFormatToString(ctx->pixel_format).c_str(),
            ring, ctx->frame_size, ctx->audio_st ? "on" : "off");
+    av_log(avctx, AV_LOG_INFO,
+           "Card frames %u to %u (%u of them), starting after %d\n",
+           st.GetStartFrame(), st.GetEndFrame(), st.GetFrameCount(),
+           ctx->preroll_frames);
     return 0;
 }
 
@@ -768,8 +794,9 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         aja_insert_cc(avctx, ctx, pkt);
 #endif
 
-    /* Wait for room in the ring, then hand the frame over. */
-    for (;;) {
+    /* Wait for room in the ring, then hand the frame over. Nothing is being
+     * played until the preroll is done, so there is nothing to wait for. */
+    while (ctx->started) {
         AUTOCIRCULATE_STATUS st;
         if (!ctx->device.AutoCirculateGetStatus(ctx->channel, st))
             return AVERROR(EIO);
@@ -808,6 +835,14 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         return AVERROR(EIO);
     }
     ctx->frames_out++;
+
+    if (!ctx->started && ctx->frames_out >= ctx->preroll_frames) {
+        if (!ctx->device.AutoCirculateStart(ctx->channel)) {
+            av_log(avctx, AV_LOG_ERROR, "AutoCirculateStart failed\n");
+            return AVERROR(EIO);
+        }
+        ctx->started = 1;
+    }
     return 0;
 }
 
@@ -1017,6 +1052,15 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     if (!ctx)
         return 0;
     av_log(avctx, AV_LOG_INFO, "AJA output: %d frames sent\n", ctx->frames_out);
+    {
+        AUTOCIRCULATE_STATUS st;
+        if (ctx->device.AutoCirculateGetStatus(ctx->channel, st))
+            av_log(avctx,
+                   st.GetDroppedFrameCount() ? AV_LOG_WARNING : AV_LOG_INFO,
+                   "AJA output: %u frames processed, %u dropped, %u still on "
+                   "the card\n", st.GetProcessedFrameCount(),
+                   st.GetDroppedFrameCount(), st.GetBufferLevel());
+    }
     if (ctx->audio_underruns)
         av_log(avctx, AV_LOG_WARNING, "AJA output: %"PRId64" audio underruns\n",
                ctx->audio_underruns);
