@@ -40,6 +40,7 @@ struct ajantv2_cctx {
                                    NULL infers it from the stream */
     int      cc;                /* embed CEA-708 in HD VANC; 0 keeps VANC out of
                                    the frame buffer entirely */
+    int      playout;           /* 0 = AutoCirculate, 1 = frame flipping */
 
     /* Teletext. These mirror the DeckLink output's names so a playout command
      * line moves between the two by changing only -f, and they are handed

@@ -116,6 +116,13 @@ struct ajantv2_ctx {
 
     NTV2TaskMode        saved_task_mode;  /* to hand the card back as found */
 
+    /* Frame-flipping playout, for cards whose AutoCirculate output does not
+     * run: the frames of card memory this device owns, and the next to fill. */
+    int                 flip;
+    ULWord              flip_first;
+    ULWord              flip_count;
+    ULWord              flip_next;
+
     int64_t             last_pts;
     int                 frames_out;
     int                 preroll_frames;   /* transfers to do before starting */
@@ -645,6 +652,31 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     AUTOCIRCULATE_STATUS st;
 
     ctx->device.AutoCirculateStop(ctx->channel);
+
+    /* Frame flipping. The frames are ours by convention rather than by
+     * allocation -- nothing else is using the card -- so take the first few and
+     * put black in them before pointing the framestore at the first. */
+    if (ctx->flip) {
+        ctx->flip_first = 0;
+        ctx->flip_count = ring > 2 ? (ring > 8 ? 8 : ring) : 2;
+        ctx->flip_next  = 0;
+        for (ULWord f = 0; f < ctx->flip_count; f++)
+            ctx->device.DMAWriteFrame(ctx->flip_first + f,
+                                      (ULWord *)ctx->host_buffer.GetHostPointer(),
+                                      ctx->frame_size);
+        ctx->device.SetOutputFrame(ctx->channel, ctx->flip_first);
+        ctx->started = 1;
+        av_log(avctx, AV_LOG_INFO,
+               "AJA output: %s %s, frame flipping over card frames %u to %u, "
+               "buffer %u bytes%s\n",
+               ::NTV2VideoFormatToString(ctx->video_format).c_str(),
+               ::NTV2FrameBufferFormatToString(ctx->pixel_format).c_str(),
+               ctx->flip_first, ctx->flip_first + ctx->flip_count - 1,
+               ctx->frame_size,
+               ctx->audio_st ? ", audio NOT embedded in this mode" : "");
+        return 0;
+    }
+
     if (!ctx->device.AutoCirculateInitForOutput(ctx->channel, ring, asys)) {
         av_log(avctx, AV_LOG_ERROR, "AutoCirculateInitForOutput failed\n");
         return AVERROR(EIO);
@@ -863,6 +895,30 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         aja_insert_cc(avctx, ctx, pkt);
 #endif
 
+    /* Frame flipping: put the picture in a frame the framestore is not reading,
+     * wait for the output vertical interrupt, then point the framestore at it.
+     * That is the whole of it -- no ring, no driver-side queue -- and the wait
+     * is what paces the run. */
+    if (ctx->flip) {
+        const ULWord frame = ctx->flip_first + ctx->flip_next;
+
+        if (!ctx->device.DMAWriteFrame(frame,
+                                       (ULWord *)ctx->host_buffer.GetHostPointer(),
+                                       ctx->frame_size)) {
+            av_log(avctx, AV_LOG_ERROR, "DMAWriteFrame to frame %u failed\n", frame);
+            return AVERROR(EIO);
+        }
+        ctx->device.WaitForOutputVerticalInterrupt(ctx->channel);
+        ctx->device.SetOutputFrame(ctx->channel, frame);
+        ctx->flip_next = (ctx->flip_next + 1) % ctx->flip_count;
+
+        if (ctx->frames_out < 5)
+            av_log(avctx, AV_LOG_INFO, "Frame %d flipped to card frame %u\n",
+                   ctx->frames_out, frame);
+        ctx->frames_out++;
+        return 0;
+    }
+
     /* Wait for room in the ring, then hand the frame over. Nothing is being
      * played until the preroll is done, so there is nothing to wait for. */
     while (ctx->started) {
@@ -968,6 +1024,7 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
     ctx->last_pts = AV_NOPTS_VALUE;
     ctx->saved_task_mode = NTV2_TASK_MODE_INVALID;
     ctx->channel = (NTV2Channel)(cctx->channel > 0 ? cctx->channel - 1 : 0);
+    ctx->flip = cctx->playout == 1;
 
     /* -output takes a comma-separated list of 1-based SDI connectors. Empty
      * means the connector matching the framestore, which is the usual case. */
@@ -1169,7 +1226,7 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     if (!ctx)
         return 0;
     av_log(avctx, AV_LOG_INFO, "AJA output: %d frames sent\n", ctx->frames_out);
-    {
+    if (!ctx->flip) {
         AUTOCIRCULATE_STATUS st;
         if (ctx->device.AutoCirculateGetStatus(ctx->channel, st))
             av_log(avctx,
