@@ -541,6 +541,19 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
             ctx->device.SetSDIOutputStandard(out, std);
             listed += (n ? ", " : "");
             listed += std::to_string(int(out) + 1);
+
+            /* Read the crosspoint back. Connect returning true only means the
+             * register write went through; it does not mean the connector is
+             * now fed from the framestore. */
+            {
+                NTV2OutputCrosspointID got(NTV2_XptBlack);
+                ctx->device.GetConnectedOutput(::GetSDIOutputInputXpt(out), got);
+                av_log(avctx, got == fsOut ? AV_LOG_INFO : AV_LOG_ERROR,
+                       "SDI output %d is fed from %s (wanted %s)\n",
+                       int(out) + 1,
+                       ::NTV2OutputCrosspointIDToString(got).c_str(),
+                       ::NTV2OutputCrosspointIDToString(fsOut).c_str());
+            }
         }
         av_log(avctx, AV_LOG_INFO, "Framestore %d -> SDI output%s %s\n",
                int(ctx->channel) + 1, ctx->outputs.size() > 1 ? "s" : "",
@@ -572,6 +585,15 @@ static int aja_setup_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         ctx->device.GetVANCMode(vm, ctx->channel);
         ctx->device.GetFrameGeometry(fg, ctx->channel);
         ctx->device.GetReference(ref);
+        {
+            NTV2ChannelSet on;
+            std::string names;
+            ctx->device.GetEnabledChannels(on);
+            for (NTV2ChannelSetConstIter it(on.begin()); it != on.end(); ++it)
+                names += (names.empty() ? "" : ",") + std::to_string(int(*it) + 1);
+            av_log(avctx, AV_LOG_INFO, "Framestores enabled: %s\n",
+                   names.empty() ? "none" : names.c_str());
+        }
 
         av_log(avctx, AV_LOG_INFO,
                "Card reports: %s %s %s %s, reference %s\n",
