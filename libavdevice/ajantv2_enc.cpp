@@ -39,6 +39,13 @@
  * proven on a card is the picture and the captions.
  */
 
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -53,11 +60,13 @@
 extern "C" {
 #include "libavformat/avformat.h"
 #include "libavformat/internal.h"
+#include "libavcodec/packet_internal.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/fifo.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/avstring.h"
+#include "libavutil/time.h"
 #include "libavutil/frame.h"
 
 #include "ajantv2_common_c.h"
@@ -88,7 +97,32 @@ extern "C" {
 #define AJA_CC_ENABLED(c) 0
 #endif
 
+/* Host-side output buffer.
+ *
+ * Without one, the thread that demuxes, decodes, filters and encodes is also
+ * the thread that waits on the card, so the card paces the whole pipeline and
+ * every stall anywhere in it reaches the output. The card's own elasticity is
+ * whatever the AutoCirculate ring holds, which on a KonaLHe+ playing HD with
+ * VANC is seven frames -- 280ms. A slow read or a filtergraph spike at a concat
+ * boundary does not fit in that.
+ *
+ * So packets go into this queue and a consumer thread hands them to the card.
+ * The queue is bounded by bytes and the put blocks when it is full, which
+ * pushes back upstream rather than dropping. Same shape as the DeckLink
+ * output's, minus the second queue: AutoCirculate carries audio with the video
+ * frame in one transfer, so there is nothing to schedule separately. */
+struct AjaPacketQueue {
+    PacketList       pkt_list;
+    int              nb_packets;
+    int64_t          size;
+    int64_t          max_size;
+    int              stop;
+    pthread_mutex_t  mutex;
+    pthread_cond_t   cond;
+};
+
 struct ajantv2_ctx {
+    AVFormatContext    *avctx;
     CNTV2Card           device;
     NTV2Channel         channel;              /* framestore */
     std::vector<NTV2Channel> outputs;          /* SDI connectors fed from it */
@@ -122,6 +156,30 @@ struct ajantv2_ctx {
     int                 started;          /* AutoCirculate is running */
     int                 cdp_tb_num, cdp_tb_den;  /* frame duration, for the CDP */
 
+    /* Output buffer and its consumer thread. buffered is 0 when
+     * -output_buffer_size is not set, and then everything below is unused and
+     * the muxer thread hands frames to the card itself. */
+    int                 buffered;
+    AjaPacketQueue      queue;
+    pthread_t           thread;
+    int                 thread_started;
+    int                 thread_stop;
+    int                 thread_error;
+
+    /* The audio FIFO and the teletext generator are filled by the muxer thread
+     * and drained by the consumer thread. */
+    pthread_mutex_t     audio_lock;
+    pthread_mutex_t     tt_lock;
+
+    /* Late detection. The card consumes exactly one frame per frame period once
+     * it is running, so wall clock since playback started says how many frames
+     * it has asked for, and frames_out says how many it got. */
+    int64_t             playback_start_us;
+    int64_t             frames_at_start;
+    ULWord              last_dropped;
+    int64_t             late_logged_us;
+    double              late_threshold;
+
     /* Teletext, all of it device-independent. */
 #if CONFIG_LIBKLVANC
     struct klvanc_context_s *vanc_ctx;
@@ -135,6 +193,163 @@ struct ajantv2_ctx {
     ULWord               tt_row_f1;
     ULWord               tt_row_f2;
 };
+
+/* --- output buffer -------------------------------------------------------- */
+
+static void *aja_output_thread(void *arg);
+
+static void aja_queue_init(AjaPacketQueue *q, int64_t max_size)
+{
+    memset(&q->pkt_list, 0, sizeof(q->pkt_list));
+    q->nb_packets = 0;
+    q->size       = 0;
+    q->max_size   = max_size;
+    q->stop       = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond, NULL);
+}
+
+static void aja_queue_flush(AjaPacketQueue *q)
+{
+    AVPacket pkt;
+
+    pthread_mutex_lock(&q->mutex);
+    while (avpriv_packet_list_get(&q->pkt_list, &pkt) == 0)
+        av_packet_unref(&pkt);
+    q->nb_packets = 0;
+    q->size = 0;
+    pthread_mutex_unlock(&q->mutex);
+}
+
+static void aja_queue_destroy(AjaPacketQueue *q)
+{
+    aja_queue_flush(q);
+    pthread_mutex_destroy(&q->mutex);
+    pthread_cond_destroy(&q->cond);
+}
+
+static int aja_queue_depth(AjaPacketQueue *q)
+{
+    int n;
+    pthread_mutex_lock(&q->mutex);
+    n = q->nb_packets;
+    pthread_mutex_unlock(&q->mutex);
+    return n;
+}
+
+/* Wake anything waiting, so a put or a get in progress gives up. */
+static void aja_queue_stop(AjaPacketQueue *q)
+{
+    pthread_mutex_lock(&q->mutex);
+    q->stop = 1;
+    pthread_cond_broadcast(&q->cond);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+/* Blocks while the queue is full. That backpressure is the point: it paces the
+ * pipeline against the card without the card pacing it directly. */
+static int aja_queue_put(AjaPacketQueue *q, AVPacket *pkt)
+{
+    const int size = pkt->size;
+    int ret;
+
+    if (av_packet_make_refcounted(pkt) < 0) {
+        av_packet_unref(pkt);
+        return AVERROR(ENOMEM);
+    }
+
+    pthread_mutex_lock(&q->mutex);
+    while (q->size >= q->max_size && !q->stop)
+        pthread_cond_wait(&q->cond, &q->mutex);
+    if (q->stop) {
+        pthread_mutex_unlock(&q->mutex);
+        av_packet_unref(pkt);
+        return AVERROR(EIO);
+    }
+    ret = avpriv_packet_list_put(&q->pkt_list, pkt, NULL, 0);
+    if (ret < 0) {
+        av_packet_unref(pkt);
+    } else {
+        q->nb_packets++;
+        q->size += size + (int64_t)sizeof(AVPacket);
+    }
+    pthread_cond_broadcast(&q->cond);
+    pthread_mutex_unlock(&q->mutex);
+    return ret;
+}
+
+/* Returns 1 with a packet, or 0 when the queue is empty and stopping. */
+static int aja_queue_get(AjaPacketQueue *q, AVPacket *pkt)
+{
+    pthread_mutex_lock(&q->mutex);
+    for (;;) {
+        if (avpriv_packet_list_get(&q->pkt_list, pkt) == 0) {
+            q->nb_packets--;
+            q->size -= pkt->size + (int64_t)sizeof(AVPacket);
+            pthread_cond_broadcast(&q->cond);
+            pthread_mutex_unlock(&q->mutex);
+            return 1;
+        }
+        if (q->stop) {
+            pthread_mutex_unlock(&q->mutex);
+            return 0;
+        }
+        pthread_cond_wait(&q->cond, &q->mutex);
+    }
+}
+
+/* Promote the output thread to SCHED_FIFO so the realtime playout cannot be
+ * starved by the SCHED_OTHER decode and filter workers. This is
+ * decklink_set_output_thread_priority() with the names changed; the reasoning
+ * is in the comment there, and it came from a CPU spike at a concat boundary
+ * starving the DeckLink output thread past its late threshold. Only one thread
+ * here, since audio rides with the video frame.
+ *
+ * SCHED_FIFO needs CAP_SYS_NICE or a non-zero RLIMIT_RTPRIO. Without it,
+ * fall back to a negative nice and say so loudly. Priority never fails the
+ * output. */
+static void aja_set_output_thread_priority(AVFormatContext *avctx)
+{
+    const int min_prio = sched_get_priority_min(SCHED_FIFO);
+    const int max_prio = sched_get_priority_max(SCHED_FIFO);
+    struct sched_param param;
+    int ret;
+
+    if (min_prio < 0 || max_prio < 0) {
+        av_log(avctx, AV_LOG_WARNING,
+               "Output thread: SCHED_FIFO unavailable here; default priority.\n");
+        return;
+    }
+    memset(&param, 0, sizeof(param));
+    param.sched_priority = FFMIN(min_prio + 2, max_prio);
+
+    /* pthread_setschedparam returns an errno value; it does not set errno. */
+    ret = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+    if (ret == 0) {
+        av_log(avctx, AV_LOG_INFO,
+               "Output thread: SCHED_FIFO priority %d set for realtime output.\n",
+               param.sched_priority);
+        return;
+    }
+    if (ret == EPERM) {
+        errno = 0;
+        if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -10) == 0)
+            av_log(avctx, AV_LOG_WARNING,
+                   "Output thread: no permission for SCHED_FIFO (needs "
+                   "CAP_SYS_NICE or a non-zero RLIMIT_RTPRIO); fell back to "
+                   "nice -10. Grant realtime scheduling or expect the card to "
+                   "run dry under load.\n");
+        else
+            av_log(avctx, AV_LOG_WARNING,
+                   "Output thread: no permission for SCHED_FIFO and the nice "
+                   "fallback failed (%s); default priority. Expect the card to "
+                   "run dry under load.\n", strerror(errno));
+        return;
+    }
+    av_log(avctx, AV_LOG_WARNING,
+           "Output thread: could not set SCHED_FIFO (%s); default priority.\n",
+           strerror(ret));
+}
 
 /* Pick the frame buffer format from the codec, the way the DeckLink output does.
  * The pixel format of an encoded stream is not reliable at write_header time --
@@ -708,10 +923,27 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
 
     /* Hold off starting. AutoCirculate started on an empty ring plays frames
      * that have nothing in them yet, so fill a few first and start from
-     * aja_write_video once they are there, which is how the player does it. */
-    ctx->preroll_frames = st.GetFrameCount() > 1 ? st.GetFrameCount() - 1 : 1;
-    if (ctx->preroll_frames > 3)
-        ctx->preroll_frames = 3;
+     * aja_deliver_frame once they are there, which is how the player does it.
+     *
+     * -preroll is in seconds, as on the DeckLink output, so a command line
+     * moves between the two cards unchanged. It cannot mean the same thing on
+     * both, though: DeckLink buffers in host memory and this buffers in the
+     * card's, where the whole ring is a fraction of a second, so the request is
+     * capped at one frame short of the ring. With an output buffer configured
+     * the preroll is kept to two frames and the host-side buffer carries the
+     * timing safety, which is what the DeckLink output does for the same
+     * reason: a short preroll gets to air sooner. */
+    if (ctx->buffered) {
+        ctx->preroll_frames = 2;
+    } else {
+        const double fps = ctx->cdp_tb_num > 0
+                               ? (double)ctx->cdp_tb_den / ctx->cdp_tb_num : 25.0;
+        ctx->preroll_frames = (int)(cctx->preroll * fps + 0.5);
+        if (ctx->preroll_frames < 1)
+            ctx->preroll_frames = 1;
+    }
+    if (st.GetFrameCount() > 1 && ctx->preroll_frames > (int)st.GetFrameCount() - 1)
+        ctx->preroll_frames = st.GetFrameCount() - 1;
 
     av_log(avctx, AV_LOG_INFO,
            "AJA output: %s %s, %u-frame ring, buffer %u bytes, audio %s\n",
@@ -722,6 +954,20 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
            "Card frames %u to %u (%u of them), starting after %d\n",
            st.GetStartFrame(), st.GetEndFrame(), st.GetFrameCount(),
            ctx->preroll_frames);
+
+    if (ctx->buffered) {
+        aja_queue_init(&ctx->queue, cctx->output_buffer_size);
+        if (pthread_create(&ctx->thread, NULL, aja_output_thread, ctx)) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot start the output thread\n");
+            aja_queue_destroy(&ctx->queue);
+            return AVERROR(ENOMEM);
+        }
+        ctx->thread_started = 1;
+        av_log(avctx, AV_LOG_INFO,
+               "Output buffer: %"PRId64" bytes, about %"PRId64" frames of "
+               "video\n", cctx->output_buffer_size,
+               ctx->frame_size ? cctx->output_buffer_size / ctx->frame_size : 0);
+    }
     return 0;
 }
 
@@ -852,8 +1098,72 @@ static uint32_t aja_buffer_hash(const void *buf, size_t bytes)
     return h;
 }
 
-static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
-                           AVPacket *pkt, int stored_new)
+/* Is the card being fed fast enough?
+ *
+ * AutoCirculate is a queue, not a scheduling API: frames are handed over and
+ * played in order at the card's rate, so unlike the DeckLink output there is no
+ * per-frame presentation time to compare against a clock. What there is:
+ *
+ *   - the card's own dropped-frame count, which on output counts the times it
+ *     wanted a frame and had none, so repeated the last one. Every increment is
+ *     a frame of the programme that did not go out.
+ *   - the number of frames it must have asked for by now. Once running it takes
+ *     exactly one per frame period, so wall clock since playback started says
+ *     how many, and frames_out says how many it got.
+ *
+ * A rise in the first is reported. A deficit in the second past late_threshold
+ * seconds stops the output, on the same reasoning as the DeckLink late check:
+ * hours of quietly wrong playout is worse than stopping.
+ *
+ * cdp_tb_* is the frame duration, so den/num is the frame rate. */
+static int aja_check_late(AVFormatContext *avctx, struct ajantv2_ctx *ctx)
+{
+    AUTOCIRCULATE_STATUS st;
+    int64_t now, expected, behind_frames;
+    double behind_secs;
+
+    if (!ctx->started || ctx->cdp_tb_num <= 0 || ctx->cdp_tb_den <= 0)
+        return 0;
+    if (!ctx->device.AutoCirculateGetStatus(ctx->channel, st))
+        return 0;
+
+    now = av_gettime_relative();
+
+    if (st.GetDroppedFrameCount() > ctx->last_dropped) {
+        /* At most one line a second: a card that is starving will do this on
+         * every frame, and a log full of it is no easier to read. */
+        if (now - ctx->late_logged_us > 1000000) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Card ran out of frames %u times (%u since the last "
+                   "report); %u frames in hand\n",
+                   st.GetDroppedFrameCount(),
+                   st.GetDroppedFrameCount() - ctx->last_dropped,
+                   st.GetBufferLevel());
+            ctx->late_logged_us = now;
+        }
+        ctx->last_dropped = st.GetDroppedFrameCount();
+    }
+
+    expected = (now - ctx->playback_start_us) * ctx->cdp_tb_den /
+               ((int64_t)ctx->cdp_tb_num * 1000000);
+    behind_frames = expected - (ctx->frames_out - ctx->frames_at_start);
+    if (behind_frames <= 0)
+        return 0;
+
+    behind_secs = (double)behind_frames * ctx->cdp_tb_num / ctx->cdp_tb_den;
+    if (ctx->late_threshold > 0 && behind_secs > ctx->late_threshold) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Output is %.2fs behind the card (threshold %.2fs). "
+               "Stopping.\n", behind_secs, ctx->late_threshold);
+        return AVERROR(EIO);
+    }
+    return 0;
+}
+/* Build one frame in the host buffer and hand it to the card. Runs on the muxer
+ * thread when there is no output buffer, and on the consumer thread when there
+ * is, so everything it touches that the muxer thread also touches is locked. */
+static int aja_deliver_frame(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
+                             AVPacket *pkt, int stored_new)
 {
     AVFrame *frame = NULL;
     const uint8_t *src;
@@ -896,10 +1206,16 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         memcpy(dst + i * ctx->fd.GetBytesPerRow(),
                src + (size_t)i * src_stride, ctx->fd.GetBytesPerRow());
 
+    ctx->last_pts = FFMAX(ctx->last_pts == AV_NOPTS_VALUE ? pkt->pts : ctx->last_pts,
+                          pkt->pts);
+
     if (NTV2_IS_VANCMODE_ON(ctx->vanc_mode))
         aja_blank_vanc(ctx);
-    if (ctx->teletext_enabled)
+    if (ctx->teletext_enabled) {
+        pthread_mutex_lock(&ctx->tt_lock);
         aja_insert_teletext(avctx, ctx, stored_new);
+        pthread_mutex_unlock(&ctx->tt_lock);
+    }
 #if CONFIG_LIBKLVANC
     if (ctx->cc_enabled)
         aja_insert_cc(avctx, ctx, pkt);
@@ -938,10 +1254,12 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
      * keeps the embedder fed and the two in step rather than letting audio slip
      * a frame behind for the rest of the run. */
     if (ctx->audio_fifo) {
-        const size_t have = av_fifo_can_read(ctx->audio_fifo);
+        size_t have;
         const size_t want = (size_t)ctx->audio_frame_bytes;
         uint8_t *dst = (uint8_t *)ctx->audio_buffer.GetHostPointer();
 
+        pthread_mutex_lock(&ctx->audio_lock);
+        have = av_fifo_can_read(ctx->audio_fifo);
         if (have >= want) {
             av_fifo_read(ctx->audio_fifo, dst, want);
         } else {
@@ -953,6 +1271,7 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                        "Audio underrun: %zu of %zu bytes, padding with silence "
                        "(%"PRId64" so far)\n", have, want, ctx->audio_underruns);
         }
+        pthread_mutex_unlock(&ctx->audio_lock);
         ctx->xfer.SetAudioBuffer((ULWord *)dst, ctx->audio_frame_bytes);
     }
     if (!ctx->device.AutoCirculateTransfer(ctx->channel, ctx->xfer)) {
@@ -979,6 +1298,8 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
             return AVERROR(EIO);
         }
         ctx->started = 1;
+        ctx->playback_start_us = av_gettime_relative();
+        ctx->frames_at_start = ctx->frames_out;
         {
             AUTOCIRCULATE_STATUS st;
             if (ctx->device.AutoCirculateGetStatus(ctx->channel, st))
@@ -989,10 +1310,41 @@ static int aja_write_video(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
                        st.GetStartFrame(), st.GetEndFrame(),
                        (int)st.GetActiveFrame());
         }
+        return 0;
     }
-    return 0;
+
+    return aja_check_late(avctx, ctx);
 }
 
+/* Consumer thread: take frames off the queue and hand them to the card. The
+ * muxer thread is then free to run ahead into the buffer, which is the whole
+ * point of having one. */
+static void *aja_output_thread(void *arg)
+{
+    struct ajantv2_ctx *ctx = (struct ajantv2_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    AVPacket pkt;
+
+    aja_set_output_thread_priority(avctx);
+
+    while (!ctx->thread_stop) {
+        int ret;
+
+        if (!aja_queue_get(&ctx->queue, &pkt))
+            break;                      /* empty and stopping */
+        ret = aja_deliver_frame(avctx, ctx, &pkt, 0);
+        av_packet_unref(&pkt);
+        if (ret < 0) {
+            ctx->thread_error = ret;
+            /* Let the muxer thread out of a blocking put so it can see it. */
+            aja_queue_stop(&ctx->queue);
+            break;
+        }
+    }
+    av_log(avctx, AV_LOG_INFO, "Output thread finished after %d frames\n",
+           ctx->frames_out);
+    return NULL;
+}
 extern "C" {
 
 int ff_ajantv2_write_header(AVFormatContext *avctx)
@@ -1007,8 +1359,13 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
     if (!ctx)
         return AVERROR(ENOMEM);
     cctx->ctx = ctx;
+    ctx->avctx = avctx;
+    ctx->buffered = cctx->output_buffer_size > 0;
     ctx->last_pts = AV_NOPTS_VALUE;
     ctx->saved_task_mode = NTV2_TASK_MODE_INVALID;
+    ctx->late_threshold = cctx->late_threshold;
+    pthread_mutex_init(&ctx->audio_lock, NULL);
+    pthread_mutex_init(&ctx->tt_lock, NULL);
     ctx->channel = (NTV2Channel)(cctx->channel > 0 ? cctx->channel - 1 : 0);
 
     /* -output takes a comma-separated list of 1-based SDI connectors. Empty
@@ -1098,8 +1455,34 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
      * capture tool this card has been used with restores the old mode when it
      * exits, so the service is back in charge by the time ffmpeg starts. */
     ctx->device.GetTaskMode(ctx->saved_task_mode);
-    ctx->device.AcquireStreamForApplication(AJA_FOURCC('f','f','m','p'),
-                                            (int32_t)getpid());
+
+    /* AcquireStreamForApplication fails when another application holds the
+     * card. Ignoring that let two processes each believe they owned it. With
+     * -block_until_available, wait instead, so an incoming process can be
+     * started before the outgoing one has let go. */
+    {
+        const int64_t started = av_gettime_relative();
+        int said = 0;
+
+        while (!ctx->device.AcquireStreamForApplication(AJA_FOURCC('f','f','m','p'),
+                                                        (int32_t)getpid())) {
+            if (!cctx->block_until_available) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "AJA device is in use by another application. Pass "
+                       "-block_until_available 1 to wait for it.\n");
+                ret = AVERROR(EBUSY);
+                goto fail;
+            }
+            if (!said) {
+                av_log(avctx, AV_LOG_INFO, "Waiting for the AJA device...\n");
+                said = 1;
+            }
+            av_usleep(10000);
+        }
+        if (said)
+            av_log(avctx, AV_LOG_INFO, "AJA device acquired after %.1f ms\n",
+                   (av_gettime_relative() - started) / 1000.0);
+    }
     ctx->device.SetTaskMode(NTV2_OEM_TASKS);
     av_log(avctx, AV_LOG_INFO, "AJA device: %s (was in %s)\n",
            ctx->device.GetDisplayName().c_str(),
@@ -1123,6 +1506,13 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
                "CEA-708 captions from A53 side data go out on VANC line %d\n",
                AJA_HD_LINE_CC);
 #endif
+
+    if (ctx->teletext_enabled && ctx->buffered)
+        av_log(avctx, AV_LOG_WARNING,
+               "Teletext with an output buffer puts captions ahead of the "
+               "picture by the depth of the buffer: subtitle packets reach the "
+               "generator as they are muxed, while the frames they belong to "
+               "wait in the queue.\n");
 
     if (ctx->teletext_enabled) {
         FFVbiTeletextConfig tcfg;
@@ -1172,14 +1562,18 @@ int ff_ajantv2_write_packet(AVFormatContext *avctx, AVPacket *pkt)
          * now and can go straight into the generator. The DeckLink output
          * queues instead because it pre-renders ahead of the clock; this path
          * has no equivalent yet. */
-        if (ctx->teletext_enabled)
+        if (ctx->teletext_enabled) {
+            pthread_mutex_lock(&ctx->tt_lock);
             ff_vbi_teletext_store(&ctx->tt, pkt->data, pkt->size,
                                   pkt->pts, pkt->duration, 1, avctx);
+            pthread_mutex_unlock(&ctx->tt_lock);
+        }
         return 0;
     }
     if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
         if (!ctx->audio_fifo)
             return 0;
+        pthread_mutex_lock(&ctx->audio_lock);
         if (st->codecpar->codec_id == AV_CODEC_ID_PCM_S16LE) {
             /* The card embeds 32-bit samples, so widen on the way in rather
              * than make the caller do it. */
@@ -1193,14 +1587,18 @@ int ff_ajantv2_write_packet(AVFormatContext *avctx, AVPacket *pkt)
         } else if (av_fifo_write(ctx->audio_fifo, pkt->data, pkt->size) < 0) {
             av_log(avctx, AV_LOG_WARNING, "Audio FIFO full, dropping a packet\n");
         }
+        pthread_mutex_unlock(&ctx->audio_lock);
         return 0;
     }
     if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
         return 0;
 
-    ctx->last_pts = FFMAX(ctx->last_pts == AV_NOPTS_VALUE ? pkt->pts : ctx->last_pts,
-                          pkt->pts);
-    return aja_write_video(avctx, ctx, pkt, 0);
+    if (!ctx->buffered)
+        return aja_deliver_frame(avctx, ctx, pkt, 0);
+
+    if (ctx->thread_error)
+        return ctx->thread_error;
+    return aja_queue_put(&ctx->queue, pkt);
 }
 
 int ff_ajantv2_write_trailer(AVFormatContext *avctx)
@@ -1210,6 +1608,27 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
 
     if (!ctx)
         return 0;
+
+    /* Let the buffer empty onto the card before stopping anything, or the tail
+     * of the programme never goes out. A thread that has already failed has
+     * nothing to drain into. */
+    if (ctx->thread_started) {
+        int64_t waited = 0;
+
+        while (aja_queue_depth(&ctx->queue) > 0 && !ctx->thread_error) {
+            av_usleep(10000);
+            if ((waited += 10000) % 1000000 == 0)
+                av_log(avctx, AV_LOG_INFO,
+                       "Output buffer draining: %d frames left\n",
+                       aja_queue_depth(&ctx->queue));
+        }
+        ctx->thread_stop = 1;
+        aja_queue_stop(&ctx->queue);
+        pthread_join(ctx->thread, NULL);
+        ctx->thread_started = 0;
+        aja_queue_destroy(&ctx->queue);
+    }
+
     av_log(avctx, AV_LOG_INFO, "AJA output: %d frames sent\n", ctx->frames_out);
     {
         AUTOCIRCULATE_STATUS st;
@@ -1235,6 +1654,8 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
                                             (int32_t)getpid());
     if (NTV2_IS_VALID_TASK_MODE(ctx->saved_task_mode))
         ctx->device.SetTaskMode(ctx->saved_task_mode);
+    pthread_mutex_destroy(&ctx->audio_lock);
+    pthread_mutex_destroy(&ctx->tt_lock);
     delete ctx;
     cctx->ctx = NULL;
     return 0;

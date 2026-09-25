@@ -215,22 +215,52 @@ drifts in one direction until something drops or repeats. The LHe+ has a
 reference input; a real installation should genlock to house reference, and the
 reference source should be an option.
 
+## Two questions nobody has answered yet
+
+Both of these are decisions rather than work, and neither is settled. They are
+recorded here so they are not lost, and so that whoever picks them up knows they
+were left open on purpose rather than overlooked.
+
+**Should HD go back to `NTV2_VANCMODE_TALLER`?** On this card TALLER costs an
+8 MB frame slot and TALL costs 16 MB, so TALLER gives sixteen frames where TALL
+gives eight. The move to TALL was a guess made while chasing a fault that turned
+out to be routing, and it has never been justified on its own terms. The counter
+-argument is that TALL is the ordinary HD VANC geometry and TALLER is unusual.
+Deciding needs a run of each with the output buffer in place, since a host-side
+buffer may make the ring depth stop mattering.
+
+**Should the rig genlock, or free-run?** The device sets
+`NTV2_REFERENCE_FREERUN`, which is right for a test and probably wrong for
+playout. Free-running, the card's clock and the file's nominal frame rate differ
+by the crystal error, so the buffer drifts one way until something drops or
+repeats. The LHe+ has a reference input. Answering this needs a long run to see
+which way and how fast it drifts, and a decision about what the rest of the
+facility is referenced to.
+
 ## Suggested order
 
-1. Check the return of `AcquireStreamForApplication`. A bug, small, independent.
-2. Output buffer and consumer thread, with the thread priority promotion. Most
-   of the stability benefit is here.
-3. Late-frame policy built on buffer level and dropped count, now that there is
-   a thread positioned to watch them.
-4. `preroll` as an option, tied to the buffer as DeckLink ties it.
-5. `block_until_available`, which is small once 1 is done.
+1. ~~Check the return of `AcquireStreamForApplication`.~~ **Done.** Fails with
+   `EBUSY` now instead of pretending to own the card.
+2. ~~Output buffer and consumer thread, with the thread priority promotion.~~
+   **Done.** `-output_buffer_size`, default 0, which keeps the old synchronous
+   behaviour.
+3. ~~Late-frame policy built on buffer level and dropped count.~~ **Done.**
+   `-late_threshold`, default 5 seconds.
+4. ~~`preroll` as an option, tied to the buffer as DeckLink ties it.~~ **Done.**
+   `-preroll`, default 0.5 seconds, capped at one frame short of the ring.
+5. ~~`block_until_available`.~~ **Done.**
 6. Pre-render, including the task-mode hand-over policy and finding out what the
    framestore shows between processes.
 7. Shared memory and socket input, after pulling DeckLink's implementation out
    into something both devices use.
 
+Items 1 to 5 are written but have not been near a card. Nothing about them has
+been tested beyond compiling, and the concurrency in item 2 is the kind that
+looks right and is not. The first run with `-output_buffer_size` should be a
+short one with something disposable on the output.
+
 Items 1 to 4 make single-process playout dependable. Items 5 to 7 are what makes
-two processes able to hand over, and they are only worth starting once 1 to 4
+two processes able to hand over, and 6 and 7 are only worth starting once 1 to 5
 hold up over a long run.
 
 ## What still needs measuring
@@ -238,10 +268,6 @@ hold up over a long run.
 - A long run. Sixty seconds with no dropped frames says nothing about an hour.
   The drift question in particular cannot be answered in a minute.
 - Whether seven frames of card-side ring is enough once a host-side buffer is
-  feeding it, or whether HD should go back to `NTV2_VANCMODE_TALLER`. On this
-  card TALLER is the cheaper geometry, 8 MB against 16 MB, and would give
-  sixteen frames instead of eight. The move to TALL was a guess made while
-  chasing a fault that turned out to be routing, and it has never been justified
-  on its own terms.
+  feeding it. See the geometry question above.
 - What the framestore outputs between `AutoCirculateStop` and the next process
   starting.

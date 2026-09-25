@@ -38,6 +38,10 @@ static const AVOption options[] = {
     { "ring_frames", "AutoCirculate output ring depth in frames", OFFSET(ring_frames), AV_OPT_TYPE_INT, { .i64 = 8 }, 2, 64, ENC },
     { "audio_depth", "audio bits per sample (the card embeds 32-bit; 16 is converted)", OFFSET(audio_depth), AV_OPT_TYPE_INT, { .i64 = 32 }, 16, 32, ENC },
     { "cc", "embed CEA-708 captions from A53 side data in HD VANC; off also keeps the VANC region out of the frame buffer, which is the plainest video path the card has", OFFSET(cc), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ENC },
+    { "output_buffer_size", "host-side output buffer in bytes (0 = hand each frame straight to the card, and let the card pace the pipeline)", OFFSET(output_buffer_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, ENC },
+    { "preroll", "seconds of video buffered on the card before playback starts", OFFSET(preroll), AV_OPT_TYPE_DOUBLE, { .dbl = 0.5 }, 0, 5, ENC },
+    { "late_threshold", "stop if the output falls this many seconds behind the card (0 = never stop)", OFFSET(late_threshold), AV_OPT_TYPE_DOUBLE, { .dbl = 5.0 }, 0, 3600, ENC },
+    { "block_until_available", "wait for another application to release the card instead of failing", OFFSET(block_until_available), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "format_code", "NTV2 video format by name, e.g. \"1080i50\", \"1080p25\", \"625i50\"; needed when the raster and rate alone are ambiguous, as 1080i50 and 1080p25 are", OFFSET(format_code), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
 
     { "teletext_fields", "teletext field insertion mode", OFFSET(teletext_fields), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, ENC, .unit = "teletext_fields" },

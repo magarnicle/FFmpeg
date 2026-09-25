@@ -40,6 +40,10 @@ struct ajantv2_cctx {
                                    NULL infers it from the stream */
     int      cc;                /* embed CEA-708 in HD VANC; 0 keeps VANC out of
                                    the frame buffer entirely */
+    int64_t  output_buffer_size;/* host-side output buffer, bytes (0 = off) */
+    double   preroll;           /* seconds of video buffered before playback */
+    double   late_threshold;    /* stop if this far behind the card (0 = never) */
+    int      block_until_available; /* wait for the card instead of failing */
 
     /* Teletext. These mirror the DeckLink output's names so a playout command
      * line moves between the two by changing only -f, and they are handed
