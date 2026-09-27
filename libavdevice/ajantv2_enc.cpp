@@ -67,6 +67,7 @@ extern "C" {
 #include "libavutil/pixdesc.h"
 #include "libavutil/avstring.h"
 #include "libavutil/time.h"
+#include "libavutil/parseutils.h"
 #include "libavutil/frame.h"
 
 #include "ajantv2_common_c.h"
@@ -123,6 +124,7 @@ struct AjaPacketQueue {
 
 struct ajantv2_ctx {
     AVFormatContext    *avctx;
+    AVStream           *video_st;
     CNTV2Card           device;
     NTV2Channel         channel;              /* framestore */
     std::vector<NTV2Channel> outputs;          /* SDI connectors fed from it */
@@ -161,6 +163,18 @@ struct ajantv2_ctx {
      * the muxer thread hands frames to the card itself. */
     int                 buffered;
     AjaPacketQueue      queue;
+
+    /* Pre-render. The card is not touched until the trigger fires, so frames
+     * pile up in the queue while another process is still on air. */
+    int                 pre_render;
+    int64_t             trigger_time_us;   /* wall clock, 0 = no time trigger */
+    int                 trigger_frames;    /* queue depth, 0 = no count trigger */
+    int64_t             fired_us;
+    volatile int        device_ready;
+    pthread_t           trigger_thread;
+    int                 trigger_started;
+    volatile int        trigger_stop;
+
     pthread_t           thread;
     int                 thread_started;
     int                 thread_stop;
@@ -955,19 +969,6 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
            st.GetStartFrame(), st.GetEndFrame(), st.GetFrameCount(),
            ctx->preroll_frames);
 
-    if (ctx->buffered) {
-        aja_queue_init(&ctx->queue, cctx->output_buffer_size);
-        if (pthread_create(&ctx->thread, NULL, aja_output_thread, ctx)) {
-            av_log(avctx, AV_LOG_ERROR, "Cannot start the output thread\n");
-            aja_queue_destroy(&ctx->queue);
-            return AVERROR(ENOMEM);
-        }
-        ctx->thread_started = 1;
-        av_log(avctx, AV_LOG_INFO,
-               "Output buffer: %"PRId64" bytes, about %"PRId64" frames of "
-               "video\n", cctx->output_buffer_size,
-               ctx->frame_size ? cctx->output_buffer_size / ctx->frame_size : 0);
-    }
     return 0;
 }
 
@@ -1330,6 +1331,14 @@ static void *aja_output_thread(void *arg)
     while (!ctx->thread_stop) {
         int ret;
 
+        /* In pre-render the card has not been claimed yet, so there is nothing
+         * to deliver to. Frames pile up in the queue meanwhile, which is the
+         * point of the mode. */
+        if (!ctx->device_ready) {
+            av_usleep(5000);
+            continue;
+        }
+
         if (!aja_queue_get(&ctx->queue, &pkt))
             break;                      /* empty and stopping */
         ret = aja_deliver_frame(avctx, ctx, &pkt, 0);
@@ -1347,6 +1356,150 @@ static void *aja_output_thread(void *arg)
 }
 extern "C" {
 
+static void *aja_trigger_thread(void *arg);
+/* Claim the card and set it up. Split out because pre-render calls it from the
+ * trigger thread, long after write_header has returned, so that the frames of
+ * this programme can be decoded and buffered while the previous one is still on
+ * air. Everything that talks to the card for the first time lives here. */
+static int aja_claim_and_init(AVFormatContext *avctx)
+{
+    struct ajantv2_cctx *cctx = (struct ajantv2_cctx *)avctx->priv_data;
+    struct ajantv2_ctx *ctx = (struct ajantv2_ctx *)cctx->ctx;
+    int ret;
+
+    if (!CNTV2DeviceScanner::GetFirstDeviceFromArgument(avctx->url ? avctx->url : "0",
+                                                        ctx->device)) {
+        av_log(avctx, AV_LOG_ERROR, "No AJA device matching '%s'\n",
+               avctx->url ? avctx->url : "0");
+        return AVERROR(ENODEV);
+    }
+    if (!ctx->device.IsDeviceReady(false)) {
+        av_log(avctx, AV_LOG_ERROR, "AJA device is not ready\n");
+        return AVERROR(EIO);
+    }
+    /* Take the card away from the AJA retail service before touching a single
+     * register. Left in standard task mode, that service keeps reprogramming
+     * the card from the control panel's settings while we run: our writes land,
+     * and it puts them back. Reading a register straight after writing it still
+     * agrees, which is why the card could report the format we asked for while
+     * sending something else down the wire. Every SDK demo does this, and the
+     * capture tool this card has been used with restores the old mode when it
+     * exits, so the service is back in charge by the time ffmpeg starts. */
+    ctx->device.GetTaskMode(ctx->saved_task_mode);
+
+    /* AcquireStreamForApplication fails when another application holds the
+     * card. Ignoring that let two processes each believe they owned it. With
+     * -block_until_available, wait instead, so an incoming process can be
+     * started before the outgoing one has let go. */
+    {
+        const int64_t started = av_gettime_relative();
+        int said = 0;
+
+        while (!ctx->device.AcquireStreamForApplication(AJA_FOURCC('f','f','m','p'),
+                                                        (int32_t)getpid())) {
+            if (!cctx->block_until_available) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "AJA device is in use by another application. Pass "
+                       "-block_until_available 1 to wait for it.\n");
+                return AVERROR(EBUSY);
+            }
+            if (!said) {
+                av_log(avctx, AV_LOG_INFO, "Waiting for the AJA device...\n");
+                said = 1;
+            }
+            av_usleep(10000);
+        }
+        if (said)
+            av_log(avctx, AV_LOG_INFO, "AJA device acquired after %.1f ms\n",
+                   (av_gettime_relative() - started) / 1000.0);
+    }
+    ctx->device.SetTaskMode(NTV2_OEM_TASKS);
+    av_log(avctx, AV_LOG_INFO, "AJA device: %s (was in %s)\n",
+           ctx->device.GetDisplayName().c_str(),
+           ::NTV2TaskModeToString(ctx->saved_task_mode).c_str());
+
+    if ((ret = aja_setup_video(avctx, ctx, cctx, ctx->video_st)) < 0)
+        return ret;
+    if (ctx->audio_st && (ret = aja_setup_audio(avctx, ctx, cctx)) < 0)
+        return ret;
+    if ((ret = aja_start_output(avctx, ctx, cctx)) < 0)
+        return ret;
+
+#if CONFIG_LIBKLVANC
+    if (ctx->cc_enabled && klvanc_context_create(&ctx->vanc_ctx) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot create a klvanc context\n");
+        return AVERROR(ENOMEM);
+    }
+    if (ctx->cc_enabled)
+        av_log(avctx, AV_LOG_INFO,
+               "CEA-708 captions from A53 side data go out on VANC line %d\n",
+               AJA_HD_LINE_CC);
+#endif
+
+    ctx->device_ready = 1;
+    return 0;
+}
+
+/* Pre-render: watch for the moment to take the card.
+ *
+ * Two triggers, either or both. A frame count fires once that many frames are
+ * waiting in the output buffer, which is the one to use when the hand-over is
+ * paced by the outgoing programme ending. A wall-clock time fires at that time,
+ * which is the one to use when the schedule says so. With neither, it fires as
+ * soon as there is anything to play, which is only useful for testing.
+ *
+ * The wait matters because claiming the card is what the outgoing process has
+ * to have finished with, and -block_until_available makes the claim itself
+ * wait. So the two together cover both orders: trigger before the other process
+ * has let go, or after. */
+static void *aja_trigger_thread(void *arg)
+{
+    struct ajantv2_ctx *ctx = (struct ajantv2_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    int ret;
+
+    av_log(avctx, AV_LOG_INFO,
+           "Pre-render: holding the card until %s%s%s\n",
+           ctx->trigger_frames ? "the buffer fills" : "",
+           (ctx->trigger_frames && ctx->trigger_time_us) ? " or " : "",
+           ctx->trigger_time_us ? "the time comes" :
+               (ctx->trigger_frames ? "" : "there is a frame to play"));
+
+    while (!ctx->trigger_stop) {
+        const int depth = aja_queue_depth(&ctx->queue);
+        int fire = 0;
+
+        if (ctx->trigger_frames > 0 && depth >= ctx->trigger_frames) {
+            av_log(avctx, AV_LOG_INFO,
+                   "Pre-render: %d frames buffered\n", depth);
+            fire = 1;
+        } else if (ctx->trigger_time_us > 0 && av_gettime() >= ctx->trigger_time_us) {
+            av_log(avctx, AV_LOG_INFO, "Pre-render: the time came\n");
+            fire = 1;
+        } else if (!ctx->trigger_frames && !ctx->trigger_time_us && depth > 0) {
+            fire = 1;
+        }
+        if (!fire) {
+            av_usleep(10000);
+            continue;
+        }
+
+        ctx->fired_us = av_gettime_relative();
+        ret = aja_claim_and_init(avctx);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Pre-render: could not take the card\n");
+            ctx->thread_error = ret;
+            aja_queue_stop(&ctx->queue);
+        } else {
+            av_log(avctx, AV_LOG_INFO,
+                   "Pre-render: card ready %.1f ms after the trigger, %d frames "
+                   "in hand\n", (av_gettime_relative() - ctx->fired_us) / 1000.0,
+                   aja_queue_depth(&ctx->queue));
+        }
+        break;
+    }
+    return NULL;
+}
 int ff_ajantv2_write_header(AVFormatContext *avctx)
 {
     struct ajantv2_cctx *cctx = (struct ajantv2_cctx *)avctx->priv_data;
@@ -1433,79 +1586,60 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
         ret = AVERROR(EINVAL);
         goto fail;
     }
+    ctx->video_st = video_st;
 
-    if (!CNTV2DeviceScanner::GetFirstDeviceFromArgument(avctx->url ? avctx->url : "0",
-                                                        ctx->device)) {
-        av_log(avctx, AV_LOG_ERROR, "No AJA device matching '%s'\n",
-               avctx->url ? avctx->url : "0");
-        ret = AVERROR(ENODEV);
-        goto fail;
-    }
-    if (!ctx->device.IsDeviceReady(false)) {
-        av_log(avctx, AV_LOG_ERROR, "AJA device is not ready\n");
-        ret = AVERROR(EIO);
-        goto fail;
-    }
-    /* Take the card away from the AJA retail service before touching a single
-     * register. Left in standard task mode, that service keeps reprogramming
-     * the card from the control panel's settings while we run: our writes land,
-     * and it puts them back. Reading a register straight after writing it still
-     * agrees, which is why the card could report the format we asked for while
-     * sending something else down the wire. Every SDK demo does this, and the
-     * capture tool this card has been used with restores the old mode when it
-     * exits, so the service is back in charge by the time ffmpeg starts. */
-    ctx->device.GetTaskMode(ctx->saved_task_mode);
-
-    /* AcquireStreamForApplication fails when another application holds the
-     * card. Ignoring that let two processes each believe they owned it. With
-     * -block_until_available, wait instead, so an incoming process can be
-     * started before the outgoing one has let go. */
-    {
-        const int64_t started = av_gettime_relative();
-        int said = 0;
-
-        while (!ctx->device.AcquireStreamForApplication(AJA_FOURCC('f','f','m','p'),
-                                                        (int32_t)getpid())) {
-            if (!cctx->block_until_available) {
-                av_log(avctx, AV_LOG_ERROR,
-                       "AJA device is in use by another application. Pass "
-                       "-block_until_available 1 to wait for it.\n");
-                ret = AVERROR(EBUSY);
-                goto fail;
-            }
-            if (!said) {
-                av_log(avctx, AV_LOG_INFO, "Waiting for the AJA device...\n");
-                said = 1;
-            }
-            av_usleep(10000);
+    if (cctx->pre_render) {
+        if (!ctx->buffered) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Pre-render needs -output_buffer_size: the frames have to go "
+                   "somewhere while the card still belongs to another process.\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
         }
-        if (said)
-            av_log(avctx, AV_LOG_INFO, "AJA device acquired after %.1f ms\n",
-                   (av_gettime_relative() - started) / 1000.0);
+        if (ctx->teletext_enabled) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Pre-render and teletext do not go together: the generator is "
+                   "configured from the video format, which is not known until "
+                   "the card is claimed, and subtitles arrive before that.\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+        if (cctx->pre_render_until &&
+            av_parse_time(&ctx->trigger_time_us, cctx->pre_render_until, 0) < 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Cannot read -pre_render_until '%s'\n", cctx->pre_render_until);
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+        ctx->trigger_frames = cctx->pre_render_frames;
+        ctx->pre_render = 1;
     }
-    ctx->device.SetTaskMode(NTV2_OEM_TASKS);
-    av_log(avctx, AV_LOG_INFO, "AJA device: %s (was in %s)\n",
-           ctx->device.GetDisplayName().c_str(),
-           ::NTV2TaskModeToString(ctx->saved_task_mode).c_str());
 
-    if ((ret = aja_setup_video(avctx, ctx, cctx, video_st)) < 0)
-        goto fail;
-    if (ctx->audio_st && (ret = aja_setup_audio(avctx, ctx, cctx)) < 0)
-        goto fail;
-    if ((ret = aja_start_output(avctx, ctx, cctx)) < 0)
-        goto fail;
+    /* The buffer and its thread come up before the card, so that pre-render has
+     * somewhere to put frames while it waits. */
+    if (ctx->buffered) {
+        aja_queue_init(&ctx->queue, cctx->output_buffer_size);
+        if (pthread_create(&ctx->thread, NULL, aja_output_thread, ctx)) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot start the output thread\n");
+            aja_queue_destroy(&ctx->queue);
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        ctx->thread_started = 1;
+        av_log(avctx, AV_LOG_INFO, "Output buffer: %"PRId64" bytes\n",
+               cctx->output_buffer_size);
+    }
 
-#if CONFIG_LIBKLVANC
-    if (ctx->cc_enabled && klvanc_context_create(&ctx->vanc_ctx) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Cannot create a klvanc context\n");
-        ret = AVERROR(ENOMEM);
+    if (ctx->pre_render) {
+        if (pthread_create(&ctx->trigger_thread, NULL, aja_trigger_thread, ctx)) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot start the pre-render thread\n");
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        ctx->trigger_started = 1;
+    } else if ((ret = aja_claim_and_init(avctx)) < 0) {
         goto fail;
     }
-    if (ctx->cc_enabled)
-        av_log(avctx, AV_LOG_INFO,
-               "CEA-708 captions from A53 side data go out on VANC line %d\n",
-               AJA_HD_LINE_CC);
-#endif
 
     if (ctx->teletext_enabled && ctx->buffered)
         av_log(avctx, AV_LOG_WARNING,
@@ -1612,10 +1746,20 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     /* Let the buffer empty onto the card before stopping anything, or the tail
      * of the programme never goes out. A thread that has already failed has
      * nothing to drain into. */
+    if (ctx->trigger_started) {
+        ctx->trigger_stop = 1;
+        pthread_join(ctx->trigger_thread, NULL);
+        ctx->trigger_started = 0;
+        if (!ctx->device_ready)
+            av_log(avctx, AV_LOG_WARNING,
+                   "Pre-render never fired, so nothing went to air.\n");
+    }
+
     if (ctx->thread_started) {
         int64_t waited = 0;
 
-        while (aja_queue_depth(&ctx->queue) > 0 && !ctx->thread_error) {
+        while (aja_queue_depth(&ctx->queue) > 0 && !ctx->thread_error &&
+               ctx->device_ready) {
             av_usleep(10000);
             if ((waited += 10000) % 1000000 == 0)
                 av_log(avctx, AV_LOG_INFO,
@@ -1630,7 +1774,7 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     }
 
     av_log(avctx, AV_LOG_INFO, "AJA output: %d frames sent\n", ctx->frames_out);
-    {
+    if (ctx->device_ready) {
         AUTOCIRCULATE_STATUS st;
         if (ctx->device.AutoCirculateGetStatus(ctx->channel, st))
             av_log(avctx,
@@ -1648,12 +1792,24 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     if (ctx->vanc_ctx)
         klvanc_context_destroy(ctx->vanc_ctx);
 #endif
-    ctx->device.AutoCirculateStop(ctx->channel);
-    ctx->device.UnsubscribeOutputVerticalEvent(ctx->channel);
-    ctx->device.ReleaseStreamForApplication(AJA_FOURCC('f','f','m','p'),
-                                            (int32_t)getpid());
-    if (NTV2_IS_VALID_TASK_MODE(ctx->saved_task_mode))
-        ctx->device.SetTaskMode(ctx->saved_task_mode);
+    if (ctx->device_ready) {
+        ctx->device.AutoCirculateStop(ctx->channel);
+        ctx->device.UnsubscribeOutputVerticalEvent(ctx->channel);
+        ctx->device.ReleaseStreamForApplication(AJA_FOURCC('f','f','m','p'),
+                                                (int32_t)getpid());
+    }
+    /* Handing the card back to the AJA retail service is good manners for a
+     * one-off run and wrong in a hand-over: between this process letting go and
+     * the next one taking hold, the service reprograms the card from the control
+     * panel's settings, and whatever that puts out goes to air in the gap
+     * between two programmes. -restore_task_mode 0 leaves it in OEM mode. */
+    if (NTV2_IS_VALID_TASK_MODE(ctx->saved_task_mode)) {
+        if (cctx->restore_task_mode)
+            ctx->device.SetTaskMode(ctx->saved_task_mode);
+        else
+            av_log(avctx, AV_LOG_INFO,
+                   "Leaving the card in OEM mode for whoever takes it next\n");
+    }
     pthread_mutex_destroy(&ctx->audio_lock);
     pthread_mutex_destroy(&ctx->tt_lock);
     delete ctx;

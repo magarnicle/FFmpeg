@@ -44,6 +44,10 @@ struct ajantv2_cctx {
     double   preroll;           /* seconds of video buffered before playback */
     double   late_threshold;    /* stop if this far behind the card (0 = never) */
     int      block_until_available; /* wait for the card instead of failing */
+    int      pre_render;        /* fill the buffer before touching the card */
+    char    *pre_render_until;  /* UTC time to start, parsed by av_parse_time */
+    int      pre_render_frames; /* frames to buffer before starting */
+    int      restore_task_mode; /* hand the card back to the AJA service on exit */
 
     /* Teletext. These mirror the DeckLink output's names so a playout command
      * line moves between the two by changing only -f, and they are handed

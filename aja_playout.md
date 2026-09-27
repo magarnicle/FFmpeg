@@ -249,19 +249,32 @@ facility is referenced to.
 4. ~~`preroll` as an option, tied to the buffer as DeckLink ties it.~~ **Done.**
    `-preroll`, default 0.5 seconds, capped at one frame short of the ring.
 5. ~~`block_until_available`.~~ **Done.**
-6. Pre-render, including the task-mode hand-over policy and finding out what the
-   framestore shows between processes.
+6. ~~Pre-render, including the task-mode hand-over policy.~~ **Done.**
+   `-pre_render`, `-pre_render_until`, `-pre_render_frames` and
+   `-restore_task_mode`. What the framestore shows between processes is still
+   unknown and still needs a card to answer.
 7. Shared memory and socket input, after pulling DeckLink's implementation out
    into something both devices use.
 
-Items 1 to 5 are written but have not been near a card. Nothing about them has
+Items 1 to 6 are written but have not been near a card. Nothing about them has
 been tested beyond compiling, and the concurrency in item 2 is the kind that
 looks right and is not. The first run with `-output_buffer_size` should be a
 short one with something disposable on the output.
 
 Items 1 to 4 make single-process playout dependable. Items 5 to 7 are what makes
-two processes able to hand over, and 6 and 7 are only worth starting once 1 to 5
-hold up over a long run.
+two processes able to hand over.
+
+Pre-render deliberately refuses two combinations. Without `-output_buffer_size`
+there is nowhere for frames to go while the card belongs to someone else, so it
+is required. And teletext is refused outright, because the generator is
+configured from the video format, which is not known until the card is claimed,
+while subtitle packets arrive before that; the SD teletext path runs on the
+DeckLink anyway.
+
+One consequence worth knowing: if the trigger never fires, the buffer fills and
+the muxer thread blocks in the put, so ffmpeg waits rather than exits. That is
+the intended behaviour for a scheduled start, and it means a `-t`-limited test
+run with a trigger time in the future will appear to hang.
 
 ## What still needs measuring
 
@@ -270,4 +283,7 @@ hold up over a long run.
 - Whether seven frames of card-side ring is enough once a host-side buffer is
   feeding it. See the geometry question above.
 - What the framestore outputs between `AutoCirculateStop` and the next process
-  starting.
+  starting. This is the one that decides whether a hand-over looks like a freeze
+  or like a fault, and no amount of reading answers it.
+- Whether `-restore_task_mode 0` is enough on its own, or whether the incoming
+  process also has to take OEM mode before the outgoing one lets go.
