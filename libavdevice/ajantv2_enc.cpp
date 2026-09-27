@@ -73,6 +73,7 @@ extern "C" {
 #include "ajantv2_common_c.h"
 #include "ajantv2_enc.h"
 #include "vbi_teletext.h"
+#include "outdev_feed.h"
 }
 
 /* After the block above, because CONFIG_LIBKLVANC comes from config.h and is
@@ -174,6 +175,15 @@ struct ajantv2_ctx {
     pthread_t           trigger_thread;
     int                 trigger_started;
     volatile int        trigger_stop;
+
+    /* Frames from other processes. */
+    FFOutdevShmBuffer  *shm;
+    int                 shm_is_server;
+    const char         *shm_name;
+    pthread_t           shm_thread;
+    int                 shm_thread_started;
+    volatile int        shm_stop;
+    FFOutdevSocketServer socket_server;
 
     pthread_t           thread;
     int                 thread_started;
@@ -1356,6 +1366,95 @@ static void *aja_output_thread(void *arg)
 }
 extern "C" {
 
+/* --- frames from other processes ------------------------------------------
+ *
+ * Two ways in, both from outdev_feed.c and both shared with the DeckLink
+ * output: a shared-memory ring for another ffmpeg, and a Unix socket for
+ * anything else. Either way the frame joins the output buffer, so both need
+ * -output_buffer_size.
+ *
+ * One thing is simpler here than on DeckLink: AutoCirculate plays frames in the
+ * order they arrive and pays no attention to timestamps, so there is no pts to
+ * rebase when a new client connects mid-run. The pts is carried only so the
+ * frame has one. */
+static int aja_feed_frame(void *opaque, int type, const uint8_t *data,
+                          int size, int64_t pts)
+{
+    struct ajantv2_ctx *ctx = (struct ajantv2_ctx *)opaque;
+    AVFormatContext *avctx = ctx->avctx;
+    AVPacket *pkt;
+    int ret;
+
+    if (type == FF_OUTDEV_FRAME_AUDIO) {
+        if (!ctx->audio_fifo)
+            return 0;
+        pthread_mutex_lock(&ctx->audio_lock);
+        if (av_fifo_write(ctx->audio_fifo, (void *)data, size) < 0)
+            av_log(avctx, AV_LOG_WARNING, "Audio FIFO full, dropping a frame\n");
+        pthread_mutex_unlock(&ctx->audio_lock);
+        return 0;
+    }
+    if (type != FF_OUTDEV_FRAME_VIDEO) {
+        av_log(avctx, AV_LOG_WARNING, "Ignoring stream type %d\n", type);
+        return 0;
+    }
+
+    pkt = av_packet_alloc();
+    if (!pkt)
+        return AVERROR(ENOMEM);
+    if (av_new_packet(pkt, size) < 0) {
+        av_packet_free(&pkt);
+        return AVERROR(ENOMEM);
+    }
+    memcpy(pkt->data, data, size);
+    pkt->pts = pkt->dts = pts;
+    pkt->stream_index = ctx->video_st ? ctx->video_st->index : 0;
+
+    ret = aja_queue_put(&ctx->queue, pkt);
+    av_packet_free(&pkt);
+    return ret;
+}
+
+/* Shared memory reader: take frames out of the ring and put them in the output
+ * buffer, which is where the muxer thread's own frames go. */
+static void *aja_shm_thread(void *arg)
+{
+    struct ajantv2_ctx *ctx = (struct ajantv2_ctx *)arg;
+    AVFormatContext *avctx = ctx->avctx;
+    FFOutdevFrameHeader header;
+    uint8_t *frame;
+    const uint32_t frame_max = ctx->frame_size ? ctx->frame_size : (8 << 20);
+
+    frame = (uint8_t *)av_malloc(frame_max);
+    if (!frame) {
+        ctx->thread_error = AVERROR(ENOMEM);
+        return NULL;
+    }
+    av_log(avctx, AV_LOG_INFO, "Shared memory server reading '%s'\n", ctx->shm_name);
+
+    while (!ctx->shm_stop) {
+        int ret = ff_outdev_shm_server_read(ctx->shm, &header, frame, frame_max, 100);
+
+        if (ret == AVERROR(EAGAIN))
+            continue;                   /* nothing yet; look at shm_stop again */
+        if (ret == AVERROR_EOF) {
+            av_log(avctx, AV_LOG_INFO, "Shared memory shut down\n");
+            break;
+        }
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Shared memory read failed: %d\n", ret);
+            ctx->thread_error = ret;
+            break;
+        }
+        if (aja_feed_frame(ctx, header.type, frame, header.size, header.pts) < 0)
+            break;
+    }
+
+    av_free(frame);
+    av_log(avctx, AV_LOG_INFO, "Shared memory server stopped\n");
+    return NULL;
+}
+
 static void *aja_trigger_thread(void *arg);
 /* Claim the card and set it up. Split out because pre-render calls it from the
  * trigger thread, long after write_header has returned, so that the frames of
@@ -1588,6 +1687,26 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
     }
     ctx->video_st = video_st;
 
+    /* As a client this process has no card and no output thread: frames go
+     * straight into the ring for whoever is serving it. Checked before the
+     * output buffer is built, since none of it would be used. */
+    if (cctx->shm_client) {
+        if (!cctx->shm_name) {
+            av_log(avctx, AV_LOG_ERROR, "-shm_client needs -shm_name\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+        if ((ret = ff_outdev_shm_client_attach(cctx->shm_name, &ctx->shm)) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot attach to '%s'\n", cctx->shm_name);
+            goto fail;
+        }
+        ctx->shm_name = cctx->shm_name;
+        av_log(avctx, AV_LOG_INFO,
+               "Shared memory client: frames go to '%s', not to a card\n",
+               cctx->shm_name);
+        return 0;
+    }
+
     if (cctx->pre_render) {
         if (!ctx->buffered) {
             av_log(avctx, AV_LOG_ERROR,
@@ -1630,6 +1749,14 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
                cctx->output_buffer_size);
     }
 
+    if ((cctx->shm_server || cctx->socket_listen) && !ctx->buffered) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Frames from another process need -output_buffer_size to land "
+               "in.\n");
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+
     if (ctx->pre_render) {
         if (pthread_create(&ctx->trigger_thread, NULL, aja_trigger_thread, ctx)) {
             av_log(avctx, AV_LOG_ERROR, "Cannot start the pre-render thread\n");
@@ -1639,6 +1766,36 @@ int ff_ajantv2_write_header(AVFormatContext *avctx)
         ctx->trigger_started = 1;
     } else if ((ret = aja_claim_and_init(avctx)) < 0) {
         goto fail;
+    }
+
+    if (cctx->shm_server) {
+        if (!cctx->shm_name) {
+            av_log(avctx, AV_LOG_ERROR, "-shm_server needs -shm_name\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+        ret = ff_outdev_shm_server_create(cctx->shm_name, cctx->shm_max_frames,
+                                          ctx->frame_size ? ctx->frame_size
+                                                          : (8 << 20), &ctx->shm);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot create '%s'\n", cctx->shm_name);
+            goto fail;
+        }
+        ctx->shm_is_server = 1;
+        ctx->shm_name = cctx->shm_name;
+        if (pthread_create(&ctx->shm_thread, NULL, aja_shm_thread, ctx)) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot start the shared memory thread\n");
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+        ctx->shm_thread_started = 1;
+    }
+
+    if (cctx->socket_listen && cctx->socket_path) {
+        ret = ff_outdev_socket_server_start(&ctx->socket_server, cctx->socket_path,
+                                            aja_feed_frame, ctx, avctx);
+        if (ret < 0)
+            goto fail;
     }
 
     if (ctx->teletext_enabled && ctx->buffered)
@@ -1690,6 +1847,30 @@ int ff_ajantv2_write_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     if (!ctx)
         return AVERROR(EINVAL);
+
+    /* As a client there is no card: frames go into the ring for whoever is
+     * serving it. */
+    if (ctx->shm && !ctx->shm_is_server) {
+        FFOutdevFrameHeader header;
+        int type;
+
+        switch (st->codecpar->codec_type) {
+        case AVMEDIA_TYPE_VIDEO:    type = FF_OUTDEV_FRAME_VIDEO;    break;
+        case AVMEDIA_TYPE_AUDIO:    type = FF_OUTDEV_FRAME_AUDIO;    break;
+        case AVMEDIA_TYPE_SUBTITLE: type = FF_OUTDEV_FRAME_SUBTITLE; break;
+        default:                    return 0;
+        }
+        memset(&header, 0, sizeof(header));
+        header.magic        = FF_OUTDEV_SHM_MAGIC;
+        header.type         = type;
+        header.size         = pkt->size;
+        header.pts          = pkt->pts;
+        header.dts          = pkt->dts;
+        header.duration     = pkt->duration;
+        header.stream_index = pkt->stream_index;
+        return ff_outdev_shm_client_write(ctx->shm, &header, pkt->data,
+                                          cctx->shm_block ? -1 : 1000);
+    }
 
     if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
         /* The muxer interleaves by pts, so a caption that arrives here is due
@@ -1746,6 +1927,14 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
     /* Let the buffer empty onto the card before stopping anything, or the tail
      * of the programme never goes out. A thread that has already failed has
      * nothing to drain into. */
+    /* Stop the feeds first, so nothing new arrives while the buffer drains. */
+    ff_outdev_socket_server_stop(&ctx->socket_server);
+    if (ctx->shm_thread_started) {
+        ctx->shm_stop = 1;
+        pthread_join(ctx->shm_thread, NULL);
+        ctx->shm_thread_started = 0;
+    }
+
     if (ctx->trigger_started) {
         ctx->trigger_stop = 1;
         pthread_join(ctx->trigger_thread, NULL);
@@ -1809,6 +1998,15 @@ int ff_ajantv2_write_trailer(AVFormatContext *avctx)
         else
             av_log(avctx, AV_LOG_INFO,
                    "Leaving the card in OEM mode for whoever takes it next\n");
+    }
+    if (ctx->shm) {
+        if (ctx->shm_is_server) {
+            ff_outdev_shm_server_shutdown(ctx->shm);
+            ff_outdev_shm_server_destroy(ctx->shm_name, ctx->shm);
+        } else {
+            ff_outdev_shm_client_detach(ctx->shm);
+        }
+        ctx->shm = NULL;
     }
     pthread_mutex_destroy(&ctx->audio_lock);
     pthread_mutex_destroy(&ctx->tt_lock);

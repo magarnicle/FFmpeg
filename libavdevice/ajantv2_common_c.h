@@ -49,6 +49,16 @@ struct ajantv2_cctx {
     int      pre_render_frames; /* frames to buffer before starting */
     int      restore_task_mode; /* hand the card back to the AJA service on exit */
 
+    /* Frames from other processes. Both feed the output buffer, so both need
+     * -output_buffer_size. */
+    char    *shm_name;          /* shared memory ring to serve or attach to */
+    int      shm_server;        /* play what other processes put in the ring */
+    int      shm_client;        /* put frames in the ring instead of on a card */
+    int      shm_max_frames;    /* slots in the ring, when creating it */
+    int      shm_block;         /* client waits when the ring is full */
+    char    *socket_path;       /* Unix socket to take frames on */
+    int      socket_listen;     /* listen on it */
+
     /* Teletext. These mirror the DeckLink output's names so a playout command
      * line moves between the two by changing only -f, and they are handed
      * straight to the device-independent generator in vbi_teletext.c. */

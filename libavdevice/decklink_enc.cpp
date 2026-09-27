@@ -50,18 +50,6 @@ using std::atomic;
  *   - 4 bytes: height (video only, network byte order)
  *   - N bytes: frame data
  */
-#define DECKLINK_SOCKET_MAGIC 0x444B4C4B
-#define DECKLINK_SOCKET_TYPE_VIDEO 0
-#define DECKLINK_SOCKET_TYPE_AUDIO 1
-
-struct decklink_socket_header {
-    uint32_t magic;
-    uint8_t  stream_type;
-    uint32_t data_size;
-    int64_t  pts;
-    uint32_t width;
-    uint32_t height;
-} __attribute__((packed));
 
 /* Include internal.h first to avoid conflict between winsock.h (used by
  * DeckLink headers) and winsock2.h (used by libavformat) in MSVC++ builds */
@@ -87,7 +75,7 @@ extern "C" {
 
 #include "decklink_common.h"
 #include "decklink_enc.h"
-#include "decklink_shm.h"
+#include "outdev_feed.h"
 #if CONFIG_LIBKLVANC
 #include "libklvanc/vanc.h"
 #include "libklvanc/vanc-lines.h"
@@ -581,214 +569,51 @@ static int decklink_output_queue_put_blocking(struct decklink_ctx *ctx, Decklink
 }
 
 /* Read exactly n bytes from socket, handling partial reads */
-static int socket_read_exact(int fd, void *buf, size_t n)
+/* Frames arriving on the socket go into the async output queues, the same as
+ * frames arriving from the muxer. The server itself lives in outdev_feed.c and
+ * knows nothing about this card. */
+static int decklink_socket_frame(void *opaque, int type, const uint8_t *data,
+                                 int size, int64_t pts)
 {
-    size_t total = 0;
-    uint8_t *p = (uint8_t *)buf;
-    while (total < n) {
-        ssize_t r = read(fd, p + total, n - total);
-        if (r <= 0) {
-            if (r == 0) return -1;  /* EOF */
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        total += r;
-    }
-    return 0;
-}
-
-/* Socket listener thread - accepts connections and queues frames from external sources */
-static void *decklink_socket_thread(void *arg)
-{
-    struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
+    struct decklink_ctx *ctx = (struct decklink_ctx *)opaque;
     AVFormatContext *avctx = ctx->avctx;
-    struct decklink_socket_header header;
-    uint8_t *frame_data = NULL;
-    size_t frame_data_size = 0;
-    int connection_count = 0;
+    AVPacket *pkt = av_packet_alloc();
 
-    av_log(avctx, AV_LOG_INFO, "Socket server thread started, listening on %s\n", ctx->socket_path);
+    if (!pkt)
+        return AVERROR(ENOMEM);
+    if (av_new_packet(pkt, size) < 0) {
+        av_packet_free(&pkt);
+        return AVERROR(ENOMEM);
+    }
+    memcpy(pkt->data, data, size);
+    pkt->pts = pkt->dts = pts;
 
-    while (!ctx->socket_thread_stop) {
-        struct sockaddr_un client_addr;
-        socklen_t client_len = sizeof(client_addr);
-
-        /* Accept with timeout using poll */
-        struct pollfd pfd = { ctx->socket_fd, POLLIN, 0 };
-        int poll_ret = poll(&pfd, 1, 100);  /* 100ms timeout */
-        if (poll_ret <= 0) {
-            if (poll_ret < 0 && errno != EINTR) {
-                av_log(avctx, AV_LOG_ERROR, "Socket poll error: %s\n", strerror(errno));
-            }
-            continue;
-        }
-
-        int client_fd = accept(ctx->socket_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (errno != EINTR && errno != EAGAIN) {
-                av_log(avctx, AV_LOG_ERROR, "Socket accept error: %s\n", strerror(errno));
-            }
-            continue;
-        }
-
-        connection_count++;
-        av_log(avctx, AV_LOG_INFO, "Socket: client %d connected\n", connection_count);
-        int64_t frames_received = 0;
-
-        /* Read frames from this client */
-        while (!ctx->socket_thread_stop) {
-            /* Read header */
-            if (socket_read_exact(client_fd, &header, sizeof(header)) < 0) {
-                break;  /* Client disconnected */
-            }
-
-            /* Validate magic */
-            uint32_t magic = ntohl(header.magic);
-            if (magic != DECKLINK_SOCKET_MAGIC) {
-                av_log(avctx, AV_LOG_ERROR, "Socket: invalid magic 0x%08X, expected 0x%08X\n",
-                       magic, DECKLINK_SOCKET_MAGIC);
-                break;
-            }
-
-            uint32_t data_size = ntohl(header.data_size);
-            int64_t pts = (int64_t)av_be2ne64(header.pts);
-
-            /* Allocate/reallocate frame buffer if needed */
-            if (data_size > frame_data_size) {
-                av_free(frame_data);
-                frame_data = (uint8_t *)av_malloc(data_size);
-                if (!frame_data) {
-                    av_log(avctx, AV_LOG_ERROR, "Socket: failed to allocate %u bytes\n", data_size);
-                    frame_data_size = 0;
-                    break;
-                }
-                frame_data_size = data_size;
-            }
-
-            /* Read frame data */
-            if (socket_read_exact(client_fd, frame_data, data_size) < 0) {
-                av_log(avctx, AV_LOG_ERROR, "Socket: failed to read frame data\n");
-                break;
-            }
-
-            /* Create packet and queue it */
-            AVPacket *pkt = av_packet_alloc();
-            if (!pkt) {
-                av_log(avctx, AV_LOG_ERROR, "Socket: failed to allocate packet\n");
-                break;
-            }
-
-            if (av_new_packet(pkt, data_size) < 0) {
-                av_log(avctx, AV_LOG_ERROR, "Socket: failed to allocate packet data\n");
-                av_packet_free(&pkt);
-                break;
-            }
-
-            memcpy(pkt->data, frame_data, data_size);
-            pkt->pts = pts;
-            pkt->dts = pts;
-
-            if (header.stream_type == DECKLINK_SOCKET_TYPE_VIDEO) {
-                pkt->stream_index = ctx->video_st ? ctx->video_st->index : 0;
-                if (ctx->output_thread_started) {
-                    decklink_output_queue_put_blocking(ctx, &ctx->output_video_queue, pkt);
-                }
-            } else if (header.stream_type == DECKLINK_SOCKET_TYPE_AUDIO) {
-                pkt->stream_index = ctx->audio_st ? ctx->audio_st->index : 0;
-                if (ctx->output_thread_started) {
-                    decklink_output_queue_put_blocking(ctx, &ctx->output_audio_queue, pkt);
-                }
-            }
-
-            av_packet_free(&pkt);
-
-            frames_received++;
-        }
-
-        close(client_fd);
-        av_log(avctx, AV_LOG_INFO, "Socket: client %d disconnected after %"PRId64" frames\n",
-               connection_count, frames_received);
+    if (type == FF_OUTDEV_FRAME_VIDEO) {
+        pkt->stream_index = ctx->video_st ? ctx->video_st->index : 0;
+        if (ctx->output_thread_started)
+            decklink_output_queue_put_blocking(ctx, &ctx->output_video_queue, pkt);
+    } else if (type == FF_OUTDEV_FRAME_AUDIO) {
+        pkt->stream_index = ctx->audio_st ? ctx->audio_st->index : 0;
+        if (ctx->output_thread_started)
+            decklink_output_queue_put_blocking(ctx, &ctx->output_audio_queue, pkt);
+    } else {
+        av_log(avctx, AV_LOG_WARNING, "Socket: unknown stream type %d\n", type);
     }
 
-    av_free(frame_data);
-    av_log(avctx, AV_LOG_INFO, "Socket server thread exiting\n");
-    return NULL;
-}
-
-/* Initialize socket server for external frame input */
-static int decklink_init_socket_server(AVFormatContext *avctx, struct decklink_ctx *ctx, const char *path)
-{
-    struct sockaddr_un addr;
-
-    /* Create socket */
-    ctx->socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (ctx->socket_fd < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create socket: %s\n", strerror(errno));
-        return AVERROR(errno);
-    }
-
-    /* Remove existing socket file if present */
-    unlink(path);
-
-    /* Bind to path */
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (bind(ctx->socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to bind socket to %s: %s\n", path, strerror(errno));
-        close(ctx->socket_fd);
-        ctx->socket_fd = -1;
-        return AVERROR(errno);
-    }
-
-    /* Listen for connections */
-    if (listen(ctx->socket_fd, 5) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to listen on socket: %s\n", strerror(errno));
-        close(ctx->socket_fd);
-        unlink(path);
-        ctx->socket_fd = -1;
-        return AVERROR(errno);
-    }
-
-    /* Store path for cleanup */
-    ctx->socket_path = av_strdup(path);
-
-    /* Start listener thread */
-    ctx->socket_thread_stop = 0;
-    int ret = pthread_create(&ctx->socket_thread, NULL, decklink_socket_thread, ctx);
-    if (ret != 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create socket thread: %s\n", strerror(ret));
-        close(ctx->socket_fd);
-        unlink(path);
-        av_freep(&ctx->socket_path);
-        ctx->socket_fd = -1;
-        return AVERROR(ret);
-    }
-
-    ctx->socket_thread_started = 1;
-    av_log(avctx, AV_LOG_INFO, "Socket server initialized on %s\n", path);
+    av_packet_free(&pkt);
     return 0;
 }
 
-/* Cleanup socket server */
+static int decklink_init_socket_server(AVFormatContext *avctx,
+                                       struct decklink_ctx *ctx, const char *path)
+{
+    return ff_outdev_socket_server_start(&ctx->socket_server, path,
+                                         decklink_socket_frame, ctx, avctx);
+}
+
 static void decklink_cleanup_socket_server(struct decklink_ctx *ctx)
 {
-    if (ctx->socket_thread_started) {
-        ctx->socket_thread_stop = 1;
-        pthread_join(ctx->socket_thread, NULL);
-        ctx->socket_thread_started = 0;
-    }
-
-    if (ctx->socket_fd >= 0) {
-        close(ctx->socket_fd);
-        ctx->socket_fd = -1;
-    }
-
-    if (ctx->socket_path) {
-        unlink(ctx->socket_path);
-        av_freep(&ctx->socket_path);
-    }
+    ff_outdev_socket_server_stop(&ctx->socket_server);
 }
 
 /*
@@ -803,8 +628,8 @@ static void *decklink_shm_reader_thread(void *arg)
 {
     struct decklink_ctx *ctx = (struct decklink_ctx *)arg;
     AVFormatContext *avctx = ctx->avctx;
-    DecklinkShmBuffer *shm = (DecklinkShmBuffer *)ctx->shm_buffer;
-    DecklinkShmFrameHeader header;
+    FFOutdevShmBuffer *shm = (FFOutdevShmBuffer *)ctx->shm_buffer;
+    FFOutdevFrameHeader header;
     uint8_t *frame_data = NULL;
     uint32_t frame_data_size = 0;
     int64_t video_frames = 0, audio_packets = 0;
@@ -836,7 +661,7 @@ static void *decklink_shm_reader_thread(void *arg)
     }
 
     while (!ctx->shm_reader_stop) {
-        int ret = decklink_shm_server_read(shm, &header, frame_data, frame_data_size, 100);
+        int ret = ff_outdev_shm_server_read(shm, &header, frame_data, frame_data_size, 100);
 
         if (ret == AVERROR(EAGAIN)) {
             continue;  /* Timeout, check stop flag */
@@ -856,7 +681,7 @@ static void *decklink_shm_reader_thread(void *arg)
         int has_gap = last_frame_walltime > 0 &&
                       (current_walltime - last_frame_walltime) > GAP_THRESHOLD_US;
 
-        if (header.type == DECKLINK_SHM_FRAME_VIDEO) {
+        if (header.type == FF_OUTDEV_FRAME_VIDEO) {
             int64_t incoming_pts = header.pts;
 
             if (header.duration > 0)
@@ -891,7 +716,7 @@ static void *decklink_shm_reader_thread(void *arg)
             last_incoming_video_pts = incoming_pts;
             last_outgoing_video_pts = incoming_pts + video_pts_offset;
             last_frame_walltime = current_walltime;
-        } else if (header.type == DECKLINK_SHM_FRAME_AUDIO) {
+        } else if (header.type == FF_OUTDEV_FRAME_AUDIO) {
             int64_t incoming_pts = header.pts;
 
             if (header.duration > 0)
@@ -942,7 +767,7 @@ static void *decklink_shm_reader_thread(void *arg)
         pkt->duration = header.duration;
 
         /* Apply appropriate PTS offset based on stream type */
-        if (header.type == DECKLINK_SHM_FRAME_VIDEO) {
+        if (header.type == FF_OUTDEV_FRAME_VIDEO) {
             pkt->pts = header.pts + video_pts_offset;
             pkt->dts = header.dts + video_pts_offset;
             pkt->stream_index = ctx->video_st ? ctx->video_st->index : 0;
@@ -950,7 +775,7 @@ static void *decklink_shm_reader_thread(void *arg)
                 decklink_output_queue_put_blocking(ctx, &ctx->output_video_queue, pkt);
             }
             video_frames++;
-        } else if (header.type == DECKLINK_SHM_FRAME_AUDIO) {
+        } else if (header.type == FF_OUTDEV_FRAME_AUDIO) {
             pkt->pts = header.pts + audio_pts_offset;
             pkt->dts = header.dts + audio_pts_offset;
             pkt->stream_index = ctx->audio_st ? ctx->audio_st->index : 0;
@@ -981,10 +806,10 @@ static void *decklink_shm_reader_thread(void *arg)
 static int decklink_init_shm_server(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                      const char *name, int max_frames, uint32_t frame_size)
 {
-    DecklinkShmBuffer *shm = NULL;
+    FFOutdevShmBuffer *shm = NULL;
     int ret;
 
-    ret = decklink_shm_server_create(name, max_frames, frame_size, &shm);
+    ret = ff_outdev_shm_server_create(name, max_frames, frame_size, &shm);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create shared memory server: %d\n", ret);
         return ret;
@@ -1007,7 +832,7 @@ static int decklink_init_shm_server(AVFormatContext *avctx, struct decklink_ctx 
     ret = pthread_create(&ctx->shm_reader_thread, NULL, decklink_shm_reader_thread, ctx);
     if (ret != 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create shm reader thread: %s\n", strerror(ret));
-        decklink_shm_server_destroy(name, shm);
+        ff_outdev_shm_server_destroy(name, shm);
         ctx->shm_buffer = NULL;
         av_freep(&ctx->shm_name);
         return AVERROR(ret);
@@ -1023,10 +848,10 @@ static int decklink_init_shm_server(AVFormatContext *avctx, struct decklink_ctx 
 static int decklink_init_shm_client(AVFormatContext *avctx, struct decklink_ctx *ctx,
                                      const char *name)
 {
-    DecklinkShmBuffer *shm = NULL;
+    FFOutdevShmBuffer *shm = NULL;
     int ret;
 
-    ret = decklink_shm_client_attach(name, &shm);
+    ret = ff_outdev_shm_client_attach(name, &shm);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to attach to shared memory: %d\n", ret);
         return ret;
@@ -1043,7 +868,7 @@ static int decklink_init_shm_client(AVFormatContext *avctx, struct decklink_ctx 
 /* Cleanup shared memory */
 static void decklink_cleanup_shm(struct decklink_ctx *ctx)
 {
-    DecklinkShmBuffer *shm = (DecklinkShmBuffer *)ctx->shm_buffer;
+    FFOutdevShmBuffer *shm = (FFOutdevShmBuffer *)ctx->shm_buffer;
 
     if (!shm)
         return;
@@ -1051,16 +876,16 @@ static void decklink_cleanup_shm(struct decklink_ctx *ctx)
     if (ctx->shm_reader_started) {
         ctx->shm_reader_stop = 1;
         if (ctx->shm_is_server) {
-            decklink_shm_server_shutdown(shm);
+            ff_outdev_shm_server_shutdown(shm);
         }
         pthread_join(ctx->shm_reader_thread, NULL);
         ctx->shm_reader_started = 0;
     }
 
     if (ctx->shm_is_server) {
-        decklink_shm_server_destroy(ctx->shm_name, shm);
+        ff_outdev_shm_server_destroy(ctx->shm_name, shm);
     } else {
-        decklink_shm_client_detach(shm);
+        ff_outdev_shm_client_detach(shm);
     }
 
     ctx->shm_buffer = NULL;
@@ -1305,14 +1130,14 @@ static int decklink_shm_write_packet(AVFormatContext *avctx, AVPacket *pkt, int 
 {
     struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
     struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
-    DecklinkShmBuffer *shm = (DecklinkShmBuffer *)ctx->shm_buffer;
-    DecklinkShmFrameHeader header;
+    FFOutdevShmBuffer *shm = (FFOutdevShmBuffer *)ctx->shm_buffer;
+    FFOutdevFrameHeader header;
 
     if (!shm || ctx->shm_is_server)
         return AVERROR(EINVAL);
 
     memset(&header, 0, sizeof(header));
-    header.magic = DECKLINK_SHM_MAGIC;
+    header.magic = FF_OUTDEV_SHM_MAGIC;
     header.type = type;
     header.size = pkt->size;
     header.pts = pkt->pts;
@@ -1320,17 +1145,17 @@ static int decklink_shm_write_packet(AVFormatContext *avctx, AVPacket *pkt, int 
     header.duration = pkt->duration;
     header.stream_index = pkt->stream_index;
 
-    if (type == DECKLINK_SHM_FRAME_VIDEO) {
+    if (type == FF_OUTDEV_FRAME_VIDEO) {
         header.width = ctx->bmd_width;
         header.height = ctx->bmd_height;
-    } else if (type == DECKLINK_SHM_FRAME_AUDIO) {
+    } else if (type == FF_OUTDEV_FRAME_AUDIO) {
         header.sample_rate = 48000;
         header.channels = ctx->channels;
     }
 
     /* Block indefinitely (-1) or timeout after 1 second based on option */
     int timeout_ms = cctx->shm_block ? -1 : 1000;
-    return decklink_shm_client_write(shm, &header, pkt->data, timeout_ms);
+    return ff_outdev_shm_client_write(shm, &header, pkt->data, timeout_ms);
 }
 
 static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
@@ -2887,7 +2712,7 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     /* If shared memory client mode, write to shm buffer */
     if (ctx->shm_buffer && !ctx->shm_is_server) {
-        int ret = decklink_shm_write_packet(avctx, pkt, DECKLINK_SHM_FRAME_VIDEO);
+        int ret = decklink_shm_write_packet(avctx, pkt, FF_OUTDEV_FRAME_VIDEO);
         if (ret < 0 && ret != AVERROR(EAGAIN)) {
             av_log(avctx, AV_LOG_ERROR, "Failed to write video to shared memory: %d\n", ret);
             return ret;
@@ -3047,7 +2872,7 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
 
     /* If shared memory client mode, write to shm buffer */
     if (ctx->shm_buffer && !ctx->shm_is_server) {
-        int ret = decklink_shm_write_packet(avctx, pkt, DECKLINK_SHM_FRAME_AUDIO);
+        int ret = decklink_shm_write_packet(avctx, pkt, FF_OUTDEV_FRAME_AUDIO);
         if (ret < 0 && ret != AVERROR(EAGAIN)) {
             av_log(avctx, AV_LOG_ERROR, "Failed to write audio to shared memory: %d\n", ret);
             return ret;
@@ -3214,7 +3039,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_rise_ns = cctx->teletext_rise_ns;
     ctx->tt.caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
-    ctx->socket_fd    = -1;
+    ctx->socket_server.fd = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
         ctx->link = decklink_link_conf_map[cctx->link];
     cctx->ctx = ctx;

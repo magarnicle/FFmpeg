@@ -26,6 +26,7 @@
 #include <DeckLinkAPIVersion.h>
 
 #include "vbi_teletext.h"
+#include "outdev_feed.h"
 #if BLACKMAGIC_DECKLINK_API_VERSION < 0x0b000000
 #define IID_IDeckLinkProfileAttributes IID_IDeckLinkAttributes
 #define IDeckLinkProfileAttributes IDeckLinkAttributes
@@ -222,11 +223,7 @@ struct decklink_ctx {
     unsigned long tc_seen;    // used with option wait_for_tc
 
     /* Socket server state */
-    int socket_fd;
-    pthread_t socket_thread;
-    int socket_thread_started;
-    int socket_thread_stop;
-    char *socket_path;
+    FFOutdevSocketServer socket_server;
 
     /* Shared memory state */
     void *shm_buffer;           /* DecklinkShmBuffer* */

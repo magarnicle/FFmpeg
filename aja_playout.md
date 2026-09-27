@@ -168,10 +168,21 @@ gives up when the ring is full.
 `socket_path` and `socket_listen` do the same job over a Unix socket, for frames
 arriving from something that is not another ffmpeg.
 
-**AJA.** Neither is card-specific. Both live above the device and could be
-shared rather than duplicated, in the same way the teletext generator was pulled
-out into `vbi_teletext.c`. That is worth doing before either is ported, because
-two copies of a shared-memory protocol will drift.
+**AJA.** Neither is card-specific, and both now live in
+`libavdevice/outdev_feed.c`, in the same way the teletext generator was pulled
+out into `vbi_teletext.c`. The DeckLink output uses that copy too, so there is
+one implementation rather than two to drift apart, and the wire formats are
+unchanged: anything already feeding the DeckLink output over either transport
+works against the AJA one without knowing which card is on the end.
+
+The socket server took a callback to make it card-independent. The shared memory
+module needed only renaming; it never had a DeckLink type in it.
+
+Two things are simpler on the AJA side. There is no pts rebasing when a client
+reconnects mid-run, because AutoCirculate plays frames in the order they arrive
+and pays no attention to timestamps. And audio goes into the device's existing
+FIFO rather than a second queue, for the same reason the output buffer has only
+one queue.
 
 ## Where the AJA differs enough to matter
 
@@ -253,10 +264,11 @@ facility is referenced to.
    `-pre_render`, `-pre_render_until`, `-pre_render_frames` and
    `-restore_task_mode`. What the framestore shows between processes is still
    unknown and still needs a card to answer.
-7. Shared memory and socket input, after pulling DeckLink's implementation out
-   into something both devices use.
+7. ~~Shared memory and socket input, after pulling DeckLink's implementation
+   out into something both devices use.~~ **Done.** `libavdevice/outdev_feed.c`
+   now holds both, and the DeckLink output uses it rather than its own copy.
 
-Items 1 to 6 are written but have not been near a card. Nothing about them has
+Items 1 to 7 are written but have not been near a card. Nothing about them has
 been tested beyond compiling, and the concurrency in item 2 is the kind that
 looks right and is not. The first run with `-output_buffer_size` should be a
 short one with something disposable on the output.

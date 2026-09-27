@@ -46,6 +46,13 @@ static const AVOption options[] = {
     { "pre_render_until", "when to take the card and start, as a date av_parse_time accepts (\"2026-09-27T10:00:00Z\", \"now+5\")", OFFSET(pre_render_until), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
     { "pre_render_frames", "take the card once this many frames are buffered (0 = use the time instead)", OFFSET(pre_render_frames), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 100000, ENC },
     { "restore_task_mode", "hand the card back to the AJA retail service on exit; turn this off when another process is taking over, or the service reprograms the card in the gap", OFFSET(restore_task_mode), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ENC },
+    { "shm_name", "shared memory ring shared with other ffmpeg processes", OFFSET(shm_name), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "shm_server", "play what other processes put in the ring (needs output_buffer_size)", OFFSET(shm_server), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "shm_client", "put frames in the ring instead of on a card", OFFSET(shm_client), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "shm_max_frames", "slots in the ring, when this process creates it", OFFSET(shm_max_frames), AV_OPT_TYPE_INT, { .i64 = 60 }, 8, 240, ENC },
+    { "shm_block", "as a client, wait when the ring is full instead of giving up", OFFSET(shm_block), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ENC },
+    { "socket_path", "Unix socket to take frames on (needs output_buffer_size)", OFFSET(socket_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
+    { "socket_listen", "listen on socket_path", OFFSET(socket_listen), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "format_code", "NTV2 video format by name, e.g. \"1080i50\", \"1080p25\", \"625i50\"; needed when the raster and rate alone are ambiguous, as 1080i50 and 1080p25 are", OFFSET(format_code), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, ENC },
 
     { "teletext_fields", "teletext field insertion mode", OFFSET(teletext_fields), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, ENC, .unit = "teletext_fields" },
