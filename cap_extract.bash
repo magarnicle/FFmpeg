@@ -23,39 +23,20 @@
 # arrive. It also never reached -late_threshold's 5 seconds, so nothing failed
 # and nothing said so beyond the drop lines.
 #
-# -max_interleave_delta is what keeps the picture moving, and without it the
-# output stutters in a way that looks like the machine being too slow.
+# -max_interleave_delta is NOT set, and every value tried so far is worse than
+# leaving it alone. Recorded so the same ground is not covered again:
 #
-# The muxer holds packets until every interleaved stream has one
-# (mux.c: nb_interleaved_streams == stream_count). Three streams go out here,
-# and teletext is sparse: one packet per caption, seconds apart. So video and
-# audio pile up in the muxing queue until the next caption releases them in a
-# burst. Measured on 28 September: a steady 24-26fps for seven seconds, then
-# nothing for 3.5s, then 33 frames in one report, then nothing for 2.5s, then 64
-# frames. The average was realtime; the delivery was not.
+#   unset (10s default)  plays, good picture, but stalls 2-4s at a time and
+#                        bursts, because the muxer holds video until every
+#                        interleaved stream has a packet and teletext is sparse
+#   1 (1 microsecond)    wedges at frame 10 of a 12-frame preroll
+#   200000 (0.2s)        wedges at frame 15
 #
-# 200000 is 0.2 seconds, and the value sits between two failure modes.
-#
-# Too large (the 10s default) and video waits for the next caption, which is the
-# stall above. Too small and it deadlocks: with 1 microsecond every packet goes
-# out the moment it exists, audio no longer advances in lockstep with video, and
-# it fills the card's audio preroll buffer before video has reached
-# first_pts + frames_preroll. ScheduleAudioSamples blocks, video stops, and
-# StartScheduledPlayback is never called. Measured on 28 September: wedged at
-# frame 10 of a 12-frame preroll, 17 input buffer overruns, no "Starting
-# scheduled playback" in the log at all.
-#
-# 0 is not the answer either: it disables the override and waits forever. The
-# negative-timestamp warning in mux.c recommends 0 for an unrelated problem and
-# is easy to follow by mistake.
-#
-# At 0.2s video is never held up for longer than that, which the card's 60-frame
-# scheduling queue absorbs, and audio can never be more than that far ahead,
-# which its preroll buffer holds comfortably.
-#
-# hd_caps_aja.bash does not need this. Its captions go into the filter chain as
-# A53 side data on the video frames, so its only output streams are video and
-# audio and neither is sparse.
+# Both wedges look identical: no "Starting scheduled playback" in the log ever,
+# input buffer overruns, and nothing to air. Why bounding the interleave wait
+# stops playback from starting is not yet understood. The audio preroll buffer
+# filling before video reaches first_pts + frames_preroll is the theory; it has
+# not been confirmed, and the numbers do not obviously fit it.
 #
 # No interl=1 on the scale, and that matters. It tells swscale the picture is
 # interlaced, so it splits each frame into two fields and scales them
@@ -97,7 +78,6 @@
   -map '[v]' -map 0:a -map 0:s \
   -c:v v210 \
   -c:s dvb_teletext -teletext_page 801 -double_height 1 \
-  -max_interleave_delta 200000 \
   -f decklink \
      -teletext_rise_ns 86 \
      -teletext_vbi_offset 5 -teletext_vbi_offset_frac 159 \
