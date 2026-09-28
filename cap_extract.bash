@@ -23,6 +23,26 @@
 # arrive. It also never reached -late_threshold's 5 seconds, so nothing failed
 # and nothing said so beyond the drop lines.
 #
+# -max_interleave_delta 1 is what keeps the picture moving, and without it the
+# output stutters in a way that looks like the machine being too slow.
+#
+# The muxer holds packets until every interleaved stream has one
+# (mux.c: nb_interleaved_streams == stream_count). Three streams go out here,
+# and teletext is sparse: one packet per caption, seconds apart. So video and
+# audio pile up in the muxing queue until the next caption releases them in a
+# burst. Measured on 28 September: a steady 24-26fps for seven seconds, then
+# nothing for 3.5s, then 33 frames in one report, then nothing for 2.5s, then 64
+# frames. The average was realtime; the delivery was not.
+#
+# 1 means one microsecond, so the delta always exceeds it and every packet goes
+# straight out. Not 0, which disables the override and waits forever -- the
+# opposite, despite what the unrelated negative-timestamp warning in mux.c
+# suggests.
+#
+# hd_caps_aja.bash does not need this. Its captions go into the filter chain as
+# A53 side data on the video frames, so its only output streams are video and
+# audio and neither is sparse.
+#
 # No interl=1 on the scale, and that matters. It tells swscale the picture is
 # interlaced, so it splits each frame into two fields and scales them
 # separately. That is right for a 1080i50 source and wrong for this one:
@@ -63,6 +83,7 @@
   -map '[v]' -map 0:a -map 0:s \
   -c:v v210 \
   -c:s dvb_teletext -teletext_page 801 -double_height 1 \
+  -max_interleave_delta 1 \
   -f decklink \
      -teletext_rise_ns 86 \
      -teletext_vbi_offset 5 -teletext_vbi_offset_frac 159 \
@@ -71,4 +92,5 @@
      -teletext_filler_ctrl 1 -teletext_filler_subcode 0 \
      -teletext_header_attr 6 \
      -teletext_burst_frames 25 \
+     -preroll 0.7 \
      'DeckLink SDI 4K'
