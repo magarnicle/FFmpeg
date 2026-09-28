@@ -954,13 +954,18 @@ static int aja_start_output(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
      * moves between the two cards unchanged. It cannot mean the same thing on
      * both, though: DeckLink buffers in host memory and this buffers in the
      * card's, where the whole ring is a fraction of a second, so the request is
-     * capped at one frame short of the ring. With an output buffer configured
-     * the preroll is kept to two frames and the host-side buffer carries the
-     * timing safety, which is what the DeckLink output does for the same
-     * reason: a short preroll gets to air sooner. */
-    if (ctx->buffered) {
-        ctx->preroll_frames = 2;
-    } else {
+     * capped at one frame short of the ring.
+     *
+     * An output buffer does not change that, and the first version of this made
+     * the mistake of thinking it did. DeckLink cuts its preroll to two frames
+     * when there is a host buffer, because on that card the preroll and the
+     * card-side queue are separate things: frames_buffer stays at 60 whatever
+     * the preroll is, so the card keeps a deep cushion either way. Here the ring
+     * IS the cushion and the preroll is what fills it, so two frames leaves the
+     * card 80ms of slack at 25fps for the whole run, with one thread to refill
+     * it. The host buffer protects the producer; the ring protects the
+     * consumer; they are not the same cushion. */
+    {
         const double fps = ctx->cdp_tb_num > 0
                                ? (double)ctx->cdp_tb_den / ctx->cdp_tb_num : 25.0;
         ctx->preroll_frames = (int)(cctx->preroll * fps + 0.5);

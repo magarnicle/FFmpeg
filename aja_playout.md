@@ -162,7 +162,17 @@ a short preroll gets to air faster.
 
 **AJA.** Already there in spirit: `aja_start_output` fills three frames before
 calling `AutoCirculateStart`. It should become an option with the same name and
-meaning, and the same interaction with the output buffer.
+meaning -- but **not** the same interaction with the output buffer.
+
+That last part was got wrong once and is worth stating plainly. DeckLink cuts
+its preroll to two frames when a host buffer is configured, on the grounds that
+the buffer provides the timing safety. That holds there because the preroll and
+the card-side queue are separate: `frames_buffer` stays at 60 whatever the
+preroll is, so the card keeps a deep cushion either way. Here the ring *is* the
+cushion and the preroll is what fills it, so copying that rule left the card
+with two frames, 80ms at 25fps, for the whole run, with one thread to refill it.
+The host buffer protects the producer side; the ring protects the consumer side;
+they are not the same cushion and one does not substitute for the other.
 
 ### 5. Block until available (`-block_until_available`)
 
