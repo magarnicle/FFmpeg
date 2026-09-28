@@ -23,6 +23,22 @@
 # arrive. It also never reached -late_threshold's 5 seconds, so nothing failed
 # and nothing said so beyond the drop lines.
 #
+# No interl=1 on the scale, and that matters. It tells swscale the picture is
+# interlaced, so it splits each frame into two fields and scales them
+# separately. That is right for a 1080i50 source and wrong for this one:
+#
+#   Stream #0:1: Video: v210, yuv422p10le(progressive), 1920x1080
+#
+# The AJA sends 1080p25. Scaling a progressive frame as two fields takes every
+# other line, scales the halves independently and interleaves them again, so
+# adjacent output lines come from differently phased samples of the same
+# picture. Horizontal edges shimmer and fine detail crawls -- it looks badly
+# interlaced because it has been interlaced, by the scaler, for no reason.
+#
+# Scaled whole and then marked tff, both fields of each PAL frame come from the
+# same instant, which is what a 25p source carried as 576i25 should be. If the
+# upstream ever changes to 1080i50, interl=1 comes back.
+#
 # -preroll is the knob that does help here, and it is the one that stops the
 # handful of frames dropped at startup.
 #
@@ -42,7 +58,7 @@
 # clamps and says so rather than hanging, but the clamp is not a setting.
 ./ffmpeg -f decklink -eia608 1 -format_code Hp25 -raw_format yuv422p10 \
        -i 'DeckLink SDI 4K' \
-  -filter_complex "[0:v]scale=720:576:interl=1,setdar=16/9,format=yuv422p10le,setfield=tff[v]" \
+  -filter_complex "[0:v]scale=720:576,setdar=16/9,format=yuv422p10le,setfield=tff[v]" \
   -map '[v]' -map 0:a -map 0:s \
   -c:v v210 \
   -c:s dvb_teletext -teletext_page 801 -double_height 1 \
