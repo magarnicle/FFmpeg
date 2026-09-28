@@ -39,23 +39,24 @@
 # same instant, which is what a 25p source carried as 576i25 should be. If the
 # upstream ever changes to 1080i50, interl=1 comes back.
 #
-# -preroll is the knob that does help here, and it is the one that stops the
-# handful of frames dropped at startup.
+# -preroll is left at its 0.5s default, and raising it here does not work.
 #
-# Playback starts at the first frame's pts, once -preroll seconds of frames are
-# in hand and scheduled on the card. So the preroll is exactly the cushion: a
-# stall shorter than it is absorbed, a stall longer than it drops frames. The
-# 0.5s default was not enough, and the startup drops on 25 September were 1.44s
-# deep. 1.5s covers that with room.
+# A longer preroll looks like the answer to the handful of frames dropped at
+# startup: playback begins at the first frame's pts once -preroll seconds of
+# frames are scheduled, so the preroll is the cushion. But without an async
+# output buffer, video and audio are both written from the muxer thread, and the
+# card's audio preroll buffer fills long before 1.5s of video is scheduled.
+# ScheduleAudioSamples then blocks, no more video arrives, the pts never reaches
+# the threshold, and StartScheduledPlayback is never called. Tried on
+# 28 September:
 #
-# The cost is latency: the SD output runs -preroll behind the HD input, all the
-# time. Raise it if frames are still dropped at startup, lower it if the delay
-# matters more than the drops.
+#   frame=103 fps=4.6 fps_inst=0x speed=0.19x     (wedged)
+#   Decklink input buffer overrun!                (x20, nothing consuming)
+#   Starting scheduled playback.                  (never logged)
 #
-# Do not go far above 2s. Frames scheduled during the preroll hold slots that
-# nothing frees until playback starts, and there are 60 of them, so at 25fps a
-# preroll of 2.4s or more would wait for a slot that never comes. The device
-# clamps and says so rather than hanging, but the clamp is not a setting.
+# So the startup drops stay. There were eight of them on 25 September, all in
+# the first second and a half, and then it ran clean. For a pass-through that is
+# the cheaper of the two problems.
 ./ffmpeg -f decklink -eia608 1 -format_code Hp25 -raw_format yuv422p10 \
        -i 'DeckLink SDI 4K' \
   -filter_complex "[0:v]scale=720:576,setdar=16/9,format=yuv422p10le,setfield=tff[v]" \
@@ -70,5 +71,4 @@
      -teletext_filler_ctrl 1 -teletext_filler_subcode 0 \
      -teletext_header_attr 6 \
      -teletext_burst_frames 25 \
-     -preroll 1.5 \
      'DeckLink SDI 4K'

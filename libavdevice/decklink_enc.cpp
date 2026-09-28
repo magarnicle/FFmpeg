@@ -1248,6 +1248,25 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     }
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
 
+    /* A long preroll without an async output buffer deadlocks, and it does so
+     * silently. Video and audio are both written from the muxer thread then,
+     * and the card's audio preroll buffer fills well before a second of video
+     * has been scheduled; ScheduleAudioSamples blocks, no more video arrives,
+     * the pts never reaches first_pts + frames_preroll, and playback is never
+     * started. What it looks like is the muxer wedged with the input queue
+     * overrunning and no "Starting scheduled playback" in the log.
+     *
+     * Where the audio buffer runs out is a property of the card, so this warns
+     * rather than clamps. With an async buffer the audio has its own thread and
+     * the transition is handled, which is what pre-render relies on. */
+    if (ctx->audio && ctx->preroll > 1.0 && cctx->output_buffer_size <= 0)
+        av_log(avctx, AV_LOG_WARNING,
+               "A preroll of %.2fs with audio and no output_buffer_size may "
+               "fill the card's audio preroll buffer before playback starts, "
+               "which wedges the output. If nothing goes to air and the log "
+               "has no \"Starting scheduled playback\", this is why.\n",
+               ctx->preroll);
+
     /* The preroll schedules frames before playback starts, and nothing frees a
      * scheduling slot until it does, so a preroll as long as the buffer waits
      * for a slot that can never come. frames_buffer is capped at 60, which puts
