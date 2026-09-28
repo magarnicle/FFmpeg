@@ -79,6 +79,32 @@ counterpart here. So: one video packet queue, one consumer thread, and the
 existing `AVFifo` for audio, which then needs a mutex because the muxer thread
 fills it and the consumer thread drains it.
 
+**It is for playing files, not for passing a live signal through.** Reading a
+file, the producer runs faster than realtime, so the buffer fills once and then
+absorbs a later stall without the output noticing. With a live input the
+producer is rate-limited by the source: it can never run ahead, so it can never
+refill a buffer it has drawn down, and all the buffer can do is add latency.
+
+On the DeckLink that latency is fatal, because it schedules by pts against the
+card's own clock, and a frame that waited in the buffer is late by exactly the
+time it waited. Measured on 28 September with 200MiB on the HD-to-SD
+pass-through: the buffer filled to 95 frames during startup while the input was
+probing, and from then on every frame arrived 97 frames -- 3.88s -- behind the
+card and was dropped. The gap never moved, because dropping consumes frames at
+the rate they arrive, and it never reached `late_threshold`'s 5 seconds, so
+nothing failed and nothing said so. Nothing went to air for the rest of the run.
+
+The AJA should be better behaved in the same situation, because AutoCirculate
+plays frames in order and ignores timestamps: a backlog would show as latency
+rather than loss, and `aja_check_late` counts frames delivered against wall
+clock rather than comparing a pts, so it would not trip either. That is a
+prediction, not a measurement.
+
+Two things follow. A live pass-through should not set `-output_buffer_size` at
+all. And the DeckLink output has a silent failure mode worth closing: dropping
+every frame indefinitely without ever tripping the threshold. A count of
+consecutive drops would turn it into an error.
+
 ### 2. Output thread priority
 
 **DeckLink.** `decklink_set_output_thread_priority()` promotes each output
@@ -88,6 +114,18 @@ a non-zero `RLIMIT_RTPRIO`.
 
 **AJA.** Copy it as is. It is card-independent and the reasoning behind it
 applies unchanged. The production grant is a known deployment requirement.
+
+Worth knowing that the nice fallback is close to useless in practice. Lowering a
+nice value needs privilege too, so a process that cannot get `SCHED_FIFO` will
+usually not get a negative nice either. On the conversion machine on
+28 September both failed:
+
+    no permission for SCHED_FIFO (need CAP_SYS_NICE or a non-zero
+    RLIMIT_RTPRIO) and nice fallback failed (Permission denied);
+    running at default priority
+
+So the grant is not optional for anything that has to stay up: either
+`CAP_SYS_NICE`, or `LimitRTPRIO` in the systemd unit.
 
 ### 3. Late-frame policy (`-late_threshold`)
 
