@@ -34,10 +34,24 @@
 # nothing for 3.5s, then 33 frames in one report, then nothing for 2.5s, then 64
 # frames. The average was realtime; the delivery was not.
 #
-# 1 means one microsecond, so the delta always exceeds it and every packet goes
-# straight out. Not 0, which disables the override and waits forever -- the
-# opposite, despite what the unrelated negative-timestamp warning in mux.c
-# suggests.
+# 200000 is 0.2 seconds, and the value sits between two failure modes.
+#
+# Too large (the 10s default) and video waits for the next caption, which is the
+# stall above. Too small and it deadlocks: with 1 microsecond every packet goes
+# out the moment it exists, audio no longer advances in lockstep with video, and
+# it fills the card's audio preroll buffer before video has reached
+# first_pts + frames_preroll. ScheduleAudioSamples blocks, video stops, and
+# StartScheduledPlayback is never called. Measured on 28 September: wedged at
+# frame 10 of a 12-frame preroll, 17 input buffer overruns, no "Starting
+# scheduled playback" in the log at all.
+#
+# 0 is not the answer either: it disables the override and waits forever. The
+# negative-timestamp warning in mux.c recommends 0 for an unrelated problem and
+# is easy to follow by mistake.
+#
+# At 0.2s video is never held up for longer than that, which the card's 60-frame
+# scheduling queue absorbs, and audio can never be more than that far ahead,
+# which its preroll buffer holds comfortably.
 #
 # hd_caps_aja.bash does not need this. Its captions go into the filter chain as
 # A53 side data on the video frames, so its only output streams are video and
@@ -83,7 +97,7 @@
   -map '[v]' -map 0:a -map 0:s \
   -c:v v210 \
   -c:s dvb_teletext -teletext_page 801 -double_height 1 \
-  -max_interleave_delta 1 \
+  -max_interleave_delta 200000 \
   -f decklink \
      -teletext_rise_ns 86 \
      -teletext_vbi_offset 5 -teletext_vbi_offset_frac 159 \
