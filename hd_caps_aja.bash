@@ -34,6 +34,33 @@
 #   need the VANC region present in the frame buffer -- so the frame geometry is
 #   1920x1112 here and 1920x1080 without them. If the picture is good with
 #   -cc 0 and wrong without it, that geometry is where to look.
+#
+#   -output_buffer_size, the same 200MiB hd_caps.bash gives the DeckLink, which
+#   at 5529600 bytes a frame is about 37 frames or a second and a half. It
+#   matters more here: without it the muxer thread waits on the card itself, so
+#   the card paces the decode and filter chain and any stall in them reaches the
+#   output. The card's own elasticity is the AutoCirculate ring, which with
+#   captions on is seven frames -- 280ms -- and a filtergraph spike does not fit
+#   in that.
+#
+# Options deliberately not set, so they are not mistaken for oversights:
+#
+#   -preroll. hd_caps.bash passes 0.04 and both devices ignore it once there is
+#   an output buffer, dropping to two frames on purpose: the host-side buffer is
+#   what provides the timing safety, and a short preroll gets to air sooner.
+#
+#   -late_threshold. Five seconds by default, which is what hd_caps.bash gets
+#   too. Worth setting only to make playout stop sooner or not at all.
+#
+#   -block_until_available and -restore_task_mode. Both are for handing the card
+#   from one process to the next. This script is a single run, so failing
+#   outright when the card is busy is the useful behaviour, and giving the card
+#   back to the AJA service on the way out is the polite one.
+#
+#   -pre_render, -shm_* and -socket_*. Also hand-over and multi-process
+#   machinery. -pre_render in particular would wait rather than play.
+
+buffer_size=$(( 200 * 1024 * 1024 ))
 
 /home/matt/ffmpeg_sources/FFmpeg/ffmpeg -loglevel debug -nostdin -hide_banner -noautorotate -fflags +discardcorrupt \
     -i $HOME/Videos/AU111999-M-Preview.mov -an \
@@ -47,4 +74,5 @@
     [videobug][2:s]cea608embed=continuous=1:keepalive=1[videoout]" \
     -map [videoout] -map [audio0] \
     -metadata name='2026-09-25 10:52:52.040000+10:00 AU112301-M.mov' \
-    -c:v v210 -f ajantv2 -format_code 1080p25 -channel 1 0
+    -c:v v210 -f ajantv2 -format_code 1080p25 -channel 1 \
+    -output_buffer_size ${buffer_size} 0
