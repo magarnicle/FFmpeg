@@ -22,6 +22,24 @@
 # The gap never moved, because dropping consumes frames at exactly the rate they
 # arrive. It also never reached -late_threshold's 5 seconds, so nothing failed
 # and nothing said so beyond the drop lines.
+#
+# -preroll is the knob that does help here, and it is the one that stops the
+# handful of frames dropped at startup.
+#
+# Playback starts at the first frame's pts, once -preroll seconds of frames are
+# in hand and scheduled on the card. So the preroll is exactly the cushion: a
+# stall shorter than it is absorbed, a stall longer than it drops frames. The
+# 0.5s default was not enough, and the startup drops on 25 September were 1.44s
+# deep. 1.5s covers that with room.
+#
+# The cost is latency: the SD output runs -preroll behind the HD input, all the
+# time. Raise it if frames are still dropped at startup, lower it if the delay
+# matters more than the drops.
+#
+# Do not go far above 2s. Frames scheduled during the preroll hold slots that
+# nothing frees until playback starts, and there are 60 of them, so at 25fps a
+# preroll of 2.4s or more would wait for a slot that never comes. The device
+# clamps and says so rather than hanging, but the clamp is not a setting.
 ./ffmpeg -f decklink -eia608 1 -format_code Hp25 -raw_format yuv422p10 \
        -i 'DeckLink SDI 4K' \
   -filter_complex "[0:v]scale=720:576:interl=1,setdar=16/9,format=yuv422p10le,setfield=tff[v]" \
@@ -36,4 +54,5 @@
      -teletext_filler_ctrl 1 -teletext_filler_subcode 0 \
      -teletext_header_attr 6 \
      -teletext_burst_frames 25 \
+     -preroll 1.5 \
      'DeckLink SDI 4K'

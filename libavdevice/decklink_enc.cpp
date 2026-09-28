@@ -1247,6 +1247,20 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
         ctx->frames_buffer = 60;
     }
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
+
+    /* The preroll schedules frames before playback starts, and nothing frees a
+     * scheduling slot until it does, so a preroll as long as the buffer waits
+     * for a slot that can never come. frames_buffer is capped at 60, which puts
+     * the ceiling at 2.4s of preroll at 25fps -- inside what -preroll accepts,
+     * so it is reachable by typing a larger number. Clamp rather than hang. */
+    if (ctx->frames_preroll >= ctx->frames_buffer) {
+        av_log(avctx, AV_LOG_WARNING,
+               "Preroll of %d frames is too long for a %d frame scheduling "
+               "buffer; using %d. Playback would never have started.\n",
+               ctx->frames_preroll, ctx->frames_buffer, ctx->frames_buffer - 1);
+        ctx->frames_preroll = ctx->frames_buffer - 1;
+    }
+
     pthread_mutex_init(&ctx->mutex, NULL);
     pthread_cond_init(&ctx->cond, NULL);
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
