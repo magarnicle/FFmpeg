@@ -23,7 +23,7 @@
 # arrive. It also never reached -late_threshold's 5 seconds, so nothing failed
 # and nothing said so beyond the drop lines.
 #
-# -max_interleave_delta 1 is what keeps the picture moving, and without it the
+# -max_interleave_delta is what keeps the picture moving, and without it the
 # output stutters in a way that looks like the machine being too slow.
 #
 # The muxer holds packets until every interleaved stream has one
