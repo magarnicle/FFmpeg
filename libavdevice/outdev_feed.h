@@ -174,11 +174,6 @@ int ff_outdev_shm_client_write(FFOutdevShmBuffer *shm, const FFOutdevFrameHeader
 /* Check if server is still active */
 int ff_outdev_shm_client_server_active(FFOutdevShmBuffer *shm);
 
-#ifdef __cplusplus
-}
-#endif
-
-
 /* ---------------------------------------------------------------------------
  * Unix socket frame server
  *
@@ -234,5 +229,9 @@ int  ff_outdev_socket_server_start(FFOutdevSocketServer *s, const char *path,
 /* Stop the thread, close the socket and remove the path. Safe on a server that
  * never started. */
 void ff_outdev_socket_server_stop(FFOutdevSocketServer *s);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AVDEVICE_OUTDEV_FEED_H */
