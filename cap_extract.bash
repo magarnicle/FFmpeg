@@ -34,13 +34,16 @@
 # pixels; drawtext expands %{metadata:...} per frame and draws it. drawtext has
 # no other per-frame source of text, which is the whole reason submeta exists.
 #
-# Two things about the quoting, both of which were wrong the first time. The
-# colon inside %{...} must not be escaped: textutils.c splits function arguments
-# with av_get_token(&text, ":}"), which turns \: back into a literal colon and
-# leaves "metadata:lavfi.sub.text" as one argument naming no function. And the
-# single quotes have to close after the expansion, not after x and y, or those
-# become part of the text. Quoted, the colon needs no escaping anyway, because
-# the graph parser leaves quoted text alone.
+# The colon inside %{...} has to be escaped, and the quotes have to close after
+# the expansion rather than after x and y. Both matter and the first is easy to
+# get backwards, so: the filter option parser splits key=value pairs on the
+# colon and does not honour the single quotes there, which is
+#
+#   No option name near 'lavfi.sub.text}:x=100:y=100:...'
+#
+# It unescapes \: into a plain colon when it hands the value to drawtext, and
+# drawtext's own tokeniser then splits %{metadata:key} correctly. So the escape
+# is for the outer parser, not the inner one.
 #
 # The box is not decoration. White text on picture is unreadable on most
 # content, and a box makes it obvious whether drawtext is drawing an empty
@@ -116,7 +119,7 @@
   -filter_complex "\
 [0:v]scale=720:576, setdar=16/9, format=yuv422p10le, setfield=tff[v]; \
     [0:a]volume=volume=-30dB[a]; \
-    [v][0:s]submeta, drawtext=text='%{metadata:lavfi.sub.text}':x=100:y=100:fontcolor=white:box=1:boxcolor=black@0.5[vm]" \
+    [v][0:s]submeta, drawtext=text='%{metadata\:lavfi.sub.text}':x=100:y=100:fontcolor=white:box=1:boxcolor=black@0.5[vm]" \
   -map '[vm]' -map '[a]' \
   -c:v v210 \
   -f decklink \

@@ -331,10 +331,30 @@ static av_cold void uninit(AVFilterContext *avctx)
     s->nb_events = s->max_events = 0;
 }
 
+/* The output carries the video input's properties unchanged. With a subtitle
+ * link on input 1 there is no sensible default for libavfilter to infer, so say
+ * it outright, as cea608embed does. */
+static int config_output(AVFilterLink *outlink)
+{
+    AVFilterContext *avctx = outlink->src;
+    AVFilterLink *inlink = avctx->inputs[0];
+    FilterLink *il = ff_filter_link(inlink);
+    FilterLink *ol = ff_filter_link(outlink);
+
+    outlink->w                   = inlink->w;
+    outlink->h                   = inlink->h;
+    outlink->time_base           = inlink->time_base;
+    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
+    ol->frame_rate               = il->frame_rate;
+
+    return 0;
+}
+
 static const AVFilterPad submeta_outputs[] = {
     {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = config_output,
     },
 };
 
@@ -342,7 +362,8 @@ const FFFilter ff_vf_submeta = {
     .p.name        = "submeta",
     .p.description = NULL_IF_CONFIG_SMALL("Put the active subtitle's text into video frame metadata."),
     .p.priv_class  = &submeta_class,
-    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_METADATA_ONLY,
+    .p.inputs      = NULL,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size     = sizeof(SubMetaContext),
     .init          = init,
     .uninit        = uninit,
