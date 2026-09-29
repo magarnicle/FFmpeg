@@ -23,8 +23,31 @@
 # arrive. It also never reached -late_threshold's 5 seconds, so nothing failed
 # and nothing said so beyond the drop lines.
 #
-# Captions come in on the video frames, not as a subtitle stream, which is what
-# -teletext_from_cc means. The device runs the same two codecs a command line
+# -eia608 is back on the input, but not for the teletext. It is there for the
+# burn-in: submeta needs a subtitle stream to read, and -eia608 is what turns
+# the captions the input already lifts out of VANC into one -map can point at.
+# The teletext still comes from the A53 side data on the video and does not care
+# whether that stream exists.
+#
+# The burn-in itself is two filters. submeta pairs each video frame with the
+# caption on screen at its time and puts the text in frame metadata, changing no
+# pixels; drawtext expands %{metadata:...} per frame and draws it. drawtext has
+# no other per-frame source of text, which is the whole reason submeta exists.
+#
+# Two things about the quoting, both of which were wrong the first time. The
+# colon inside %{...} must not be escaped: textutils.c splits function arguments
+# with av_get_token(&text, ":}"), which turns \: back into a literal colon and
+# leaves "metadata:lavfi.sub.text" as one argument naming no function. And the
+# single quotes have to close after the expansion, not after x and y, or those
+# become part of the text. Quoted, the colon needs no escaping anyway, because
+# the graph parser leaves quoted text alone.
+#
+# The box is not decoration. White text on picture is unreadable on most
+# content, and a box makes it obvious whether drawtext is drawing an empty
+# string or not drawing at all.
+#
+# Captions come in on the video frames for the teletext, not as a subtitle
+# stream, which is what -teletext_from_cc means. The device runs the same two codecs a command line
 # would (eia_608 -> cc_dec -> ASS -> teletextenc -> WST) and feeds the result to
 # the same teletext generator, so nothing about what reaches the VBI changes.
 #
@@ -88,10 +111,13 @@
 # So the startup drops stay. There were eight of them on 25 September, all in
 # the first second and a half, and then it ran clean. For a pass-through that is
 # the cheaper of the two problems.
-./ffmpeg -f decklink -format_code Hp25 -raw_format yuv422p10 \
+./ffmpeg -f decklink -eia608 1 -format_code Hp25 -raw_format yuv422p10 \
        -i 'DeckLink SDI 4K' \
-  -filter_complex "[0:v]scale=720:576,setdar=16/9,format=yuv422p10le,setfield=tff[v]" \
-  -map '[v]' -map 0:a \
+  -filter_complex "\
+[0:v]scale=720:576, setdar=16/9, format=yuv422p10le, setfield=tff[v]; \
+    [0:a]volume=volume=-30dB[a]; \
+    [v][0:s]submeta, drawtext=text='%{metadata:lavfi.sub.text}':x=100:y=100:fontcolor=white:box=1:boxcolor=black@0.5[vm]" \
+  -map '[vm]' -map '[a]' \
   -c:v v210 \
   -f decklink \
      -teletext_from_cc 1 \
