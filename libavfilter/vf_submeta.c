@@ -38,6 +38,8 @@
  * ASS onto video, not this and drawtext.
  */
 
+#include <inttypes.h>
+
 #include "libavcodec/avcodec.h"
 
 #include "libavutil/avstring.h"
@@ -65,6 +67,8 @@ typedef struct SubMetaContext {
     int      nb_events;
     int      max_events;
     int      sub_eof;
+    int64_t  nb_sub_frames;
+    int64_t  nb_cues;
     char    *last_logged;
 } SubMetaContext;
 
@@ -175,6 +179,7 @@ static int add_event(SubMetaContext *s, int64_t start, int64_t end, char *text)
     s->events[s->nb_events].end   = end;
     s->events[s->nb_events].text  = text;
     s->nb_events++;
+    s->nb_cues++;
     return 0;
 }
 
@@ -296,9 +301,18 @@ static int activate(AVFilterContext *avctx)
     FF_FILTER_FORWARD_STATUS_BACK_ALL(outlink, avctx);
 
     /* Subtitles first and all of them: a cue has to be known before the video
-     * frame it belongs to is handed on, and they arrive in their own time. */
+     * frame it belongs to is handed on.
+     *
+     * The request matters as much as the drain, and leaving it out is why this
+     * filter set an empty string for a whole run while the captions were
+     * plainly there. A filter only receives what it asks for, and asking only
+     * in the branch below -- the one reached when the video input has nothing
+     * ready -- means a live capture, which always has a frame ready, never asks
+     * at all. Ask on every pass, and carry on to the video either way: a
+     * caption stream is sparse and waiting for one would stall the picture. */
     if (!s->sub_eof) {
         while ((ret = ff_inlink_consume_frame(sin, &frame)) > 0) {
+            s->nb_sub_frames++;
             ret = take_subtitle(avctx, frame);
             av_frame_free(&frame);
             if (ret < 0)
@@ -308,6 +322,8 @@ static int activate(AVFilterContext *avctx)
             return ret;
         if (ff_inlink_acknowledge_status(sin, &status, &pts))
             s->sub_eof = 1;
+        else
+            ff_inlink_request_frame(sin);
     }
 
     ret = ff_inlink_consume_frame(vin, &frame);
@@ -321,11 +337,8 @@ static int activate(AVFilterContext *avctx)
         return 0;
     }
 
-    if (ff_outlink_frame_wanted(outlink)) {
+    if (ff_outlink_frame_wanted(outlink))
         ff_inlink_request_frame(vin);
-        if (!s->sub_eof)
-            ff_inlink_request_frame(sin);
-    }
     return FFERROR_NOT_READY;
 }
 
@@ -349,6 +362,12 @@ static av_cold int init(AVFilterContext *avctx)
 static av_cold void uninit(AVFilterContext *avctx)
 {
     SubMetaContext *s = avctx->priv;
+
+    /* At info level, because "the text never appeared" is otherwise three runs
+     * to tell apart: no subtitle frames reaching the filter, frames carrying no
+     * usable text, or text that never lined up with a video frame. */
+    av_log(avctx, AV_LOG_INFO, "%"PRId64" subtitle frames, %"PRId64" cues\n",
+           s->nb_sub_frames, s->nb_cues);
 
     for (int i = 0; i < s->nb_events; i++)
         av_freep(&s->events[i].text);
