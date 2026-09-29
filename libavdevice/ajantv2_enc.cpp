@@ -145,9 +145,12 @@ struct ajantv2_ctx {
      * are accumulated here and drawn down a frame at a time. */
     AVStream           *audio_st;
     NTV2AudioSystem     audio_system;
-    int                 audio_channels;
+    int                 audio_channels;           /* in the stream */
+    int                 card_audio_channels;      /* what the card embeds: 6, 8 or 16 */
     int                 audio_bytes_per_sample;   /* on the card: always 4 */
-    int                 audio_frame_bytes;        /* one video frame's worth */
+    int                 audio_frame_bytes;        /* one frame's worth, card channels */
+    int                 audio_in_bytes;           /* one frame's worth, stream channels */
+    NTV2Buffer          audio_in;                 /* drawn from the FIFO, before padding */
     AVFifo             *audio_fifo;
     NTV2Buffer          audio_buffer;
     int64_t             audio_underruns;
@@ -606,9 +609,14 @@ static int aja_setup_audio(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     if (!ctx->device.features().CanDoFrameStore1Display())
         ctx->audio_system = NTV2_AUDIOSYSTEM_1;
 
-    if (!ctx->device.SetNumberAudioChannels(ctx->audio_channels, ctx->audio_system))
+    /* The card embeds groups, not pairs: SetNumberAudioChannels takes 6, 8 or 16
+     * and rejects anything else, so a stereo stream cannot simply be asked for.
+     * Take the smallest group it will hold and pad the rest with silence. */
+    ctx->card_audio_channels = ctx->audio_channels <= 6 ? 6
+                             : ctx->audio_channels <= 8 ? 8 : 16;
+    if (!ctx->device.SetNumberAudioChannels(ctx->card_audio_channels, ctx->audio_system))
         av_log(avctx, AV_LOG_WARNING, "SetNumberAudioChannels(%d) failed\n",
-               ctx->audio_channels);
+               ctx->card_audio_channels);
     if (!ctx->device.SetAudioRate(NTV2_AUDIO_48K, ctx->audio_system))
         av_log(avctx, AV_LOG_WARNING, "SetAudioRate(48K) failed\n");
     if (!ctx->device.SetAudioBufferSize(NTV2_AUDIO_BUFFER_BIG, ctx->audio_system))
@@ -621,9 +629,43 @@ static int aja_setup_audio(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
      * SDI input's audio over ours. */
     ctx->device.SetAudioLoopBack(NTV2_AUDIO_LOOPBACK_OFF, ctx->audio_system);
 
+    /* Read the channel count back before sizing anything from it. Every call
+     * above is advisory, and a frame's worth of audio is however many bytes the
+     * card will read: get that wrong and it takes the next frame's audio early,
+     * every frame, which is a tear at a steady interval rather than a fault
+     * anything else here would notice. */
+    {
+        ULWord chans = 0;
+        NTV2AudioRate rate = NTV2_AUDIO_RATE_INVALID;
+        NTV2AudioBufferSize bufsz = NTV2_AUDIO_BUFFER_INVALID;
+
+        ctx->device.GetNumberAudioChannels(chans, ctx->audio_system);
+        ctx->device.GetAudioRate(rate, ctx->audio_system);
+        ctx->device.GetAudioBufferSize(bufsz, ctx->audio_system);
+        av_log(avctx, AV_LOG_INFO,
+               "Card reports audio: %u channels, %s, buffer %s\n", chans,
+               ::NTV2AudioRateToString(rate).c_str(),
+               ::NTV2AudioBufferSizeToString(bufsz).c_str());
+
+        if (chans && (int)chans != ctx->card_audio_channels) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Card embeds %u audio channels, not the %d asked for; "
+                   "padding to %u\n", chans, ctx->card_audio_channels, chans);
+            ctx->card_audio_channels = (int)chans;
+        }
+        if (ctx->card_audio_channels < ctx->audio_channels) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "The card embeds %d channels and the stream has %d\n",
+                   ctx->card_audio_channels, ctx->audio_channels);
+            return AVERROR(EINVAL);
+        }
+    }
+
     ctx->audio_bytes_per_sample = 4;
     samples_per_frame = (int)(48000.0 / fps + 0.5);
-    ctx->audio_frame_bytes = samples_per_frame * ctx->audio_channels *
+    ctx->audio_in_bytes = samples_per_frame * ctx->audio_channels *
+                          ctx->audio_bytes_per_sample;
+    ctx->audio_frame_bytes = samples_per_frame * ctx->card_audio_channels *
                              ctx->audio_bytes_per_sample;
 
     /* Room for a second or so, so a burst of packets does not spill. */
@@ -633,28 +675,13 @@ static int aja_setup_audio(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         return AVERROR(ENOMEM);
     if (!ctx->audio_buffer.Allocate(ctx->audio_frame_bytes, true))
         return AVERROR(ENOMEM);
-
-    /* Read it back. Every call above is advisory, and an old card that quietly
-     * kept more channels than were asked for, or a smaller buffer, would embed
-     * at a different rate from the one these numbers assume. */
-    {
-        ULWord chans = 0;
-        NTV2AudioRate rate = NTV2_AUDIO_RATE_INVALID;
-        NTV2AudioBufferSize bufsz = NTV2_AUDIO_BUFFER_INVALID;
-
-        ctx->device.GetNumberAudioChannels(chans, ctx->audio_system);
-        ctx->device.GetAudioRate(rate, ctx->audio_system);
-        ctx->device.GetAudioBufferSize(bufsz, ctx->audio_system);
-        av_log(avctx, chans == (ULWord)ctx->audio_channels ? AV_LOG_INFO
-                                                           : AV_LOG_WARNING,
-               "Card reports audio: %u channels, %s, buffer %s\n", chans,
-               ::NTV2AudioRateToString(rate).c_str(),
-               ::NTV2AudioBufferSizeToString(bufsz).c_str());
-    }
+    if (!ctx->audio_in.Allocate(ctx->audio_in_bytes, true))
+        return AVERROR(ENOMEM);
 
     av_log(avctx, AV_LOG_INFO,
-           "Audio: %d channels, 48kHz, %d samples and %d bytes a frame\n",
-           ctx->audio_channels, samples_per_frame, ctx->audio_frame_bytes);
+           "Audio: %d channels in, %d embedded, 48kHz, %d samples and %d bytes "
+           "a frame\n", ctx->audio_channels, ctx->card_audio_channels,
+           samples_per_frame, ctx->audio_frame_bytes);
     return 0;
 }
 
@@ -1294,23 +1321,44 @@ static int aja_deliver_frame(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
      * a frame behind for the rest of the run. */
     if (ctx->audio_fifo) {
         size_t have;
-        const size_t want = (size_t)ctx->audio_frame_bytes;
+        const size_t want = (size_t)ctx->audio_in_bytes;
+        uint8_t *in = (uint8_t *)ctx->audio_in.GetHostPointer();
         uint8_t *dst = (uint8_t *)ctx->audio_buffer.GetHostPointer();
 
         pthread_mutex_lock(&ctx->audio_lock);
         have = av_fifo_can_read(ctx->audio_fifo);
         if (have >= want) {
-            av_fifo_read(ctx->audio_fifo, dst, want);
+            av_fifo_read(ctx->audio_fifo, in, want);
         } else {
             if (have)
-                av_fifo_read(ctx->audio_fifo, dst, have);
-            memset(dst + have, 0, want - have);
+                av_fifo_read(ctx->audio_fifo, in, have);
+            memset(in + have, 0, want - have);
             if (ctx->frames_out > 2 && ++ctx->audio_underruns % 25 == 1)
                 av_log(avctx, AV_LOG_WARNING,
                        "Audio underrun: %zu of %zu bytes, padding with silence "
                        "(%"PRId64" so far)\n", have, want, ctx->audio_underruns);
         }
         pthread_mutex_unlock(&ctx->audio_lock);
+
+        /* Lay the stream's channels into the card's. The card embeds groups of
+         * 6, 8 or 16 and cannot be asked for a pair, so the rest of each sample
+         * is silence. Handing it the stream's bytes unpadded, as this did, means
+         * it reads a whole frame of audio out of a quarter of one. */
+        if (ctx->card_audio_channels == ctx->audio_channels) {
+            memcpy(dst, in, want);
+        } else {
+            const int32_t *src = (const int32_t *)in;
+            int32_t *out = (int32_t *)dst;
+            const int samples = ctx->audio_in_bytes /
+                                (ctx->audio_channels * ctx->audio_bytes_per_sample);
+            int sm, ch;
+
+            memset(dst, 0, ctx->audio_frame_bytes);
+            for (sm = 0; sm < samples; sm++)
+                for (ch = 0; ch < ctx->audio_channels; ch++)
+                    out[sm * ctx->card_audio_channels + ch] =
+                        src[sm * ctx->audio_channels + ch];
+        }
         ctx->xfer.SetAudioBuffer((ULWord *)dst, ctx->audio_frame_bytes);
     }
     if (!ctx->device.AutoCirculateTransfer(ctx->channel, ctx->xfer)) {
