@@ -23,20 +23,36 @@
 # arrive. It also never reached -late_threshold's 5 seconds, so nothing failed
 # and nothing said so beyond the drop lines.
 #
-# -max_interleave_delta is NOT set, and every value tried so far is worse than
-# leaving it alone. Recorded so the same ground is not covered again:
+# Captions come in on the video frames, not as a subtitle stream, which is what
+# -teletext_from_cc means. The device runs the same two codecs a command line
+# would (eia_608 -> cc_dec -> ASS -> teletextenc -> WST) and feeds the result to
+# the same teletext generator, so nothing about what reaches the VBI changes.
 #
-#   unset (10s default)  plays, good picture, but stalls 2-4s at a time and
-#                        bursts, because the muxer holds video until every
-#                        interleaved stream has a packet and teletext is sparse
+# The reason is the muxer. ffmpeg holds every interleaved stream until each one
+# has a packet to compare (mux.c, nb_interleaved_streams), and a teletext
+# subtitle stream is sparse -- one packet per caption. So the picture stalled for
+# as long as the gap between captions, and with no captions at all it stalled
+# until max_interleave_delta expired, which is ten seconds by default. Measured
+# on 28 September: output began at frame 247, and stayed ten seconds behind the
+# input for the whole run.
+#
+# Bounding that wait does not work; every value tried was worse:
+#
+#   unset (10s default)  plays, ten seconds late, stalls between captions
 #   1 (1 microsecond)    wedges at frame 10 of a 12-frame preroll
 #   200000 (0.2s)        wedges at frame 15
 #
-# Both wedges look identical: no "Starting scheduled playback" in the log ever,
-# input buffer overruns, and nothing to air. Why bounding the interleave wait
-# stops playback from starting is not yet understood. The audio preroll buffer
-# filling before video reaches first_pts + frames_preroll is the theory; it has
-# not been confirmed, and the numbers do not obviously fit it.
+# Video is never sparse, so carrying the captions on it removes the question
+# rather than tuning it. The output has two streams now and neither can stall
+# the other.
+#
+# -eia608 is gone from the input with the subtitle stream it fed. The A53 side
+# data the captions actually travel in is attached either way.
+#
+# Teletext page options move to -teletext_opts, since the encoder now lives
+# inside the device rather than in the stream mapping. Everything teletext_*
+# after -f decklink is unchanged: those are the device's, and they shape the VBI
+# waveform rather than the page.
 #
 # No interl=1 on the scale, and that matters. It tells swscale the picture is
 # interlaced, so it splits each frame into two fields and scales them
@@ -72,13 +88,14 @@
 # So the startup drops stay. There were eight of them on 25 September, all in
 # the first second and a half, and then it ran clean. For a pass-through that is
 # the cheaper of the two problems.
-./ffmpeg -f decklink -eia608 1 -format_code Hp25 -raw_format yuv422p10 \
+./ffmpeg -f decklink -format_code Hp25 -raw_format yuv422p10 \
        -i 'DeckLink SDI 4K' \
   -filter_complex "[0:v]scale=720:576,setdar=16/9,format=yuv422p10le,setfield=tff[v]" \
-  -map '[v]' -map 0:a -map 0:s \
+  -map '[v]' -map 0:a \
   -c:v v210 \
-  -c:s dvb_teletext -teletext_page 801 -double_height 1 \
   -f decklink \
+     -teletext_from_cc 1 \
+     -teletext_opts page=801:double_height=1 \
      -teletext_rise_ns 86 \
      -teletext_vbi_offset 5 -teletext_vbi_offset_frac 159 \
      -teletext_dual_field 1 \
@@ -86,5 +103,4 @@
      -teletext_filler_ctrl 1 -teletext_filler_subcode 0 \
      -teletext_header_attr 6 \
      -teletext_burst_frames 25 \
-     -preroll 0.7 \
      'DeckLink SDI 4K'

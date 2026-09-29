@@ -27,6 +27,7 @@
 
 #include "vbi_teletext.h"
 #include "outdev_feed.h"
+#include "cc_to_teletext.h"
 #if BLACKMAGIC_DECKLINK_API_VERSION < 0x0b000000
 #define IID_IDeckLinkProfileAttributes IID_IDeckLinkAttributes
 #define IDeckLinkProfileAttributes IDeckLinkAttributes
@@ -187,6 +188,10 @@ struct decklink_ctx {
     AVStream *video_st;
     AVStream *klv_st;
     AVStream *teletext_st;
+    /* Captions taken from the video stream's A53 side data rather than from a
+     * teletext subtitle stream. */
+    int teletext_from_cc;
+    FFCCToTeletext cc_tt;
     AVStream *cc_st;          /* extracted CEA-608/708, when -eia608 is set */
     uint16_t cdp_sequence_num;
     /* Options */

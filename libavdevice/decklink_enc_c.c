@@ -70,6 +70,8 @@ static const AVOption options[] = {
     { "true"        ,  NULL                     , 0                   , AV_OPT_TYPE_CONST , { .i64 = 1   }, 0, 0, ENC, .unit = "level_a"},
     { "timing_offset", "genlock timing pixel offset", OFFSET(timing_offset), AV_OPT_TYPE_INT,   { .i64 = INT_MIN }, INT_MIN, INT_MAX, ENC, .unit = "timing_offset"},
     { "unset"       ,  NULL                     , 0                        , AV_OPT_TYPE_CONST, { .i64 = INT_MIN },       0,       0, ENC, .unit = "timing_offset"},
+    { "teletext_from_cc", "build SD teletext from the CEA-608 captions carried on the video frames, instead of taking a teletext subtitle stream; avoids a sparse subtitle stream holding up the muxer", OFFSET(teletext_from_cc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "teletext_opts", "options for the teletext page encoder when teletext_from_cc is set, e.g. \"page=801:double_height=1\"", OFFSET(teletext_opts), AV_OPT_TYPE_DICT, { .str = NULL }, 0, 0, ENC },
     { "teletext_fields", "teletext field insertion mode", OFFSET(teletext_fields), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, ENC, .unit = "teletext_fields"},
     { "both"        , "insert on both fields (default, per OP-47)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, ENC, .unit = "teletext_fields"},
     { "odd"         , "insert on odd field (field 1) only",         0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, ENC, .unit = "teletext_fields"},

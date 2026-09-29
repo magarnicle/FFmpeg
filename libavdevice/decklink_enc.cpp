@@ -1580,8 +1580,10 @@ av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
     ff_decklink_packet_queue_end(&ctx->vanc_queue);
 
     /* Clean up teletext queue if it was used */
-    if (ctx->teletext_st)
+    if (ctx->teletext_st || ctx->teletext_from_cc)
         ff_decklink_packet_queue_end(&ctx->teletext_queue);
+    if (ctx->teletext_from_cc)
+        ff_cc_to_teletext_close(&ctx->cc_tt);
 
     /* Clean up async output queues if they were used */
     if (cctx->output_buffer_size > 0) {
@@ -2439,9 +2441,38 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
         goto done;
     }
 
+    /* Captions riding on this video frame become a teletext page here, put into
+     * the same queue the subtitle stream would have filled. Doing it from the
+     * video packet is the whole point: a teletext subtitle stream is sparse, and
+     * ffmpeg's muxer holds every other stream until each interleaved one has a
+     * packet to compare against, so seconds between captions become seconds of
+     * held-up picture. The video is never sparse. */
+    if (ctx->teletext_from_cc && ctx->bmd_mode == bmdModePAL) {
+        size_t cc_size = 0;
+        const uint8_t *cc = av_packet_get_side_data(pkt, AV_PKT_DATA_A53_CC,
+                                                    &cc_size);
+        const uint8_t *tt = NULL;
+        int tt_size = 0;
+
+        if (cc && cc_size)
+            tt_size = ff_cc_to_teletext(&ctx->cc_tt, cc, (int)cc_size, pkt->pts,
+                                        (AVRational){ctx->bmd_tb_num, ctx->bmd_tb_den},
+                                        &tt, avctx);
+        if (tt_size > 0) {
+            AVPacket *tt_pkt = av_packet_alloc();
+            if (tt_pkt && av_new_packet(tt_pkt, tt_size) >= 0) {
+                memcpy(tt_pkt->data, tt, tt_size);
+                tt_pkt->pts = tt_pkt->dts = pkt->pts;
+                tt_pkt->duration = 0;
+                ff_decklink_packet_queue_put(&ctx->teletext_queue, tt_pkt);
+            }
+            av_packet_free(&tt_pkt);
+        }
+    }
+
     /* For SD PAL mode, insert teletext as raw VBI waveforms on lines 21/334
      * This must be done after ancillary data creation so we can access VBI line buffers */
-    if (ctx->teletext_st && ctx->bmd_mode == bmdModePAL) {
+    if ((ctx->teletext_st || ctx->teletext_from_cc) && ctx->bmd_mode == bmdModePAL) {
         /* Diagnostic: test which VBI lines the SDK accepts */
         static int diag_done = 0;
         if (!diag_done) {
@@ -3068,6 +3099,19 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
         tcfg.frames_per_10s  = 250;   /* refined once the mode timebase is known */
         ff_vbi_teletext_init(&ctx->tt, &tcfg);
     }
+    /* Captions on the video stream rather than as a subtitle stream. The queue
+     * and the generator are the same ones the subtitle path uses; only where
+     * the teletext comes from differs, so everything downstream is unchanged. */
+    ctx->teletext_from_cc = cctx->teletext_from_cc;
+    if (ctx->teletext_from_cc) {
+        if ((ret = ff_cc_to_teletext_open(&ctx->cc_tt, &cctx->teletext_opts,
+                                          avctx)) < 0)
+            goto error;
+        ff_decklink_packet_queue_init(avctx, &ctx->teletext_queue, 1024 * 1024);
+        av_log(avctx, AV_LOG_INFO,
+               "Teletext will be built from the captions on the video frames\n");
+    }
+
     ctx->teletext_vbi_offset_frac = cctx->teletext_vbi_offset_frac;
     ctx->teletext_rise_ns = cctx->teletext_rise_ns;
     ctx->tt.caption_end_pts = AV_NOPTS_VALUE;

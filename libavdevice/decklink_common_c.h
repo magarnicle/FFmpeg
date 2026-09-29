@@ -24,6 +24,8 @@
 #define AVDEVICE_DECKLINK_COMMON_C_H
 
 #include <stdint.h>
+
+#include "libavutil/dict.h"
 #include <DeckLinkAPIVersion.h>
 
 #include "libavutil/log.h"
@@ -92,6 +94,8 @@ struct decklink_cctx {
     int64_t output_buffer_size;
     double late_threshold;
     double audio_schedule_retry;
+    int teletext_from_cc;
+    AVDictionary *teletext_opts;
     DecklinkTeletextFields teletext_fields;
     int teletext_vbi_offset;
     int teletext_vbi_offset_frac;
