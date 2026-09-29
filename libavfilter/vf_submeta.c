@@ -65,6 +65,7 @@ typedef struct SubMetaContext {
     int      nb_events;
     int      max_events;
     int      sub_eof;
+    char    *last_logged;
 } SubMetaContext;
 
 #define OFFSET(x) offsetof(SubMetaContext, x)
@@ -113,6 +114,8 @@ static char *rect_text(const SubMetaContext *s, const AVSubtitleRect *rect)
 {
     AVBPrint bp;
     char *out = NULL;
+    unsigned i;
+    int blank = 1;
 
     av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
 
@@ -139,6 +142,21 @@ static char *rect_text(const SubMetaContext *s, const AVSubtitleRect *rect)
         av_bprint_finalize(&bp, NULL);
         return NULL;
     }
+
+    /* A cue of nothing but spaces is not a caption. cea608embed sends exactly
+     * that when keepalive is on, so that the 608 track never goes empty and a
+     * player does not drop it; decoded back it is a caption of spaces, and
+     * anything drawing a box around it draws an empty box. Treat it as blank. */
+    for (i = 0; i < bp.len; i++) {
+        if (bp.str[i] != ' ' && bp.str[i] != '\t' && bp.str[i] != '\n' &&
+            bp.str[i] != '\r') {
+            blank = 0;
+            break;
+        }
+    }
+    if (blank)
+        av_bprint_clear(&bp);
+
     av_bprint_finalize(&bp, &out);
     return out;
 }
@@ -253,6 +271,13 @@ static int take_video(AVFilterContext *avctx, AVFrame *frame)
 
     /* Always set it, empty when nothing is up, so %{metadata:key} needs no
      * default and never renders the caption before last. */
+    if (av_log_get_level() >= AV_LOG_VERBOSE && text && *text &&
+        (!s->last_logged || strcmp(s->last_logged, text))) {
+        av_log(avctx, AV_LOG_VERBOSE, "%s = \"%s\"\n", s->key, text);
+        av_freep(&s->last_logged);
+        s->last_logged = av_strdup(text);
+    }
+
     av_dict_set(&frame->metadata, s->key, text ? text : "", 0);
 
     return ff_filter_frame(avctx->outputs[0], frame);
@@ -328,6 +353,7 @@ static av_cold void uninit(AVFilterContext *avctx)
     for (int i = 0; i < s->nb_events; i++)
         av_freep(&s->events[i].text);
     av_freep(&s->events);
+    av_freep(&s->last_logged);
     s->nb_events = s->max_events = 0;
 }
 
