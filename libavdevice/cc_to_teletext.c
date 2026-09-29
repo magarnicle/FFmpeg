@@ -56,8 +56,12 @@ int ff_cc_to_teletext_open(FFCCToTeletext *c, AVDictionary **enc_opts,
     }
     c->buf_size = CC_TT_BUF_SIZE;
 
-    /* The decoder reports caption times against this. */
+    /* The decoder reports caption times against this, and avcodec_open2
+     * refuses an encoder without a time base. Milliseconds for both: it is what
+     * AVSubtitle's display times are in, and the teletext encoder builds data
+     * units without consulting it. */
     c->dec->pkt_timebase = (AVRational){1, 1000};
+    c->enc->time_base    = (AVRational){1, 1000};
 
     if ((ret = avcodec_open2(c->dec, dec, NULL)) < 0) {
         av_log(logctx, AV_LOG_ERROR, "Cannot open the EIA-608 decoder\n");

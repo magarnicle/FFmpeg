@@ -3102,12 +3102,17 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     /* Captions on the video stream rather than as a subtitle stream. The queue
      * and the generator are the same ones the subtitle path uses; only where
      * the teletext comes from differs, so everything downstream is unchanged. */
-    ctx->teletext_from_cc = cctx->teletext_from_cc;
-    if (ctx->teletext_from_cc) {
-        if ((ret = ff_cc_to_teletext_open(&ctx->cc_tt, &cctx->teletext_opts,
-                                          avctx)) < 0)
-            goto error;
+    if (cctx->teletext_from_cc) {
+        /* The queue first, and the flag only once both have succeeded: the
+         * cleanup path ends the queue when the flag is set, and ending one that
+         * was never started is a crash rather than a failed open. */
         ff_decklink_packet_queue_init(avctx, &ctx->teletext_queue, 1024 * 1024);
+        if ((ret = ff_cc_to_teletext_open(&ctx->cc_tt, &cctx->teletext_opts,
+                                          avctx)) < 0) {
+            ff_decklink_packet_queue_end(&ctx->teletext_queue);
+            goto error;
+        }
+        ctx->teletext_from_cc = 1;
         av_log(avctx, AV_LOG_INFO,
                "Teletext will be built from the captions on the video frames\n");
     }
