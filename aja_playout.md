@@ -336,6 +336,21 @@ the muxer thread blocks in the put, so ffmpeg waits rather than exits. That is
 the intended behaviour for a scheduled start, and it means a `-t`-limited test
 run with a trigger time in the future will appear to hang.
 
+## Testing it
+
+`aja_test_playout.bash` and `aja_test_capture.bash` are the pair for this. The
+first puts bars and a 1kHz tone out of the card with the same options as
+`hd_caps_aja.bash`, captions included, because the VANC region changes the frame
+geometry and with it the ring depth -- seven frames against sixteen -- and a
+playout test on the wrong geometry is not a test of playout. The second records
+the tone off the SDI on the DeckLink machine and prints every gap in it with the
+interval since the last.
+
+The tone is the useful part. Programme audio hides a dropout; one frequency at
+one level turns it into a gap in a flat waveform that a machine can find, count
+and time. A regular interval points at something structural in the playout path;
+an irregular one at scheduling or load.
+
 ## What still needs measuring
 
 - A long run. Sixty seconds with no dropped frames says nothing about an hour.
