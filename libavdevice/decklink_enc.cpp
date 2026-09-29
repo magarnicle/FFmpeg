@@ -2886,6 +2886,29 @@ static int decklink_schedule_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
         outbuf = pkt->data;
     }
 
+    /* The card is told to play these samples at pkt->pts, counted in 48kHz
+     * samples, so consecutive packets have to abut exactly: any gap is silence
+     * the card fills in, and any overlap is samples played twice. Either is a
+     * click, and neither shows up as a shortage of buffered audio, so nothing
+     * else here would notice. */
+    if (ctx->audio_expected_pts != AV_NOPTS_VALUE &&
+        pkt->pts != ctx->audio_expected_pts) {
+        const int64_t delta = pkt->pts - ctx->audio_expected_pts;
+        const int64_t now = av_gettime_relative();
+
+        ctx->audio_discontinuities++;
+        if (now - ctx->audio_disc_logged_us > 1000000) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Audio timeline %s by %"PRId64" samples (%.1f ms) at pts "
+                   "%"PRId64"; %"PRId64" breaks so far\n",
+                   delta > 0 ? "jumped forward" : "went backward",
+                   delta, delta * 1000.0 / 48000.0, pkt->pts,
+                   ctx->audio_discontinuities);
+            ctx->audio_disc_logged_us = now;
+        }
+    }
+    ctx->audio_expected_pts = pkt->pts + sample_count;
+
     /* ScheduleAudioSamples() can briefly return E_ACCESSDENIED (0x80000009)
      * while the video thread takes the audio stream out of preroll: EndAudio-
      * Preroll()/StartScheduledPlayback() run concurrently and without a lock
@@ -3121,6 +3144,7 @@ av_cold int ff_decklink_write_header(AVFormatContext *avctx)
     ctx->teletext_rise_ns = cctx->teletext_rise_ns;
     ctx->tt.caption_end_pts = AV_NOPTS_VALUE;
     ctx->first_pts    = AV_NOPTS_VALUE;
+    ctx->audio_expected_pts = AV_NOPTS_VALUE;
     ctx->socket_server.fd = -1;
     if (cctx->link > 0 && (unsigned int)cctx->link < FF_ARRAY_ELEMS(decklink_link_conf_map))
         ctx->link = decklink_link_conf_map[cctx->link];

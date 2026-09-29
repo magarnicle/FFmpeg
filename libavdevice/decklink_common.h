@@ -190,6 +190,12 @@ struct decklink_ctx {
     AVStream *teletext_st;
     /* Captions taken from the video stream's A53 side data rather than from a
      * teletext subtitle stream. */
+    /* Where the audio timeline is expected to continue from, in samples, so a
+     * gap or an overlap in what gets scheduled is visible. */
+    int64_t audio_expected_pts;
+    int64_t audio_discontinuities;
+    int64_t audio_disc_logged_us;
+
     int teletext_from_cc;
     FFCCToTeletext cc_tt;
     AVStream *cc_st;          /* extracted CEA-608/708, when -eia608 is set */
