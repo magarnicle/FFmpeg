@@ -20,10 +20,19 @@
 FFMPEG=${FFMPEG:-/home/matt/ffmpeg_sources/FFmpeg/ffmpeg}
 buffer_size=$(( 200 * 1024 * 1024 ))
 
+# RING changes the AutoCirculate ring depth, which is a measurement rather than
+# a setting. The tone breaks every 0.280s, which is seven frames at 25fps, and
+# seven is what the ring comes out at on this card once the audio buffer has
+# taken its share. RING=4 says whether that is the cause: the gaps move to
+# 0.160s if it is, and stay at 0.280s if the seven was a coincidence.
+RING=${RING:-}
+ring_opt=""
+[ -n "$RING" ] && ring_opt="-ring_frames $RING"
+
 $FFMPEG -nostdin -hide_banner \
     -f lavfi -i "testsrc2=s=1920x1080:r=25" \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
     -map 0:v -map 1:a \
     -c:v v210 -c:a pcm_s32le -ac 2 \
-    -f ajantv2 -format_code 1080p25 -channel 1 \
+    -f ajantv2 -format_code 1080p25 -channel 1 ${ring_opt} \
     -output_buffer_size ${buffer_size} 0
