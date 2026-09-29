@@ -606,9 +606,13 @@ static int aja_setup_audio(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
     if (!ctx->device.features().CanDoFrameStore1Display())
         ctx->audio_system = NTV2_AUDIOSYSTEM_1;
 
-    ctx->device.SetNumberAudioChannels(ctx->audio_channels, ctx->audio_system);
-    ctx->device.SetAudioRate(NTV2_AUDIO_48K, ctx->audio_system);
-    ctx->device.SetAudioBufferSize(NTV2_AUDIO_BUFFER_BIG, ctx->audio_system);
+    if (!ctx->device.SetNumberAudioChannels(ctx->audio_channels, ctx->audio_system))
+        av_log(avctx, AV_LOG_WARNING, "SetNumberAudioChannels(%d) failed\n",
+               ctx->audio_channels);
+    if (!ctx->device.SetAudioRate(NTV2_AUDIO_48K, ctx->audio_system))
+        av_log(avctx, AV_LOG_WARNING, "SetAudioRate(48K) failed\n");
+    if (!ctx->device.SetAudioBufferSize(NTV2_AUDIO_BUFFER_BIG, ctx->audio_system))
+        av_log(avctx, AV_LOG_WARNING, "SetAudioBufferSize(BIG) failed\n");
     for (size_t n = 0; n < ctx->outputs.size(); n++) {
         ctx->device.SetSDIOutputAudioSystem(ctx->outputs[n], ctx->audio_system);
         ctx->device.SetSDIOutputDS2AudioSystem(ctx->outputs[n], ctx->audio_system);
@@ -629,6 +633,24 @@ static int aja_setup_audio(AVFormatContext *avctx, struct ajantv2_ctx *ctx,
         return AVERROR(ENOMEM);
     if (!ctx->audio_buffer.Allocate(ctx->audio_frame_bytes, true))
         return AVERROR(ENOMEM);
+
+    /* Read it back. Every call above is advisory, and an old card that quietly
+     * kept more channels than were asked for, or a smaller buffer, would embed
+     * at a different rate from the one these numbers assume. */
+    {
+        ULWord chans = 0;
+        NTV2AudioRate rate = NTV2_AUDIO_RATE_INVALID;
+        NTV2AudioBufferSize bufsz = NTV2_AUDIO_BUFFER_INVALID;
+
+        ctx->device.GetNumberAudioChannels(chans, ctx->audio_system);
+        ctx->device.GetAudioRate(rate, ctx->audio_system);
+        ctx->device.GetAudioBufferSize(bufsz, ctx->audio_system);
+        av_log(avctx, chans == (ULWord)ctx->audio_channels ? AV_LOG_INFO
+                                                           : AV_LOG_WARNING,
+               "Card reports audio: %u channels, %s, buffer %s\n", chans,
+               ::NTV2AudioRateToString(rate).c_str(),
+               ::NTV2AudioBufferSizeToString(bufsz).c_str());
+    }
 
     av_log(avctx, AV_LOG_INFO,
            "Audio: %d channels, 48kHz, %d samples and %d bytes a frame\n",
