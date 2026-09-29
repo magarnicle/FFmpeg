@@ -492,6 +492,7 @@ extern const FFFilter ff_vf_ssim;
 extern const FFFilter ff_vf_ssim360;
 extern const FFFilter ff_vf_stereo3d;
 extern const FFFilter ff_vf_streamselect;
+extern const FFFilter ff_vf_submeta;
 extern const FFFilter ff_vf_subtitles;
 extern const FFFilter ff_vf_super2xsai;
 extern const FFFilter ff_vf_swaprect;

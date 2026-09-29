@@ -525,6 +525,7 @@ OBJS-$(CONFIG_SSIM_FILTER)                   += vf_ssim.o framesync.o
 OBJS-$(CONFIG_SSIM360_FILTER)                += vf_ssim360.o framesync.o
 OBJS-$(CONFIG_STEREO3D_FILTER)               += vf_stereo3d.o
 OBJS-$(CONFIG_STREAMSELECT_FILTER)           += f_streamselect.o framesync.o
+OBJS-$(CONFIG_SUBMETA_FILTER)                += vf_submeta.o
 OBJS-$(CONFIG_SUBTITLES_FILTER)              += vf_subtitles.o
 OBJS-$(CONFIG_SUPER2XSAI_FILTER)             += vf_super2xsai.o
 OBJS-$(CONFIG_SWAPRECT_FILTER)               += vf_swaprect.o
