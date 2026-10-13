@@ -914,7 +914,14 @@ static int teletext_encode_frame(AVCodecContext *avctx, uint8_t *buf,
             if (ctx->page_buffer[row][col] != TELETEXT_NOTE_MARK)
                 continue;
             if (ctx->note_x26) {
-                ctx->page_buffer[row][col] = ' ';
+                /* '#', not a space. A Level 1.5 decoder replaces this cell with
+                 * the G2 note from the enhancement below, so what is underneath
+                 * is only ever seen by a decoder that ignores X/26 -- and for
+                 * that decoder a space means the note vanishes. A caption that
+                 * is nothing but notes, which song lyrics often are, then goes
+                 * to air blank. '#' is what the note_x26=0 path uses and it is
+                 * strictly better than nothing to look at. */
+                ctx->page_buffer[row][col] = 0x5F;
                 note_rc[num_notes][0] = row;
                 note_rc[num_notes][1] = col;
                 num_notes++;
