@@ -550,7 +550,10 @@ def main():
     rep.line('Levels: min %s   max %s' % (
         ' '.join('%d(x%d)' % kv for kv in sorted(lows.items())),
         ' '.join('%d(x%d)' % kv for kv in sorted(highs.items()))))
-    rep.check(chroma <= {128}, 'chroma neutral (saw %s)' % sorted(chroma))
+    if chroma:
+        rep.check(chroma <= {128}, 'chroma neutral (saw %s)' % sorted(chroma))
+    else:
+        rep.line('  (no raw samples in this capture, so chroma is unchecked)')
     if args.monotonic:
         rep.check(min(lows) >= LEVEL_LOW and max(highs) <= LEVEL_HIGH,
                   'no sample outside %d..%d' % (LEVEL_LOW, LEVEL_HIGH))

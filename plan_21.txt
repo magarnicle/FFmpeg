@@ -639,3 +639,56 @@ to include.
 NEXT: fix the capture tool so it keeps every frame, then capture and log the
 same run again. Without a complete capture there is no way to check on-air
 scheduling against the log.
+
+
+==========================================================================
+Where this ended up - 2026-09-24
+==========================================================================
+
+The fussy receiver's dropped captions were packet loss, not structure. Raising
+-teletext_burst_frames from 8 to 25 stopped them: twelve deliveries of a page
+get through where four did not. Every conformance check that could be built
+against our own output had already passed, which was the clue that the fault
+was not in how the stream was formed.
+
+That left two artefacts of the longer burst, both now fixed (89c5c8f60d):
+
+  Captions dipped and came back. The P8FF that terminates page 801, so a
+  receiver commits it, also opens page 8FF, and a receiver that blanks while
+  acquiring shows each one as a dip. Twelve cycles made visible what four did
+  not. The page is committed once per caption now and later passes carry an
+  inert repeat.
+
+  Captions cleared late. The erase waited for idle_frames >= burst_frames, so a
+  25-frame burst held every caption a second past its end time. The dwell is
+  capped at 8 frames; the burst stays long.
+
+Working configuration:
+
+  -teletext_page 801 -double_height 1
+  -teletext_rise_ns 86
+  -teletext_vbi_offset 5 -teletext_vbi_offset_frac 159
+  -teletext_dual_field 1
+  -teletext_filler idl -teletext_spare_p8ff 1
+  -teletext_filler_ctrl 1 -teletext_filler_subcode 0
+  -teletext_header_attr 6
+  -teletext_burst_frames 25
+
+Still open:
+
+  - Why packets were being lost at four deliveries a caption. Redundancy masks
+    it rather than explaining it. A complete Polistream capture to diff against
+    is still the thing that would answer it.
+  - The one remaining P8FF per caption may still show as a single dip. Removing
+    it needs a different way to make the receiver commit the page, and that
+    wants testing rather than reasoning.
+  - The Mac with the AJA card captures one frame in three at best.
+    AutoCirculateTransfer costs 148-265ms a frame there with a frame already in
+    hand and the cost independent of size; --dmatest will say whether that is
+    AutoCirculate or the host. tools/ff21grab does the same job from a DeckLink
+    card and is built but has not yet met a machine that can see a signal.
+
+Tools built along the way: tools/teletext_vbi_check.py (waveform, packet
+structure, strict-receiver model, caption list, and it now refuses to be
+fooled by a capture that dropped frames), tools/ff21grab, and the AJA grabber's
+--vbionly, drop reporting and timing counters.
